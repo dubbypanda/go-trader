@@ -244,6 +244,160 @@ func TestExecutePerpsSignal_PersistsExchangeMetadata(t *testing.T) {
 	}
 }
 
+func TestDeferredOpenRecordsProtectionOIDSnapshotOnce(t *testing.T) {
+	db := openTestDB(t)
+	prev := tradeRecorder
+	tradeRecorder = db.InsertTrade
+	t.Cleanup(func() { tradeRecorder = prev })
+
+	s := &StrategyState{
+		ID:              "hl-live",
+		Platform:        "hyperliquid",
+		Type:            "perps",
+		Cash:            1000,
+		InitialCapital:  1000,
+		Positions:       map[string]*Position{},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+	}
+	logger := newTestLogger(t)
+
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, logger)
+	if err != nil {
+		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
+	}
+	if exec.TradesExecuted != 1 || exec.OpenTrade == nil {
+		t.Fatalf("exec = %+v, want one deferred open trade", exec)
+	}
+	var count int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM trades WHERE strategy_id = 'hl-live'").Scan(&count); err != nil {
+		t.Fatalf("count before record: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("trade rows before recordPositionOpen = %d, want 0", count)
+	}
+
+	pos := s.Positions["ETH"]
+	pos.EntryATR = 12.5
+	pos.StopLossOID = 111
+	pos.StopLossTriggerPx = 1875
+	pos.TPOIDs = []int64{222, 333}
+	mult := 1.5
+	sc := StrategyConfig{ID: "hl-live", Platform: "hyperliquid", Type: "perps", StopLossATRMult: &mult}
+	recordPositionOpen(s, sc, exec.OpenTrade, pos)
+
+	var entryATR, triggerPx, slATRMult float64
+	var slOID int64
+	var tpOIDsJSON string
+	if err := db.db.QueryRow(`SELECT entry_atr, stop_loss_oid, stop_loss_trigger_px, tp_oids_json, stop_loss_atr_mult FROM trades WHERE strategy_id = 'hl-live'`).Scan(&entryATR, &slOID, &triggerPx, &tpOIDsJSON, &slATRMult); err != nil {
+		t.Fatalf("query trade snapshot: %v", err)
+	}
+	if entryATR != 12.5 || slOID != 111 || triggerPx != 1875 || tpOIDsJSON != "[222,333]" || slATRMult != 1.5 {
+		t.Fatalf("snapshot = atr %.2f slOID %d trigger %.2f tp %q mult %.2f, want atr 12.5 slOID 111 trigger 1875 tp [222,333] mult 1.5", entryATR, slOID, triggerPx, tpOIDsJSON, slATRMult)
+	}
+	if len(s.TradeHistory) != 1 || s.TradeHistory[0].StopLossOID != 111 || len(s.TradeHistory[0].TPOIDs) != 2 || s.TradeHistory[0].TPOIDs[0] != 222 || s.TradeHistory[0].TPOIDs[1] != 333 {
+		t.Fatalf("in-memory trade snapshot = %+v, want SL/TPOID snapshot", s.TradeHistory)
+	}
+}
+
+func TestDeferredOpenWrappersDoNotInsertBeforeRecordPositionOpen(t *testing.T) {
+	db := openTestDB(t)
+	prev := tradeRecorder
+	tradeRecorder = db.InsertTrade
+	t.Cleanup(func() { tradeRecorder = prev })
+	logger := newTestLogger(t)
+
+	t.Run("spot", func(t *testing.T) {
+		s := &StrategyState{
+			ID:              "spot1",
+			Platform:        "binanceus",
+			Type:            "spot",
+			Cash:            1000,
+			InitialCapital:  1000,
+			Positions:       map[string]*Position{},
+			OptionPositions: map[string]*OptionPosition{},
+			TradeHistory:    []Trade{},
+		}
+		exec, err := ExecuteSpotSignalWithFillFeeDeferredOpen(s, 1, "BTC", 50000, 0.01, 0.25, "spot-oid", 0, logger)
+		if err != nil {
+			t.Fatalf("ExecuteSpotSignalWithFillFeeDeferredOpen: %v", err)
+		}
+		if exec.TradesExecuted != 1 || exec.OpenTrade == nil {
+			t.Fatalf("exec = %+v, want one deferred open trade", exec)
+		}
+		assertTradeCount(t, db, "spot1", 0)
+		recordPositionOpen(s, StrategyConfig{ID: "spot1", Type: "spot", Platform: "binanceus"}, exec.OpenTrade, s.Positions["BTC"])
+		assertTradeCount(t, db, "spot1", 1)
+	})
+
+	t.Run("futures", func(t *testing.T) {
+		s := &StrategyState{
+			ID:              "ts-es",
+			Platform:        "topstep",
+			Type:            "futures",
+			Cash:            10000,
+			InitialCapital:  10000,
+			Positions:       map[string]*Position{},
+			OptionPositions: map[string]*OptionPosition{},
+			TradeHistory:    []Trade{},
+		}
+		spec := ContractSpec{Multiplier: 50, Margin: 500}
+		exec, err := ExecuteFuturesSignalWithFillFeeDeferredOpen(s, 1, "ES", 5000, spec, 2.5, 5, 1, 1.25, "fut-oid", 0, logger)
+		if err != nil {
+			t.Fatalf("ExecuteFuturesSignalWithFillFeeDeferredOpen: %v", err)
+		}
+		if exec.TradesExecuted != 1 || exec.OpenTrade == nil {
+			t.Fatalf("exec = %+v, want one deferred open trade", exec)
+		}
+		assertTradeCount(t, db, "ts-es", 0)
+		recordPositionOpen(s, StrategyConfig{ID: "ts-es", Type: "futures", Platform: "topstep"}, exec.OpenTrade, s.Positions["ES"])
+		assertTradeCount(t, db, "ts-es", 1)
+	})
+}
+
+func TestRecordPositionOpenFallsBackWhenPositionMissing(t *testing.T) {
+	db := openTestDB(t)
+	prev := tradeRecorder
+	tradeRecorder = db.InsertTrade
+	t.Cleanup(func() { tradeRecorder = prev })
+
+	s := &StrategyState{
+		ID:              "hl-live",
+		Platform:        "hyperliquid",
+		Type:            "perps",
+		Cash:            1000,
+		InitialCapital:  1000,
+		Positions:       map[string]*Position{},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+	}
+	logger := newTestLogger(t)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, logger)
+	if err != nil {
+		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
+	}
+	delete(s.Positions, "ETH")
+
+	if !recordPositionOpen(s, StrategyConfig{ID: "hl-live", Platform: "hyperliquid", Type: "perps"}, exec.OpenTrade, nil) {
+		t.Fatal("recordPositionOpen returned false, want fallback insert")
+	}
+	assertTradeCount(t, db, "hl-live", 1)
+	if len(s.TradeHistory) != 1 || s.TradeHistory[0].ExchangeOrderID != "12345" {
+		t.Fatalf("fallback trade = %+v, want bare deferred trade recorded", s.TradeHistory)
+	}
+}
+
+func assertTradeCount(t *testing.T, db *StateDB, strategyID string, want int) {
+	t.Helper()
+	var count int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM trades WHERE strategy_id = ?", strategyID).Scan(&count); err != nil {
+		t.Fatalf("count trades for %s: %v", strategyID, err)
+	}
+	if count != want {
+		t.Fatalf("trade rows for %s = %d, want %d", strategyID, count, want)
+	}
+}
+
 // TestRecordTrade_OutOfOrderFailureRecoveredBySaveState verifies the dedup
 // fix for the #289 carry-over: when an earlier-timestamped RecordTrade fails
 // eager-insert but a later-timestamped one succeeds, the pre-fix MAX(timestamp)
