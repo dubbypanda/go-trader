@@ -257,12 +257,13 @@ Closes sold options early. `profit_target_pct` (% of premium captured), `stop_lo
 For hand-placed positions (or TradingView alerts) tracked by the scheduler for P&L, stops/TPs, and Discord summaries, declare a `type: "manual"` strategy and use:
 
 ```bash
-./go-trader manual-open  --strategy hl-manual-btc --side long  --notional 500 --atr 250
-./go-trader manual-open  --strategy hl-manual-btc --side short --size 0.05 --record-only --fill-price 64500
-./go-trader manual-close --strategy hl-manual-btc [--fraction 0.5]
+./go-trader manual-open  hl-manual-btc                                          # defaults: --side long --margin 50
+./go-trader manual-open  hl-manual-btc --side long  --notional 500 --atr 250
+./go-trader manual-open  hl-manual-btc --side short --size 0.05 --record-only --fill-price 64500
+./go-trader manual-close hl-manual-btc [--qty 0.025]
 ```
 
-Sizing is mutually exclusive (`--size` / `--notional` / `--margin`). Omitting `--atr` arms a leverage-aware fallback (`0.1 * fill_price / leverage`). SL + N-tier TPs are placed inline so the position is never naked; on queue-insert failure the scheduler auto-flattens and cancels the protective orders.
+Sizing flags are mutually exclusive (`--size` / `--notional` / `--margin`); when all three are omitted (and not `--record-only`), `--margin 50` is auto-applied. `--side` defaults to `long`. Omitting `--atr` auto-fetches ATR(14) from Hyperliquid OHLCV for the strategy's symbol+timeframe; a leverage-aware fallback (`0.1 * fill_price / leverage`) is used only if the fetch fails. SL + N-tier TPs are placed inline so the position is never naked; on queue-insert failure the scheduler auto-flattens and cancels the protective orders. `type=manual` strategies with no stop fields default to `stop_loss_atr_mult = 1.5×`.
 
 ---
 

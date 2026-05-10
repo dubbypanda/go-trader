@@ -243,13 +243,15 @@ When in doubt, treat as runtime default and prompt. Regenerate from `git log --o
 - **Owner DM on HL TP/SL fill (#661/#663)** — was: reconciler-detected TP/SL fills only surfaced via the next summary post (up to 5 min later). Now: all three reconciler detectors emit an owner DM the same cycle. Default on; disable with top-level `notify_tp_sl_fills: false`. Filled TP tiers also marked `✓` in Discord/Telegram position summaries (#662/#664) — no toggle
 - **Sole-owner TP partial-fill attribution (#670/#672)** — was: non-shared HL perps strategies silently absorbed TP partial fills (no Trade row, no realized PnL credited, no `#T`/W-L update, no owner DM); final-tier flatten was booked at SL trigger price when the auto-cancel hadn't propagated. Now: `tryBookSoleOwnerTPFill` mirrors shared-coin Detector 3 — books partial drift / final-tier flatten at the actual VWAP fill price (or configured TP price as fallback) and emits a TP{n} owner DM. **Full-close attribution requires ALL `TPOIDs[i]==0`** so a residual closed by SL/operator/CB after a prior partial TP defers to the legacy SL branch instead of mis-attributing to the already-booked tier. Fires automatically — no operator action.
 - **TP-fired close attributed to TP fills, not SL trigger (#673/#675)** — was: `syncHyperliquidAccountPositions` saw a state position vanish on-chain with `StopLossOID > 0` and booked the close at the SL trigger price, producing fictitious losses on dual-TP flattens (HL auto-cancels the resting SL once on-chain qty hits zero). Now: `hlAttemptCloseFromTPFills` queries `userFills` for the SL OID first; if SL has no fills but TP OIDs do, books each filled tier as a partial close at VWAP. Falls through to the legacy SL path on confirmed SL fills (preserves the #621 partial-qty adjustment). Fires automatically.
+- **manual-open ATR auto-fetch (#689/#690)** — was: `manual-open --atr <X>` was effectively required because omitting it triggered the leverage-aware fallback `0.1*fillPrice/leverage` (≈10% margin at 1× ATR) on every open. Now: when `--atr` is omitted the binary calls `check_hyperliquid.py --fetch-atr` to fetch ATR(14) from HL OHLCV at the strategy's symbol+timeframe — same baseline strategy opens get via `ensure_atr_indicator`. 50%-of-fillPrice plausibility guard mirrors `stampEntryATRIfOpened`. `computeFallbackATR` is preserved as a last-resort when the fetch fails (network error, insufficient candles), behind a single combined notifier message. The startup probe also exercises `--fetch-atr` against `check_hyperliquid.py`, so a stale Python missing `run_fetch_atr` fails the probe instead of silently degrading. Fires automatically — no operator action.
+- **manual-open operator-friendly defaults (#691/#692)** — was: `manual-open` required explicit `--side` and one of `--size`/`--notional`/`--margin`; `type=manual` strategies with no stop fields inherited the fleet-wide `default_stop_loss_atr_mult` (typically 1.0× ATR). Now: `--side` defaults to `long`; when no sizing flag is passed (and not `--record-only`), `--margin 50` is auto-applied so `./go-trader manual-open <id>` is a valid smoke command; `type=manual` strategies with all five HL stop fields omitted default `stop_loss_atr_mult` to **1.5× ATR** (`defaultManualStopLossATRMult`) — non-manual HL perps keep the tighter fleet default. Explicit `stop_loss_atr_mult`/other stop fields still win; fleet `default_stop_loss_atr_mult: 0` opts manual out too. Init wizard `manualLeverage` default bumped from 10 to 20 (matches `--json` fallback in `generateConfig`).
 
 **Opt-in field**
 - `trailing_stop_pct` (#502); `trailing_stop_atr_mult` (#507 — initial trigger deferred one cycle)
 - Open/close composition (#483); `stop_loss_margin_pct` (#490); `margin_per_trade_usd` (#520)
 - `tiered_tp_atr_live` (#527 — `atr_source` param, falls back to entry ATR on warm-up)
 - Regime detection `regime.enabled` + `allowed_regimes` (#541/#546/#558 — `Trade.Regime` column added on first start)
-- **`type: "manual"` strategy + `manual-open` / `manual-close` CLI (#569)** — operator-driven HL perps with auto-defaults SL@1×ATR + `tiered_tp_atr_live` (TP1@2× / TP2@3×); can now share a coin with HL perps or another `type=manual` (#619/#620 — blanket ban lifted; owner guards + `shouldCloseFullPosition` + `extraCancelOIDs` prevent cross-strategy mutation; peers must agree on `leverage` and `margin_mode`). SL + TP[n] orders now placed inline on `manual-open` (#633) so the position is never naked between fill and the next scheduler cycle; `--atr` is optional — fallback `0.1*fillPrice/leverage` is used when omitted (risks ~10% margin at 1× ATR)
+- **`type: "manual"` strategy + `manual-open` / `manual-close` CLI (#569)** — operator-driven HL perps with auto-defaults SL@1.5×ATR (#691/#692; was 1×ATR) + `tiered_tp_atr_live` (TP1@2× / TP2@3×); can now share a coin with HL perps or another `type=manual` (#619/#620 — blanket ban lifted; owner guards + `shouldCloseFullPosition` + `extraCancelOIDs` prevent cross-strategy mutation; peers must agree on `leverage` and `margin_mode`). SL + TP[n] orders now placed inline on `manual-open` (#633) so the position is never naked between fill and the next scheduler cycle. **`--atr` is optional and now auto-fetched (#689/#690):** when omitted, the binary calls `check_hyperliquid.py --fetch-atr` to compute ATR(14) from the strategy's symbol+timeframe (same baseline strategy opens see via `ensure_atr_indicator`); falls back to `0.1*fillPrice/leverage` only if the fetch fails (network error, insufficient candles). **`--side` defaults to `long` (#691/#692);** when no sizing flag is passed (and not `--record-only`), defaults to `--margin 50`
 - **`discord.trade_alert_channels` / `telegram.trade_alert_channels` (#572/#573)** — optional map to route trade-fill alerts to a separate channel; omit to keep current behavior (summaries + alerts on same `channels` entry)
 - **N-tier HL TP via `params.tiers` (#615/issue #612)** — list of `{atr_multiple, close_fraction}` (cumulative); default `[{1×,0.5},{2×,1.0}]`; final tier coerced to 1.0 so on-chain TPs sum to full position; non-numeric values rejected per tier. `Position.TPOIDs` / `positions.tp_oids_json` SQLite column (legacy `tp1_oid` / `tp2_oid` retained for rollback to pre-#615 — only first two tiers survive a downgrade)
 
@@ -387,7 +389,7 @@ When the user says `/menu`, "show menu", "what can I configure", "what's availab
    /go-trader
    ./go-trader init
    ./go-trader init --json '{...}' --output scheduler/config.json
-   ./go-trader manual-open <strategy-id> --side long|short (--size N | --notional N | --margin N)
+   ./go-trader manual-open <strategy-id> [--side long|short] [--size N | --notional N | --margin N]
    ./go-trader manual-close <strategy-id> [--qty N]
    ./go-trader backfill hl-fees [--strategy <id>|--all] [--apply] [--reset-cash]
    sudo systemctl start|stop|restart|status go-trader
@@ -404,7 +406,7 @@ When the user says `/menu`, "show menu", "what can I configure", "what's availab
 
 ## Manual Trading (HL perps)
 
-Use `type: "manual"` on Hyperliquid for hand-driven entries/exits with scheduler-tracked P/L, close evaluators (default SL@1×ATR + `tiered_tp_atr_live` TP1@2× / TP2@3×), and Discord trade DMs (#569).
+Use `type: "manual"` on Hyperliquid for hand-driven entries/exits with scheduler-tracked P/L, close evaluators (default SL@1.5×ATR + `tiered_tp_atr_live` TP1@2× / TP2@3×), and Discord trade DMs (#569).
 
 Config skeleton (no `script` / `args` / `interval_seconds` — `LoadConfig` fills them):
 
@@ -417,12 +419,13 @@ Multiple `type=manual` strategies and HL perps strategies may share a coin (#619
 CLI:
 
 ```bash
-# Open — pick exactly one of --size, --notional, --margin
+# Open — pick at most one of --size, --notional, --margin
+./go-trader manual-open hl-manual-btc                              # defaults: --side long --margin 50
 ./go-trader manual-open hl-manual-btc --side long --size 0.01
 ./go-trader manual-open hl-manual-btc --side long --notional 500
 ./go-trader manual-open hl-manual-btc --side short --margin 100   # margin × leverage = notional
 
-# Optional: pass live ATR for accurate SL/TP distances; omit to use fallback
+# Optional: pass live ATR for accurate SL/TP distances; omit to auto-fetch ATR(14)
 ./go-trader manual-open hl-manual-btc --side long --size 0.01 --atr 850
 
 # Close — full or partial
@@ -437,7 +440,9 @@ CLI:
 Notes:
 
 - `--record-only` skips the live HL order; pair with `--fill-price`. SL is **not** auto-armed in record-only mode — place the trigger on the UI manually.
-- SL and TP[n] reduce-only orders are placed **inline** on open (#633). `--atr` is optional: when omitted, `0.1*fillPrice/leverage` is used as a fallback ATR (≈10% margin risked at 1× ATR SL). Pass `--atr` for accuracy when you have the live indicator value.
+- SL and TP[n] reduce-only orders are placed **inline** on open (#633). `--atr` is optional: when omitted, the binary auto-fetches ATR(14) from the strategy's symbol+timeframe via `check_hyperliquid.py --fetch-atr` (#690), matching what `ensure_atr_indicator` would compute on a baseline strategy open. If the fetch fails (network error, insufficient candles), it falls back to `0.1*fillPrice/leverage` (≈10% margin risked at 1× ATR SL) and emits one combined notifier message. Pass `--atr` explicitly when you have a live indicator value and want to skip the network round-trip.
+- `--side` defaults to `long` (#691/#692). When no sizing flag is passed (and not `--record-only`), `--margin 50` is auto-applied so `manual-open <strategy-id>` works as a smoke-test command. Operators who want a different size must still pass `--size`/`--notional`/`--margin` explicitly.
+- Default SL multiplier for `type=manual` is **1.5× ATR** (#691/#692), distinct from the fleet-wide `default_stop_loss_atr_mult` (typically 1.0×) used by non-manual HL perps. Explicit `stop_loss_atr_mult`/`stop_loss_pct`/`stop_loss_margin_pct`/`trailing_stop_pct`/`trailing_stop_atr_mult` on the strategy still wins; fleet `default_stop_loss_atr_mult: 0` opts manual out too.
 - Open blocked when portfolio kill switch active or strategy has pending CB close.
 - Fills queued in `pending_manual_actions`, applied at top of next scheduler cycle (need `--once` if daemon idle). If the queue insert fails after a successful on-chain fill, the position is auto-flattened and SL/TP cancelled (#635); cleanup failures notify loudly — flatten manually.
 - A 99% partial close is **not** silently collapsed into a full close — the queue carries explicit `is_full_close` intent from `--qty`.
