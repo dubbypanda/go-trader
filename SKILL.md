@@ -162,13 +162,18 @@ cd /path/to/go-trader && bash scripts/update.sh --restart
 # Linux bare-process deploy (no systemd)
 cd /path/to/go-trader && bash scripts/update.sh --restart --restart-mode signal
 
+# Sync from a source clone without clobbering secrets/state/venv/binary (#791)
+bash scripts/update.sh --rsync-from /path/to/source-clone --restart
+
 # Batch-update all go-trader-* siblings at once (requires --restart)
 bash scripts/update.sh --all --restart [--update-all-root <parent-dir>]
 ```
 
 `scripts/update.sh` is the single source of truth for `git pull --ff-only` + `uv sync` + `go build` (all three steps gated under `set -euo pipefail`). External deploy automation (Ansible, image bake, etc.) should call this script rather than reproducing the steps inline — that's how asymmetric deploys land.
 
-**Signal mode** (`--restart-mode signal` / `RESTART_MODE=signal`): SIGTERMs the PID in `GO_TRADER_PIDFILE` (default `./go-trader.pid`), respawns via `GO_TRADER_RUN_SH` (default `./run.sh`), then polls `/health` + PID freshness — same verify/rollback flow as systemd mode. Generate a starter `run.sh` with `bash scripts/create-run-sh.sh`. Signal-mode env vars: `GO_TRADER_RUN_SH`, `GO_TRADER_PIDFILE`, `GO_TRADER_SIGNAL_LOG`.
+**`--rsync-from <src>` (#791):** replaces `git pull --ff-only` with an `rsync` from a source clone into the deployment directory. Preserves `.git/`, `scheduler/config.json`, `state.db` and WAL sidecars, `.venv/`, and the live binary; safe to use when the deployment directory has local changes or was not cloned from origin. Before the systemd restart, warns on stderr when any required `EnvironmentFile=` declared in the unit is missing (optional entries prefixed with `-` are skipped silently).
+
+**Signal mode** (`--restart-mode signal` / `RESTART_MODE=signal`): SIGTERMs the PID in `GO_TRADER_PIDFILE` (default `./go-trader.pid`), respawns via `GO_TRADER_RUN_SH` (default `./run.sh`), then polls `/health` + PID freshness — same verify/rollback flow as systemd mode. Generate a starter `run.sh` with `bash scripts/create-run-sh.sh`. Signal-mode env vars: `GO_TRADER_RUN_SH`, `GO_TRADER_PIDFILE`, `GO_TRADER_SIGNAL_LOG`. **Systemd→signal fallback (#786):** when `--restart-mode systemd` encounters a missing unit (systemctl exit 5), update.sh automatically retries via signal mode if `go-trader.pid` and an executable `run.sh` are present — no operator action needed for mixed-mode deployments.
 
 **Batch mode** (`--all`): scans `GO_TRADER_UPDATE_ALL_ROOT` (default: parent of this repo) for `go-trader-*/` directories and runs the full update flow in each sequentially. Each child inherits `GO_TRADER_SERVICE` — set per-worktree env if systemd unit names differ across instances.
 
@@ -335,6 +340,10 @@ When in doubt, treat as runtime default and prompt. Regenerate from `git log --o
   ```
   All three canonical labels (`trending_up`, `trending_down`, `ranging`) required — no undefined runtime fallback. **Resolver semantics:** when flat, resolves from current cycle's regime (fresh entry decision); when a position is open, resolves from `pos.Regime` stamped at open ("hold until natural exit" — the position runs under the policy it opened with until natural SL/TP/close-evaluator exit; new entries in the opposing direction never fire because `PerpsOrderSkipReason` gates on the resolved `Direction`). `base_direction`/`base_invert_signal` remain the static fallback when the block is absent or regime detection disabled. Requires `regime.enabled=true` at top level. HL perps only. SIGHUP: shape add/remove/mutate blocked while a position is open; change-when-flat applies on next cycle. `/status` surfaces `base_direction`, `base_invert_signal`, `effective_direction`, `effective_invert_signal`, `regime_directional_policy` (bool flag), `effective_policy_regime` per strategy. Backtester rejects via `run_backtest.py` (use static `direction`/`invert_signal` for backtesting). Default off; opt in by adding the block.
 - **Perps direction validation honors regime policy (#783/#784)** — was: startup `ValidatePerpsDirectionConfig` compared open position side to base `direction` only, so `regime_directional_policy` strategies could false-alarm (e.g. short opened under `trending_down` while base `direction` is `long`). Now: validation uses stamped `pos.Regime` via `EffectiveDirectionForPosition` (same hold-on-transition as live); unstamped legacy positions skip the warning when any policy regime allows the side. `inspect` direction section aligned (#784). Fires automatically — no operator action unless you previously ignored a `[WARN] perps state-vs-config gap` that was a false positive.
+- **Multi-window regime detection (#792/#793)** — new `regime.windows` map: run independent ADX classifiers per named horizon (value = ADX period in bars); empty = legacy single-lookback unchanged. Per-strategy `regime_gate_window`/`regime_atr_window`/`regime_directional_window` selectors route each consumer to a different horizon. `RegimePayload` from check scripts is now string (legacy) or JSON dict keyed by window name. `positions.regime_windows_json` SQLite column added (migration idempotent). OHLCV limit scales to cover the largest window. `regime.windows` requires restart; per-strategy `regime_*_window` SIGHUP when flat, blocked while open. No default behavior change — existing configs with empty `windows` are unaffected. Opt in by adding `regime.windows` and per-strategy selectors.
+- **update.sh `--rsync-from` + EnvironmentFile warning (#791)** — new `--rsync-from <src>` flag syncs code from a source clone without clobbering `.git/`, config, state DB, venv, or live binary; useful for deployment pipelines that stage builds separately. Before systemd restart, warns on stderr when a required `EnvironmentFile=` path declared in the unit file is missing. No behavior change to trading; no operator action for existing systemd deploys (missing-envfile warning is advisory, restart proceeds).
+- **update.sh systemd→signal fallback (#786)** — when systemd mode cannot find the unit (systemctl exit 5), update.sh automatically retries via signal mode when `go-trader.pid` and an executable `run.sh` are present. No operator action for existing setups.
+- **Probe skips live credential checks (#788)** — `LoadConfigForProbe` no longer requires `HYPERLIQUID_SECRET_KEY` and related env vars during the pre-swap probe step; `LoadConfig` at daemon startup still validates them. No behavior change to live trading; probe now succeeds on build machines without exchange credentials.
 
 **Open-position constraint**
 - `margin_mode`, exchange `leverage`, kill-switch identity changes
@@ -594,7 +603,7 @@ sudo systemctl kill -s HUP go-trader   # hot reload (no state loss)
 sudo systemctl restart go-trader       # full restart
 ```
 
-Hot reload (`SIGHUP`) re-applies a safe subset: capital, drawdown, intervals, params, stop-loss (incl. `%`/ATR-mult trailing), sizing leverage, theta-harvest, portfolio risk knobs, summary cadence, correlation thresholds, `allowed_regimes` per-strategy, auto-update mode, Discord/Telegram channels and tokens. Refuses if strategy roster, script/args/type/platform, HTF filter, kill-switch identity, or DB path changed; refuses per-strategy exchange `leverage` / HL `margin_mode` while positions open. Global `regime` block (enabled/period/adx_threshold) requires full restart (mirrors `correlation`). Re-runs HL peer-on-same-coin check (`margin_mode`/exchange `leverage` agreement; at most one trailing-stop owner). On rejection, fall back to restart. Status server reflects new port immediately.
+Hot reload (`SIGHUP`) re-applies a safe subset: capital, drawdown, intervals, params, stop-loss (incl. `%`/ATR-mult trailing), sizing leverage, theta-harvest, portfolio risk knobs, summary cadence, correlation thresholds, `allowed_regimes` per-strategy, auto-update mode, Discord/Telegram channels and tokens; per-strategy `regime_*_window` selectors when flat. Refuses if strategy roster, script/args/type/platform, HTF filter, kill-switch identity, or DB path changed; refuses per-strategy exchange `leverage` / HL `margin_mode` while positions open; refuses `regime_*_window` while open. Global `regime` block (enabled/period/adx_threshold/windows) requires full restart (mirrors `correlation`). Re-runs HL peer-on-same-coin check (`margin_mode`/exchange `leverage` agreement; at most one trailing-stop owner). On rejection, fall back to restart. Status server reflects new port immediately.
 
 Common changes:
 
@@ -681,7 +690,7 @@ Regime detection (global opt-in):
 - `regime.enabled` — must be `true` for any per-strategy `allowed_regimes` to fire
 - `regime.period` — ADX lookback (Wilder), default 14
 - `regime.adx_threshold` — below = `ranging`, default 20.0
-- Valid labels: `trending_up`, `trending_down`, `ranging`. `AllowedRegimes` SIGHUP-compatible; global `regime` block needs full restart. Not on type=options.
+- Valid labels: `trending_up`, `trending_down`, `ranging`. `AllowedRegimes` SIGHUP-compatible; global `regime` block (incl. `windows`) needs full restart. Per-strategy `regime_*_window` selectors SIGHUP when flat; blocked while open. Not on type=options.
 
 ---
 

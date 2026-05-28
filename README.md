@@ -324,16 +324,19 @@ Historical `exchange_fee = 0` rows can be rewritten from Hyperliquid `userFills`
 The canonical update path is `scripts/update.sh` — `git pull --ff-only` → `uv sync` → `go build` (version-stamped) → atomic binary swap → optional restart with `/health`-and-PID verify and automatic rollback to the previous binary on failed restart. If `go` is not on `PATH`, the script tries common install locations (`/opt/homebrew/bin/go`, then `/usr/local/go/bin/go`). With `--restart`, it warns when systemd's `ExecStart` binary is not the same file as this checkout's `./go-trader`, so you can catch a unit pointed at the wrong path before assuming the upgrade took effect. A startup compatibility probe refuses to launch on a Go/Python version mismatch, so prefer the script over hand-rolled rebuilds. `systemctl restart` drains gracefully (in-flight `--execute` / close orders complete; read-only checks cancel immediately) and exits within ~20s instead of hanging on systemd's SIGKILL.
 
 Two restart modes are supported:
-- **`--restart-mode systemd`** (default) — `sudo systemctl restart <unit>`, polls `systemctl is-active` + `/health`. If the unit is not loaded (systemctl exit 5), systemd mode falls back to the signal path when `go-trader.pid` and an executable `run.sh` exist (#785).
+- **`--restart-mode systemd`** (default) — `sudo systemctl restart <unit>`, polls `systemctl is-active` + `/health`. If the unit is not loaded (systemctl exit 5), systemd mode falls back to the signal path when `go-trader.pid` and an executable `run.sh` exist (#785). Before restarting, warns when any `EnvironmentFile=` declared in the unit is absent so missing secrets are caught before the new binary starts.
 - **`--restart-mode signal`** — for Linux bare-process deploys without systemd. SIGTERMs the PID from a pidfile (`./go-trader.pid` by default), then respawns via a wrapper script (`./run.sh` by default) with the same `/health`+PID verify and rollback. Generate a starter wrapper with `bash scripts/create-run-sh.sh`.
+
+Use `--rsync-from <source-dir>` to sync code from a staged build clone instead of `git pull`; preserves `.git/`, config, state DB, venv, and the live binary in the deployment directory — useful for pipelines that build on a separate machine.
 
 Use `--all` to batch-update all `go-trader-*/` sibling directories in one pass (requires `--restart`).
 
 ```bash
-sudo bash scripts/update.sh --restart                  # systemd deploy
-bash scripts/update.sh --restart --restart-mode signal # bare-process deploy
-bash scripts/update.sh --all --restart                 # update all instances
-bash scripts/update.sh                                 # build only, no restart
+sudo bash scripts/update.sh --restart                              # systemd deploy
+bash scripts/update.sh --restart --restart-mode signal             # bare-process deploy
+bash scripts/update.sh --rsync-from /path/to/staged-build --restart  # deploy from staged clone
+bash scripts/update.sh --all --restart                             # update all instances
+bash scripts/update.sh                                             # build only, no restart
 ```
 
 | Change | Action |
