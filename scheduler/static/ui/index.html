@@ -17,7 +17,7 @@
   </head>
   <body>
     <div class="shell">
-      <aside class="sidebar">
+      <aside id="app-sidebar" class="sidebar" tabindex="-1">
         <div class="brand">
           <div class="brand-mark">gt</div>
           <div>
@@ -34,12 +34,25 @@
 
       <main class="workspace">
         <header class="topbar">
-          <div class="topbar-heading">
-            <div class="topbar-title-row">
-              <h2 id="active-title">Dashboard</h2>
-              <span id="regime-badge" class="regime-badge" hidden></span>
+          <div class="topbar-start">
+            <button
+              id="sidebar-toggle"
+              class="icon-button sidebar-toggle"
+              type="button"
+              title="Menu"
+              aria-label="Open menu"
+              aria-expanded="false"
+              aria-controls="app-sidebar"
+            >
+              <span class="sidebar-toggle-icon" aria-hidden="true"></span>
+            </button>
+            <div class="topbar-heading">
+              <div class="topbar-title-row">
+                <h2 id="active-title">Dashboard</h2>
+                <span id="regime-badge" class="regime-badge" hidden></span>
+              </div>
+              <p id="active-subtitle">Select a strategy</p>
             </div>
-            <p id="active-subtitle">Select a strategy</p>
           </div>
           <div class="toolbar">
             <button id="dark-mode-toggle" class="icon-button" type="button" title="Dark mode" aria-label="Toggle dark mode" aria-pressed="false">
@@ -83,6 +96,7 @@
         </section>
       </main>
     </div>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" aria-hidden="true"></div>
     <script src="/dashboard/lightweight-charts.standalone.production.js"></script>
     <script src="/dashboard/app.js"></script>
   </body>
