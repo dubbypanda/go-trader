@@ -471,10 +471,10 @@ func tradeMarkers(trades []Trade) []UITradeMarker {
 	return out
 }
 
-// tradeMarkersForTable returns markers oldest-first for table display (#808).
+// tradeMarkersForTable returns a copy of markers (already oldest-first from tradeMarkers) for the trades JSON key (#808).
 func tradeMarkersForTable(markers []UITradeMarker) []UITradeMarker {
 	if len(markers) == 0 {
-		return nil
+		return []UITradeMarker{}
 	}
 	out := make([]UITradeMarker, len(markers))
 	copy(out, markers)

@@ -179,9 +179,10 @@
     const label = tradeSideLabel(trade);
     if (label === "BUY") return "trade-history-side-buy";
     if (label === "SELL") return "trade-history-side-sell";
-    if (label === "CLOSE") {
-      return String(trade.side).toLowerCase() === "buy" ? "trade-history-side-buy" : "trade-history-side-sell";
-    }
+    if (label === "CLOSE") return "";
+    const side = trade.side ? String(trade.side).toLowerCase() : "";
+    if (side === "buy") return "trade-history-side-buy";
+    if (side === "sell") return "trade-history-side-sell";
     return "";
   }
 
