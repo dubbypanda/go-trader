@@ -1,10 +1,15 @@
 (function () {
   const SIDEBAR_STORAGE_KEY = "goTraderSidebarOpen";
   const MOBILE_SIDEBAR_MQ = "(max-width: 980px)";
+  const VIEW_MODE_KEY = "goTraderViewMode";
 
   const state = {
     strategies: [],
+    overviewRows: [],
     activeID: "",
+    viewMode: "detail",
+    sortKey: "id",
+    sortDir: "asc",
     chart: null,
     series: null,
     timer: 0,
@@ -25,6 +30,7 @@
     darkToggle: document.getElementById("dark-mode-toggle"),
     darkIcon: document.getElementById("dark-mode-icon"),
     refresh: document.getElementById("refresh-button"),
+    viewMode: document.getElementById("view-mode-button"),
     interval: document.getElementById("refresh-interval"),
     statusDot: document.getElementById("status-dot"),
     statusLabel: document.getElementById("status-label"),
@@ -36,6 +42,9 @@
     sidebarToggle: document.getElementById("sidebar-toggle"),
     sidebarBackdrop: document.getElementById("sidebar-backdrop"),
     workspace: document.querySelector(".workspace"),
+    overviewPanel: document.getElementById("overview-panel"),
+    overviewBody: document.getElementById("overview-body"),
+    detailPanel: document.getElementById("detail-panel"),
   };
 
   function isMobileSidebar() {
@@ -181,6 +190,32 @@
     applyChartTheme();
   }
 
+
+  function loadViewMode() {
+    const saved = window.localStorage.getItem(VIEW_MODE_KEY);
+    return saved === "table" ? "table" : "detail";
+  }
+
+  function saveViewMode(mode) {
+    window.localStorage.setItem(VIEW_MODE_KEY, mode);
+  }
+
+  function applyViewMode() {
+    const tableMode = state.viewMode === "table";
+    els.overviewPanel.hidden = !tableMode;
+    els.detailPanel.hidden = tableMode;
+    els.viewMode.textContent = tableMode ? "Detail" : "Table";
+    els.viewMode.setAttribute("aria-pressed", tableMode ? "true" : "false");
+    document.querySelector(".content").classList.toggle("content-table", tableMode);
+  }
+
+  function toggleViewMode() {
+    state.viewMode = state.viewMode === "table" ? "detail" : "table";
+    saveViewMode(state.viewMode);
+    applyViewMode();
+    refreshAll().catch(handleRefreshError);
+  }
+
   function initChart() {
     if (state.chart) return;
     state.chart = LightweightCharts.createChart(els.chart, Object.assign({}, chartThemeOptions(), {
@@ -242,7 +277,7 @@
         button.querySelector(".strategy-meta").textContent =
           [strategy.type, strategy.timeframe, strategy.direction].filter(Boolean).join(" / ");
         button.addEventListener("click", function () {
-          selectStrategy(strategy.id);
+          selectStrategy(strategy.id).catch(handleRefreshError);
         });
         els.list.appendChild(button);
         const cached = state.sparklines[strategy.id];
@@ -319,7 +354,8 @@
     });
   }
 
-  async function selectStrategy(id) {
+  async function selectStrategy(id, options) {
+    const opts = options || {};
     state.activeID = id;
     updateRegimeBadge("");
     const strategy = activeStrategy();
@@ -328,6 +364,11 @@
       els.subtitle.textContent = [strategy.platform, strategy.symbol, strategy.timeframe].filter(Boolean).join(" / ");
     }
     renderStrategies();
+    if (opts.switchToDetail) {
+      state.viewMode = "detail";
+      saveViewMode(state.viewMode);
+      applyViewMode();
+    }
     if (isMobileSidebar()) {
       setSidebarOpen(false);
     }
@@ -449,8 +490,82 @@
       escapeHTML(side || "-") + '</span><span>' + escapeHTML(detail) + '</span><span></span></div>';
   }
 
+
+  function sortValue(row, key) {
+    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe") {
+      const n = Number(row[key]);
+      return Number.isFinite(n) ? n : -Infinity;
+    }
+    const value = row[key];
+    return value === undefined || value === null ? "" : String(value).toLowerCase();
+  }
+
+  function sortedOverviewRows() {
+    const rows = state.overviewRows.slice();
+    const dir = state.sortDir === "desc" ? -1 : 1;
+    rows.sort(function (a, b) {
+      const av = sortValue(a, state.sortKey);
+      const bv = sortValue(b, state.sortKey);
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    return rows;
+  }
+
+  function updateSortButtons() {
+    document.querySelectorAll(".sort-button").forEach(function (button) {
+      const key = button.dataset.key;
+      const active = key === state.sortKey;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-sort", active ? (state.sortDir === "asc" ? "ascending" : "descending") : "none");
+    });
+  }
+
+  function renderOverviewTable() {
+    const rows = sortedOverviewRows();
+    els.overviewBody.innerHTML = rows.map(function (row) {
+      const pnlClassName = row.pnl_pct > 0 ? "pnl-pos" : row.pnl_pct < 0 ? "pnl-neg" : "";
+      return '<tr class="overview-row' + (row.id === state.activeID ? " active" : "") + '" data-id="' + escapeHTML(row.id) + '">' +
+        "<td>" + escapeHTML(row.id) + "</td>" +
+        "<td>" + escapeHTML(row.platform || "-") + "</td>" +
+        "<td>" + escapeHTML(row.symbol || "-") + "</td>" +
+        '<td class="' + pnlClassName + '">' + escapeHTML(fmtPct(row.pnl_pct)) + "</td>" +
+        "<td>" + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
+        "<td>" + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
+        "<td>" + escapeHTML(row.regime || "-") + "</td>" +
+        "<td>" + escapeHTML(row.direction || "-") + "</td>" +
+        "</tr>";
+    }).join("");
+    updateSortButtons();
+  }
+
+  async function refreshOverview() {
+    const resp = await getJSON("/api/strategies/overview");
+    state.overviewRows = resp.strategies || [];
+    renderOverviewTable();
+    els.statusDot.className = "status-dot ok";
+    els.statusLabel.textContent = "Live";
+    els.statusGrid.innerHTML = "<dt>Strategies</dt><dd>" + escapeHTML(String(state.overviewRows.length)) + "</dd>";
+    els.positions.innerHTML = '<div class="position-row"><span>Table view</span><span>Select a row for detail</span></div>';
+  }
+
+  function handleRefreshError(err) {
+    if (err.status === 401) {
+      showAuthPrompt();
+      return;
+    }
+    els.statusDot.className = "status-dot error";
+    els.statusLabel.textContent = "Error";
+    els.statusGrid.innerHTML = "<dt>Message</dt><dd>" + escapeHTML(err.message) + "</dd>";
+  }
+
   async function refreshAll() {
     try {
+      if (state.viewMode === "table") {
+        await refreshOverview();
+        return;
+      }
       await Promise.all([
         refreshChart(),
         refreshStatus(),
@@ -459,13 +574,7 @@
         })),
       ]);
     } catch (err) {
-      if (err.status === 401) {
-        showAuthPrompt();
-        return;
-      }
-      els.statusDot.className = "status-dot error";
-      els.statusLabel.textContent = "Error";
-      els.statusGrid.innerHTML = "<dt>Message</dt><dd>" + escapeHTML(err.message) + "</dd>";
+      handleRefreshError(err);
     }
   }
 
@@ -474,10 +583,7 @@
     const ms = Number(els.interval.value);
     if (ms > 0) {
       state.timer = setInterval(function () {
-        refreshStatus();
-        loadSparklines(filteredStrategies().map(function (s) {
-          return s.id;
-        }));
+        refreshAll().catch(handleRefreshError);
       }, ms);
     }
   }
@@ -517,6 +623,8 @@
   }
 
   async function boot() {
+    state.viewMode = loadViewMode();
+    applyViewMode();
     updateDarkModeToggle();
     initChart();
     const resp = await getJSON("/api/strategies");
@@ -524,6 +632,8 @@
     renderStrategies();
     if (state.strategies.length) {
       await selectStrategy(state.strategies[0].id);
+    } else {
+      await refreshAll();
     }
     scheduleRefresh();
   }
@@ -533,8 +643,28 @@
   els.darkToggle.addEventListener("click", function () {
     setDarkMode(!isDarkMode());
   });
-  els.refresh.addEventListener("click", refreshAll);
+  els.refresh.addEventListener("click", function () {
+    refreshAll().catch(handleRefreshError);
+  });
+  els.viewMode.addEventListener("click", toggleViewMode);
   els.interval.addEventListener("change", scheduleRefresh);
+  els.overviewBody.addEventListener("click", function (event) {
+    const row = event.target.closest(".overview-row");
+    if (!row || !row.dataset.id) return;
+    selectStrategy(row.dataset.id, { switchToDetail: true }).catch(handleRefreshError);
+  });
+  document.querySelectorAll(".sort-button").forEach(function (button) {
+    button.addEventListener("click", function () {
+      const key = button.dataset.key;
+      if (state.sortKey === key) {
+        state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        state.sortKey = key;
+        state.sortDir = "asc";
+      }
+      renderOverviewTable();
+    });
+  });
   els.authPanel.addEventListener("submit", function (event) {
     event.preventDefault();
     const token = els.authToken.value.trim();
@@ -551,9 +681,7 @@
       showAuthPrompt();
       return;
     }
-    els.statusDot.className = "status-dot error";
-    els.statusLabel.textContent = "Error";
-    els.statusGrid.innerHTML = "<dt>Message</dt><dd>" + escapeHTML(err.message) + "</dd>";
+    handleRefreshError(err);
   });
 
   function showAuthPrompt() {

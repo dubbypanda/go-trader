@@ -55,6 +55,7 @@
             </div>
           </div>
           <div class="toolbar">
+            <button id="view-mode-button" class="view-mode-button" type="button" aria-pressed="false">Detail</button>
             <button id="dark-mode-toggle" class="icon-button" type="button" title="Dark mode" aria-label="Toggle dark mode" aria-pressed="false">
               <span id="dark-mode-icon" aria-hidden="true">☾</span>
             </button>
@@ -71,28 +72,47 @@
         </header>
 
         <section class="content">
-          <div class="chart-panel">
-            <div id="chart"></div>
-            <div id="empty-chart" class="empty-state">No candles yet</div>
+          <div id="overview-panel" class="overview-panel" hidden>
+            <table class="overview-table">
+              <thead>
+                <tr>
+                  <th scope="col"><button type="button" class="sort-button" data-key="id">ID</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="platform">Platform</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="symbol">Symbol</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="pnl_pct">PnL %</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="win_rate">Win Rate</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="sharpe">Sharpe</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="regime">Regime</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="direction">Direction</button></th>
+                </tr>
+              </thead>
+              <tbody id="overview-body"></tbody>
+            </table>
           </div>
-          <aside class="status-panel">
-            <div class="status-header">
-              <span id="status-dot" class="status-dot"></span>
-              <span id="status-label">Waiting</span>
+          <div id="detail-panel" class="detail-panel">
+            <div class="chart-panel">
+              <div id="chart"></div>
+              <div id="empty-chart" class="empty-state">No candles yet</div>
             </div>
-            <form id="auth-panel" class="auth-panel" hidden>
-              <label>
-                <span>Status token</span>
-                <input id="auth-token" type="password" autocomplete="current-password" placeholder="Status token">
-              </label>
-              <button type="submit">Save</button>
-            </form>
-            <dl id="status-grid" class="status-grid"></dl>
-            <div class="positions">
-              <h3>Positions</h3>
-              <div id="positions-list"></div>
-            </div>
-          </aside>
+            <aside class="status-panel">
+              <div class="status-header">
+                <span id="status-dot" class="status-dot"></span>
+                <span id="status-label">Waiting</span>
+              </div>
+              <form id="auth-panel" class="auth-panel" hidden>
+                <label>
+                  <span>Status token</span>
+                  <input id="auth-token" type="password" autocomplete="current-password" placeholder="Status token">
+                </label>
+                <button type="submit">Save</button>
+              </form>
+              <dl id="status-grid" class="status-grid"></dl>
+              <div class="positions">
+                <h3>Positions</h3>
+                <div id="positions-list"></div>
+              </div>
+            </aside>
+          </div>
         </section>
       </main>
     </div>
