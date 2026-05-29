@@ -1,4 +1,7 @@
 (function () {
+  const SIDEBAR_STORAGE_KEY = "goTraderSidebarOpen";
+  const MOBILE_SIDEBAR_MQ = "(max-width: 980px)";
+
   const state = {
     strategies: [],
     activeID: "",
@@ -26,7 +29,97 @@
     authToken: document.getElementById("auth-token"),
     statusGrid: document.getElementById("status-grid"),
     positions: document.getElementById("positions-list"),
+    sidebar: document.getElementById("app-sidebar"),
+    sidebarToggle: document.getElementById("sidebar-toggle"),
+    sidebarBackdrop: document.getElementById("sidebar-backdrop"),
+    workspace: document.querySelector(".workspace"),
   };
+
+  function isMobileSidebar() {
+    return window.matchMedia(MOBILE_SIDEBAR_MQ).matches;
+  }
+
+  function setSidebarOpen(open) {
+    if (!isMobileSidebar()) {
+      document.body.classList.remove("sidebar-open");
+      if (els.workspace) {
+        els.workspace.inert = false;
+      }
+      if (els.sidebarToggle) {
+        els.sidebarToggle.setAttribute("aria-expanded", "false");
+        els.sidebarToggle.setAttribute("aria-label", "Open menu");
+      }
+      if (els.sidebarBackdrop) {
+        els.sidebarBackdrop.setAttribute("aria-hidden", "true");
+      }
+      try {
+        sessionStorage.removeItem(SIDEBAR_STORAGE_KEY);
+      } catch (_err) {
+        /* sessionStorage unavailable */
+      }
+      return;
+    }
+    const wasOpen = document.body.classList.contains("sidebar-open");
+    document.body.classList.toggle("sidebar-open", open);
+    if (els.sidebarToggle) {
+      els.sidebarToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      els.sidebarToggle.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+    }
+    if (els.sidebarBackdrop) {
+      els.sidebarBackdrop.setAttribute("aria-hidden", open ? "false" : "true");
+    }
+    if (els.workspace) {
+      els.workspace.inert = open;
+    }
+    if (open && els.sidebar) {
+      els.sidebar.focus();
+    } else if (!open && wasOpen && els.sidebarToggle) {
+      els.sidebarToggle.focus();
+    }
+    try {
+      if (open) {
+        sessionStorage.setItem(SIDEBAR_STORAGE_KEY, "1");
+      } else {
+        sessionStorage.removeItem(SIDEBAR_STORAGE_KEY);
+      }
+    } catch (_err) {
+      /* sessionStorage unavailable */
+    }
+  }
+
+  function readStoredSidebarOpen() {
+    try {
+      return sessionStorage.getItem(SIDEBAR_STORAGE_KEY) === "1";
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function initSidebar() {
+    if (!els.sidebarToggle || !els.sidebarBackdrop) return;
+
+    function syncSidebarForViewport() {
+      if (!isMobileSidebar()) {
+        setSidebarOpen(false);
+        return;
+      }
+      setSidebarOpen(readStoredSidebarOpen());
+    }
+
+    els.sidebarToggle.addEventListener("click", function () {
+      setSidebarOpen(!document.body.classList.contains("sidebar-open"));
+    });
+    els.sidebarBackdrop.addEventListener("click", function () {
+      setSidebarOpen(false);
+    });
+    window.matchMedia(MOBILE_SIDEBAR_MQ).addEventListener("change", syncSidebarForViewport);
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
+        setSidebarOpen(false);
+      }
+    });
+    syncSidebarForViewport();
+  }
 
   function authHeaders() {
     const token = window.localStorage.getItem("goTraderStatusToken");
@@ -161,6 +254,9 @@
       els.subtitle.textContent = [strategy.platform, strategy.symbol, strategy.timeframe].filter(Boolean).join(" / ");
     }
     renderStrategies();
+    if (isMobileSidebar()) {
+      setSidebarOpen(false);
+    }
     await refreshAll();
   }
 
@@ -345,6 +441,7 @@
     scheduleRefresh();
   }
 
+  initSidebar();
   els.search.addEventListener("input", renderStrategies);
   els.darkToggle.addEventListener("click", function () {
     setDarkMode(!isDarkMode());
