@@ -101,6 +101,22 @@ func strategyTPTiersForRegime(sc StrategyConfig, regime string) []hlProtectionTi
 		if n == "tiered_tp_atr_regime" || n == "tiered_tp_atr_live_regime" {
 			regimeAware = true
 		}
+		// #841 2b: unified per-regime block — select the active regime's scalar
+		// ladder and resolve it through the scalar tier parser below. An unknown
+		// / empty regime yields no tiers this cycle (SL-only), retried next cycle
+		// once stampPositionRegimeIfOpened populates the label.
+		if regimeAware && closeParamsAreUnifiedRegime(ref.Params) {
+			scalar, _, ok := unifiedRegimeScalarParams(ref.Params, regime)
+			if !ok {
+				return nil
+			}
+			sel, _ := closeTierListParam(scalar)
+			tiers := parseHLProtectionTiers(sel)
+			if len(tiers) < 2 {
+				return nil
+			}
+			return finalizeProtectionTiers(tiers)
+		}
 		if v, ok := closeTierListParam(ref.Params); ok {
 			raw = v
 			break
