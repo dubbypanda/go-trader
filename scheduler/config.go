@@ -669,6 +669,18 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 			return nil, fmt.Errorf("read config after v13 migration: %w", err)
 		}
 	}
+	// #841: v15 rewrites close-strategy keys on disk (tiers→tp_tiers, unified
+	// regime block, tp_at_pct→tiered_tp_pct). Run synchronously before parse
+	// so validation sees canonical keys after alias reads are dropped.
+	if needsV15CloseMigration(data) {
+		if err := MigrateConfig(path, nil, nil); err != nil {
+			return nil, fmt.Errorf("v15 close-key migration: %w", err)
+		}
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config after v15 migration: %w", err)
+		}
+	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -784,6 +796,7 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 
 	// Apply per-strategy defaults.
 	for i := range cfg.Strategies {
+		normalizeDeprecatedCloseRef(cfg.Strategies[i].CloseStrategy)
 		// Infer platform from ID prefix for backwards compatibility.
 		if cfg.Strategies[i].Platform == "" {
 			switch {
@@ -877,7 +890,7 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 			// freshly-unmarshaled regime block and cause the scalar default to
 			// be applied on top, triggering a spurious mutex error in
 			// validateRegimeATRConfig (review #735.1).
-			if sc.StopLossPct == nil && sc.StopLossMarginPct == nil && sc.TrailingStopPct == nil && sc.TrailingStopATRMult == nil && sc.StopLossATRMult == nil && !sc.StopLossATRRegime.IsConfigured() && !sc.TrailingStopATRRegime.IsConfigured() {
+			if sc.StopLossPct == nil && sc.StopLossMarginPct == nil && sc.TrailingStopPct == nil && sc.TrailingStopATRMult == nil && sc.StopLossATRMult == nil && !sc.StopLossATRRegime.IsConfigured() && !sc.TrailingStopATRRegime.IsConfigured() && !strategyUsesUnifiedRegimeClose(*sc) {
 				defaultMult := defaultStopLossATRMult
 				sc.StopLossATRMult = &defaultMult
 				fmt.Printf("[INFO] %s: applied default stop_loss_atr_mult=%g (no stop fields set; set stop_loss_atr_mult=0 or default_stop_loss_atr_mult=0 to opt out)\n", sc.ID, defaultStopLossATRMult)
