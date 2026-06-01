@@ -74,7 +74,7 @@ func migrateV15CloseKeys(raw map[string]interface{}) {
 		slMult := scalarStopLossFromStrategy(sc, defaultSL)
 		folded := migrateV15StrategyCloseRefs(sc, slRegime, slMult)
 		if folded {
-			migrateV15FoldStopLossRegime(sc)
+			migrateV15StripStrategyStopOwners(sc)
 		}
 		migrateV15StrategyRegimeBlocks(sc)
 	}
@@ -142,18 +142,28 @@ func scalarStopLossFromStrategy(sc map[string]interface{}, fallback float64) flo
 	return fallback
 }
 
-func migrateV15FoldStopLossRegime(sc map[string]interface{}) {
-	delete(sc, "stop_loss_atr_regime")
+// migrateV15StripStrategyStopOwners removes strategy-level stop fields after a
+// legacy regime close folds into a unified block. The unified close owns SL
+// via per-regime stop_loss_atr; leaving scalar/regime siblings behind fails
+// validateUnifiedCloseSoleOwner on startup (#841).
+func migrateV15StripStrategyStopOwners(sc map[string]interface{}) {
+	for _, key := range []string{
+		"stop_loss_atr_mult",
+		"stop_loss_atr_regime",
+		"stop_loss_pct",
+		"stop_loss_margin_pct",
+		"trailing_stop_atr_mult",
+		"trailing_stop_pct",
+		"trailing_stop_atr_regime",
+	} {
+		delete(sc, key)
+	}
 }
 
 func migrateV15StrategyCloseRefs(sc map[string]interface{}, slRegime map[string]interface{}, slMult float64) bool {
-	folded := false
 	if refRaw, ok := sc["close_strategy"]; ok {
 		if ref, ok := refRaw.(map[string]interface{}); ok {
-			if migrateV15CloseRef(ref, slRegime, slMult) {
-				folded = true
-			}
-			return folded
+			return migrateV15CloseRef(ref, slRegime, slMult)
 		}
 	}
 	closes, ok := sc["close_strategies"].([]interface{})
@@ -161,11 +171,9 @@ func migrateV15StrategyCloseRefs(sc map[string]interface{}, slRegime map[string]
 		return false
 	}
 	if ref, ok := closes[0].(map[string]interface{}); ok {
-		if migrateV15CloseRef(ref, slRegime, slMult) {
-			folded = true
-		}
+		return migrateV15CloseRef(ref, slRegime, slMult)
 	}
-	return folded
+	return false
 }
 
 func migrateV15CloseRef(ref map[string]interface{}, slRegime map[string]interface{}, slMult float64) bool {
@@ -184,7 +192,7 @@ func migrateV15CloseRef(ref map[string]interface{}, slRegime map[string]interfac
 		if !closeParamsAreUnifiedRegime(params) {
 			if tierList, ok := v15TierListRaw(params); ok {
 				ref["params"] = liftLegacyRegimeCloseToUnified(params, tierList, slRegime, slMult)
-				return len(slRegime) > 0
+				return true
 			}
 		}
 	}

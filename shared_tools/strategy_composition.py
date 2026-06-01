@@ -190,6 +190,26 @@ def canonical_close_name(name: str) -> str:
     return _DEPRECATED_CLOSE_NAMES.get(name, name)
 
 
+def rewrite_deprecated_close_ref(name: str, params: Optional[dict]) -> tuple[str, Optional[dict]]:
+    """One-window shim: tp_at_pct → single-tier tiered_tp_pct (#841)."""
+    name = (name or "").strip()
+    resolved = canonical_close_name(name)
+    if name != "tp_at_pct":
+        return resolved, params
+    pct = 0.03
+    if params and params.get("pct") is not None:
+        try:
+            pct = max(float(params.get("pct", 0.03)), 0.0)
+        except (TypeError, ValueError):
+            pct = 0.03
+    out: dict = {
+        "tp_tiers": [{"profit_pct": pct, "close_fraction": 1.0}],
+    }
+    if params and "sl_after" in params:
+        out["sl_after"] = params["sl_after"]
+    return resolved, out
+
+
 def validate_close_strategy_names(
     close_names: Iterable[str],
     get_open_strategy: Callable[[str], object],
@@ -314,7 +334,7 @@ def evaluate_open_close(
     close_evals: list[CloseEvaluation] = []
     market = market_ctx if market_ctx is not None else _default_market_ctx(df)
     for name in close_names:
-        resolved = canonical_close_name(name)
+        resolved, _ = rewrite_deprecated_close_ref(name, None)
         # #640: per-close params arrive via close_params_by_name (carried on the
         # matching StrategyRef on the Go side). Implicit-self close still
         # inherits the open strategy's params unless the operator explicitly
@@ -328,6 +348,7 @@ def evaluate_open_close(
             base_close_params = params
         else:
             base_close_params = None
+        resolved, base_close_params = rewrite_deprecated_close_ref(name, base_close_params)
         if close_evaluate is not None:
             try:
                 result = close_evaluate(resolved, position_ctx or {}, market, base_close_params)

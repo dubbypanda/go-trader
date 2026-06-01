@@ -890,7 +890,7 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 			// freshly-unmarshaled regime block and cause the scalar default to
 			// be applied on top, triggering a spurious mutex error in
 			// validateRegimeATRConfig (review #735.1).
-			if sc.StopLossPct == nil && sc.StopLossMarginPct == nil && sc.TrailingStopPct == nil && sc.TrailingStopATRMult == nil && sc.StopLossATRMult == nil && !sc.StopLossATRRegime.IsConfigured() && !sc.TrailingStopATRRegime.IsConfigured() {
+			if sc.StopLossPct == nil && sc.StopLossMarginPct == nil && sc.TrailingStopPct == nil && sc.TrailingStopATRMult == nil && sc.StopLossATRMult == nil && !sc.StopLossATRRegime.IsConfigured() && !sc.TrailingStopATRRegime.IsConfigured() && !strategyUsesUnifiedRegimeClose(*sc) {
 				defaultMult := defaultStopLossATRMult
 				sc.StopLossATRMult = &defaultMult
 				fmt.Printf("[INFO] %s: applied default stop_loss_atr_mult=%g (no stop fields set; set stop_loss_atr_mult=0 or default_stop_loss_atr_mult=0 to opt out)\n", sc.ID, defaultStopLossATRMult)

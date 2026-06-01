@@ -116,6 +116,9 @@ func TestMigrateV15CloseKeys_LiftLegacyRegime(t *testing.T) {
 	if _, ok := sc["stop_loss_atr_regime"]; ok {
 		t.Error("stop_loss_atr_regime should be removed after fold")
 	}
+	if _, ok := sc["stop_loss_atr_mult"]; ok {
+		t.Error("stop_loss_atr_mult should be removed after fold")
+	}
 	ref := sc["close_strategy"].(map[string]interface{})
 	params := ref["params"].(map[string]interface{})
 	if !closeParamsAreUnifiedRegime(params) {
@@ -136,6 +139,111 @@ func TestMigrateV15CloseKeys_LiftLegacyRegime(t *testing.T) {
 	}
 }
 
+func TestMigrateV15CloseKeys_LiftLegacyRegime_StripsScalarStopLoss(t *testing.T) {
+	tier0 := map[string]interface{}{
+		"close_fraction": 0.5,
+		"trend_regime": map[string]interface{}{
+			"trending_up":   map[string]interface{}{"atr": 2.0},
+			"ranging":       map[string]interface{}{"atr": 1.0},
+			"trending_down": map[string]interface{}{"atr": 2.0},
+		},
+	}
+	raw := map[string]interface{}{
+		"strategies": []interface{}{
+			map[string]interface{}{
+				"id":                 "hl-test",
+				"stop_loss_atr_mult": 1.5,
+				"close_strategy": map[string]interface{}{
+					"name": "tiered_tp_atr_regime",
+					"params": map[string]interface{}{
+						"tiers": []interface{}{tier0},
+					},
+				},
+			},
+		},
+	}
+	migrateV15CloseKeys(raw)
+	sc := raw["strategies"].([]interface{})[0].(map[string]interface{})
+	if _, ok := sc["stop_loss_atr_mult"]; ok {
+		t.Fatal("stop_loss_atr_mult should be stripped after unified fold")
+	}
+	params := sc["close_strategy"].(map[string]interface{})["params"].(map[string]interface{})
+	up := params["trend_regime"].(map[string]interface{})["trending_up"].(map[string]interface{})
+	if up["stop_loss_atr"].(float64) != 1.5 {
+		t.Errorf("trending_up stop_loss_atr = %v, want 1.5 from scalar fallback", up["stop_loss_atr"])
+	}
+}
+
+func TestLoadConfig_V15_RegimeFoldStripsScalarStop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v14.json")
+	dbPath := filepath.Join(dir, "state.db")
+	tier0 := map[string]interface{}{
+		"close_fraction": 0.5,
+		"trend_regime": map[string]interface{}{
+			"trending_up":   map[string]interface{}{"atr": 2.0},
+			"ranging":       map[string]interface{}{"atr": 1.0},
+			"trending_down": map[string]interface{}{"atr": 2.0},
+		},
+	}
+	tier1 := map[string]interface{}{
+		"close_fraction": 1.0,
+		"trend_regime": map[string]interface{}{
+			"trending_up":   map[string]interface{}{"atr": 4.0},
+			"ranging":       map[string]interface{}{"atr": 2.0},
+			"trending_down": map[string]interface{}{"atr": 4.0},
+		},
+	}
+	v14 := map[string]interface{}{
+		"config_version":             14,
+		"db_file":                    dbPath,
+		"default_stop_loss_atr_mult": 1.0,
+		"portfolio_risk":             map[string]interface{}{"max_drawdown_pct": 25, "warn_threshold_pct": 60},
+		"regime": map[string]interface{}{
+			"enabled":       true,
+			"period":        14,
+			"adx_threshold": 20,
+		},
+		"strategies": []interface{}{
+			map[string]interface{}{
+				"id":                 "hl-test",
+				"type":               "perps",
+				"platform":           "hyperliquid",
+				"script":             "shared_scripts/check_hyperliquid.py",
+				"args":               []interface{}{"tema_cross_bd", "BTC", "1h", "--mode=paper"},
+				"capital":            1000.0,
+				"max_drawdown_pct":   25.0,
+				"leverage":           1.0,
+				"stop_loss_atr_mult": 1.5,
+				"close_strategy": map[string]interface{}{
+					"name": "tiered_tp_atr_regime",
+					"params": map[string]interface{}{
+						"tiers": []interface{}{tier0, tier1},
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(v14, "", "  ")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig after v15 migration: %v", err)
+	}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("ValidateConfig: %v", err)
+	}
+	sc := cfg.Strategies[0]
+	if sc.StopLossATRMult != nil {
+		t.Fatalf("StopLossATRMult = %v, want nil after unified fold", *sc.StopLossATRMult)
+	}
+	if !strategyUsesUnifiedRegimeClose(sc) {
+		t.Fatal("expected unified regime close after migration")
+	}
+}
+
 func TestLoadConfig_V15_MigratesCloseKeysOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "v14.json")
@@ -143,11 +251,11 @@ func TestLoadConfig_V15_MigratesCloseKeysOnDisk(t *testing.T) {
 		"config_version": 14,
 		"strategies": []interface{}{
 			map[string]interface{}{
-				"id":       "spot-test",
-				"type":     "spot",
-				"script":   "shared_scripts/check_strategy.py",
-				"args":     []interface{}{"momentum", "BTC/USDT", "1h"},
-				"capital":  1000.0,
+				"id":      "spot-test",
+				"type":    "spot",
+				"script":  "shared_scripts/check_strategy.py",
+				"args":    []interface{}{"momentum", "BTC/USDT", "1h"},
+				"capital": 1000.0,
 				"close_strategy": map[string]interface{}{
 					"name": "tiered_tp_atr",
 					"params": map[string]interface{}{
