@@ -35,6 +35,11 @@ func formatProtectionSyncWarnings(result *HyperliquidProtectionSyncResult) []str
 			warns = append(warns, fmt.Sprintf("surplus TP cancel OID=%d failed (will retry)", oid))
 		}
 	}
+	for _, oid := range result.TPCancelFilledOIDs {
+		if oid > 0 {
+			warns = append(warns, fmt.Sprintf("surplus TP OID=%d filled on-chain (reconciler)", oid))
+		}
+	}
 	return warns
 }
 

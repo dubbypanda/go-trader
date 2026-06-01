@@ -382,7 +382,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 	return result, true
 }
 
-func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtectionSyncResult) {
+func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtectionSyncResult, cancelTPOIDs []int64) {
 	if pos == nil || result == nil {
 		return
 	}
@@ -458,13 +458,14 @@ func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtection
 			pos.TPArmedTiers[1] = true
 		}
 	}
-	applySurplusTPCancelRetention(pos, result)
+	applySurplusTPCancelOutcome(pos, result, cancelTPOIDs)
 }
 
-// applySurplusTPCancelRetention re-appends surplus TP OIDs whose on-chain cancel
-// failed or was deferred so Go state does not forget still-resting orphans (#843).
-func applySurplusTPCancelRetention(pos *Position, result *HyperliquidProtectionSyncResult) {
-	if pos == nil || result == nil || len(result.TPCancelFailedOIDs) == 0 {
+// applySurplusTPCancelOutcome updates pos.TPOIDs after dynamic tier-count shrink
+// cancels (#843): re-append failed cancels for retry, clear filled or successfully
+// canceled surplus OIDs so dust cycles do not leave stale slots.
+func applySurplusTPCancelOutcome(pos *Position, result *HyperliquidProtectionSyncResult, cancelTPOIDs []int64) {
+	if pos == nil || result == nil {
 		return
 	}
 	for _, oid := range result.TPCancelFailedOIDs {
@@ -487,8 +488,45 @@ func applySurplusTPCancelRetention(pos *Position, result *HyperliquidProtectionS
 			copy(extended, pos.TPArmedTiers)
 			pos.TPArmedTiers = extended
 		}
-		// Surplus slots were resting before the tier-count shrink.
 		pos.TPArmedTiers[len(pos.TPOIDs)-1] = true
+	}
+	if len(cancelTPOIDs) == 0 {
+		return
+	}
+	failed := make(map[int64]struct{}, len(result.TPCancelFailedOIDs))
+	for _, oid := range result.TPCancelFailedOIDs {
+		if oid > 0 {
+			failed[oid] = struct{}{}
+		}
+	}
+	clear := make(map[int64]struct{})
+	for _, oid := range result.TPCancelFilledOIDs {
+		if oid > 0 {
+			clear[oid] = struct{}{}
+		}
+	}
+	for _, oid := range cancelTPOIDs {
+		if oid <= 0 {
+			continue
+		}
+		if _, isFailed := failed[oid]; isFailed {
+			continue
+		}
+		clear[oid] = struct{}{}
+	}
+	if len(clear) == 0 || len(pos.TPOIDs) == 0 {
+		return
+	}
+	if len(pos.TPArmedTiers) < len(pos.TPOIDs) {
+		extended := make([]bool, len(pos.TPOIDs))
+		copy(extended, pos.TPArmedTiers)
+		pos.TPArmedTiers = extended
+	}
+	for i, oid := range pos.TPOIDs {
+		if _, ok := clear[oid]; ok {
+			pos.TPOIDs[i] = 0
+			pos.TPArmedTiers[i] = true
+		}
 	}
 }
 
@@ -559,7 +597,10 @@ func runHyperliquidProtectionSync(
 	if !ok || pos == nil || pos.Quantity <= 0 || pos.Side != plan.Side {
 		return false
 	}
-	applyHyperliquidProtectionSync(pos, protection)
+	applyHyperliquidProtectionSync(pos, protection, plan.CancelTPOIDs)
+	if logger != nil && len(protection.TPCancelFilledOIDs) > 0 {
+		logger.Info("surplus TP OIDs filled on-chain (reconciler will book): %v", protection.TPCancelFilledOIDs)
+	}
 	// Re-stamp TradeHistory so the trade alert picks up SL/TP prices placed
 	// by the protection sync (#625). Without this, execute-path SL=0 leaves the
 	// trade's StopLossTriggerPx unset even though the sync correctly populated

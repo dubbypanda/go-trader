@@ -663,6 +663,7 @@ class TestSyncProtection:
         place_responses=None,
         reconcile_fill_hints_json=None,
         cancel_tp_oids=None,
+        force_sl_replace=False,
     ):
         mod, spec = _load_check_module()
         spec.loader.exec_module(mod)
@@ -736,8 +737,21 @@ class TestSyncProtection:
                     tp_armed_tiers=tp_armed_tiers,
                     reconcile_fill_hints_json=reconcile_fill_hints_json or "",
                     cancel_tp_oids=cancel_tp_oids,
+                    force_sl_replace=force_sl_replace,
                 )
         return json.loads(captured.getvalue()), mock_adapter
+
+    def test_sl_skips_force_replace_when_size_zero(self):
+        """#843: dust cycle echoes resting SL instead of place_stop_loss(0)."""
+        out, adapter = self._run_sync(
+            size=0,
+            cancel_tp_oids=[303],
+            open_oids={100},
+            sl_oid=100,
+            force_sl_replace=True,
+        )
+        assert out.get("stop_loss_oid") == 100
+        adapter.place_stop_loss.assert_not_called()
 
     def test_surplus_cancel_failed_reported(self):
         """#843: failed surplus cancel surfaces OID for Go retry; runs even when size=0."""

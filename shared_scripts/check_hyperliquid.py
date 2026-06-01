@@ -600,30 +600,33 @@ def run_sync_protection(
             if _oid_is_open(open_oids, stop_loss_oid) and not force_sl_replace:
                 out["stop_loss_oid"] = int(stop_loss_oid)
             elif _oid_is_open(open_oids, stop_loss_oid) and force_sl_replace:
-                try:
-                    adapter.cancel_order_by_oid(symbol, int(stop_loss_oid))
-                except Exception as ce:
-                    out["stop_loss_error"] = f"force replace cancel: {ce}"
-                try:
-                    resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
-                    kind, payload = _classify_sl_response(resp)
-                    if kind == "resting":
-                        out["stop_loss_oid"] = payload
-                    elif kind == "filled":
-                        out["stop_loss_filled_immediately"] = True
-                    elif kind == "error":
-                        out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
-                    else:
-                        out["stop_loss_error"] = f"place_stop_loss returned no usable status: {resp}"
-                except Exception as se:
-                    out["stop_loss_error"] = str(se)
+                if size <= 0:
+                    out["stop_loss_oid"] = int(stop_loss_oid)
+                else:
+                    try:
+                        adapter.cancel_order_by_oid(symbol, int(stop_loss_oid))
+                    except Exception as ce:
+                        out["stop_loss_error"] = f"force replace cancel: {ce}"
+                    try:
+                        resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
+                        kind, payload = _classify_sl_response(resp)
+                        if kind == "resting":
+                            out["stop_loss_oid"] = payload
+                        elif kind == "filled":
+                            out["stop_loss_filled_immediately"] = True
+                        elif kind == "error":
+                            out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
+                        else:
+                            out["stop_loss_error"] = f"place_stop_loss returned no usable status: {resp}"
+                    except Exception as se:
+                        out["stop_loss_error"] = str(se)
             else:
                 action, fill = _resolve_missing_oid(stop_loss_oid)
                 if action == "filled":
                     out["stop_loss_filled_externally"] = True
                     out["stop_loss_fill"] = fill
                     print(f"[WARN] stop-loss OID={stop_loss_oid} already filled on-chain; not re-placing — reconciler will book the close", file=sys.stderr)
-                elif action == "place":
+                elif action == "place" and size > 0:
                     try:
                         resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
                         kind, payload = _classify_sl_response(resp)
