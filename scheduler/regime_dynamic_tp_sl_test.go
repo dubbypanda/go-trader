@@ -85,6 +85,19 @@ func TestStrategyUsesRegimeTieredTPATRClose_IncludesDynamic(t *testing.T) {
 	}
 }
 
+func TestDynamicProtectionSurplusTPOIDs(t *testing.T) {
+	got := dynamicProtectionSurplusTPOIDs([]int64{10, 20, 30}, 2)
+	if len(got) != 1 || got[0] != 30 {
+		t.Fatalf("surplus OIDs = %v, want [30]", got)
+	}
+	if surplus := dynamicProtectionSurplusTPOIDs([]int64{10, 0, 30}, 2); len(surplus) != 1 || surplus[0] != 30 {
+		t.Fatalf("skip zero OID in surplus: %v", surplus)
+	}
+	if surplus := dynamicProtectionSurplusTPOIDs([]int64{10, 20}, 2); len(surplus) != 0 {
+		t.Fatalf("no shrink: got %v", surplus)
+	}
+}
+
 func TestDynamicProtectionForceReplace(t *testing.T) {
 	sc := dynamicCloseTestStrategy()
 	plan := hlProtectionPlan{
@@ -133,6 +146,14 @@ func TestDynamicProtectionForceReplace(t *testing.T) {
 		_, forceTP := dynamicProtectionForceReplace(sc, pos, plan, "trending_up", true)
 		if forceTP[0] || forceTP[1] {
 			t.Fatalf("never-armed tiers should skip force-replace: %v", forceTP)
+		}
+	})
+
+	t.Run("tier_count_shrink_surplus", func(t *testing.T) {
+		pos := &Position{TPOIDs: []int64{10, 20, 303}}
+		surplus := dynamicProtectionSurplusTPOIDs(pos.TPOIDs, 2)
+		if len(surplus) != 1 || surplus[0] != 303 {
+			t.Fatalf("tier shrink surplus = %v, want [303]", surplus)
 		}
 	})
 

@@ -170,6 +170,21 @@ func triggerPxMoveExceedsMinPct(oldPx, newPx, minMovePct float64) bool {
 	return movePct >= minMovePct
 }
 
+// dynamicProtectionSurplusTPOIDs returns resting TP OIDs at indices >= newTierCount
+// that must be canceled when a regime flip shrinks the per-regime ladder (#843).
+func dynamicProtectionSurplusTPOIDs(tpOIDs []int64, newTierCount int) []int64 {
+	if newTierCount >= len(tpOIDs) {
+		return nil
+	}
+	var out []int64
+	for i := newTierCount; i < len(tpOIDs); i++ {
+		if tpOIDs[i] > 0 {
+			out = append(out, tpOIDs[i])
+		}
+	}
+	return out
+}
+
 // dynamicProtectionForceReplace computes per-tier TP and SL force-replace flags
 // after the applied regime changes. Filled tiers (armed with OID 0) are skipped.
 func dynamicProtectionForceReplace(

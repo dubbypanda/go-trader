@@ -484,6 +484,7 @@ def run_sync_protection(
     tp_armed_tiers=None,
     force_sl_replace=False,
     force_tp_replace=None,
+    cancel_tp_oids=None,
     reconcile_fill_hints_json="",
 ):
     """Verify/re-place per-strategy reduce-only SL/TP orders (#601)."""
@@ -625,6 +626,18 @@ def run_sync_protection(
                     file=sys.stderr,
                 )
             else:
+                for surplus_oid in cancel_tp_oids or []:
+                    oid = int(surplus_oid)
+                    if oid <= 0:
+                        continue
+                    try:
+                        adapter.cancel_order_by_oid(symbol, oid)
+                    except Exception as ce:
+                        print(
+                            f"[WARN] cancel surplus TP OID={oid} failed: {ce}",
+                            file=sys.stderr,
+                        )
+
                 tp_oids_out = list(existing_tp_oids[:len(tiers)])
                 tp_pxs = []
                 tp_errors = [""] * len(tiers)
@@ -665,6 +678,26 @@ def run_sync_protection(
                         except Exception as ce:
                             tp_errors[idx] = f"force replace cancel: {ce}"
                             continue
+                        try:
+                            resp = adapter.place_take_profit_limit(
+                                symbol, tier_size, rounded_px, close_is_buy
+                            )
+                            kind, payload = _classify_sl_response(resp)
+                            if kind == "resting":
+                                tp_oids_out[idx] = payload
+                            elif kind == "filled":
+                                tp_filled_immediately[idx] = True
+                            elif kind == "error":
+                                tp_errors[idx] = (
+                                    f"place_take_profit_limit SDK error: {payload}"
+                                )
+                            else:
+                                tp_errors[idx] = (
+                                    f"place_take_profit_limit returned no usable status: {resp}"
+                                )
+                        except Exception as te:
+                            tp_errors[idx] = str(te)
+                        continue
 
                     # #749: OID 0 means "no resting order" both before first placement
                     # and after a tier filled (Go zeros the slot; TPArmedTiers marks
@@ -1162,6 +1195,11 @@ def main():
             default="",
             help="#843: JSON bool[] — cancel+replace resting TP tiers when true.",
         )
+        parser.add_argument(
+            "--cancel-tp-oids-json",
+            default="",
+            help="#843: JSON int[] — surplus resting TP OIDs to cancel after tier-count shrink.",
+        )
         parser.add_argument("--mode", default="live")
         args = parser.parse_args()
         tp_tiers = json.loads(args.tp_tiers_json) if args.tp_tiers_json else None
@@ -1171,6 +1209,9 @@ def main():
         )
         force_tp_replace = (
             json.loads(args.force_tp_replace_json) if args.force_tp_replace_json else None
+        )
+        cancel_tp_oids = (
+            json.loads(args.cancel_tp_oids_json) if args.cancel_tp_oids_json else None
         )
         run_sync_protection(
             args.symbol,
@@ -1191,6 +1232,7 @@ def main():
             tp_armed_tiers=tp_armed_tiers,
             force_sl_replace=bool(args.force_sl_replace),
             force_tp_replace=force_tp_replace,
+            cancel_tp_oids=cancel_tp_oids,
             reconcile_fill_hints_json=args.reconcile_fill_hints_json or "",
         )
     elif "--update-stop-loss" in sys.argv:

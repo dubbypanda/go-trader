@@ -26,6 +26,9 @@ type hlProtectionPlan struct {
 	// and the new trigger price clears the min-move debounce.
 	ForceSLReplace bool
 	ForceTPReplace []bool
+	// CancelTPOIDs lists resting reduce-only TP OIDs dropped when the active
+	// regime's ladder has fewer tiers than pos.TPOIDs (#843 tier-count shrink).
+	CancelTPOIDs []int64
 }
 
 func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtectionPlan, bool) {
@@ -345,7 +348,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 	result, stderr, err := RunHyperliquidSyncProtection(
 		sc.Script, plan.Symbol, plan.Side, plan.Size, plan.AvgCost, plan.EntryATR,
 		plan.StopLossATRMult, plan.Tiers, plan.StopLossOID, plan.TPOIDs, plan.TPArmedTiers,
-		plan.ForceSLReplace, plan.ForceTPReplace,
+		plan.ForceSLReplace, plan.ForceTPReplace, plan.CancelTPOIDs,
 		reconcileFillHintsJSON,
 	)
 	if stderr != "" && logger != nil {
@@ -494,10 +497,13 @@ func runHyperliquidProtectionSync(
 			oldAppliedRegime := pos.RegimeAppliedLabel
 			regimeChanged := advanceDynamicCloseRegime(pos, stratState, sc)
 			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
-			if syncOK && regimeChanged {
-				forceSL, forceTP := dynamicProtectionForceReplace(sc, pos, plan, oldAppliedRegime, true)
-				plan.ForceSLReplace = forceSL
-				plan.ForceTPReplace = forceTP
+			if syncOK {
+				plan.CancelTPOIDs = dynamicProtectionSurplusTPOIDs(pos.TPOIDs, len(plan.Tiers))
+				if regimeChanged {
+					forceSL, forceTP := dynamicProtectionForceReplace(sc, pos, plan, oldAppliedRegime, true)
+					plan.ForceSLReplace = forceSL
+					plan.ForceTPReplace = forceTP
+				}
 			}
 		}
 		mu.Unlock()
