@@ -779,7 +779,7 @@ func TestHLExecuteSnapshotForCoin(t *testing.T) {
 
 func TestBuildHyperliquidSyncProtectionArgv_TPArmedTiersJSON(t *testing.T) {
 	tiers := []hlProtectionTier{{Multiple: 1, Fraction: 0.5}, {Multiple: 2, Fraction: 1}}
-	argv := buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, tiers, 999, []int64{0, 300}, []bool{true, true}, nil)
+	argv := buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, tiers, 999, []int64{0, 300}, []bool{true, true}, false, nil, nil)
 	var armedArg string
 	for _, a := range argv {
 		if strings.HasPrefix(a, "--tp-armed-tiers-json=") {
@@ -795,7 +795,7 @@ func TestBuildHyperliquidSyncProtectionArgv_TPArmedTiersJSON(t *testing.T) {
 		t.Errorf("armed tiers JSON = %q, want [true,true]", got)
 	}
 	// Shorter slice pads false (#749 / hyperliquid_protection.go).
-	argv = buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, tiers, 0, nil, []bool{true}, nil)
+	argv = buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, tiers, 0, nil, []bool{true}, false, nil, nil)
 	for _, a := range argv {
 		if strings.HasPrefix(a, "--tp-armed-tiers-json=") {
 			if got := strings.TrimPrefix(a, prefix); got != `[true,false]` {
@@ -808,7 +808,7 @@ func TestBuildHyperliquidSyncProtectionArgv_TPArmedTiersJSON(t *testing.T) {
 }
 
 func TestBuildHyperliquidSyncProtectionArgv_NoTiersOmitsArmedJSON(t *testing.T) {
-	argv := buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, nil, 0, nil, nil, nil)
+	argv := buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, nil, 0, nil, nil, false, nil, nil)
 	for _, a := range argv {
 		if strings.HasPrefix(a, "--tp-armed-tiers-json=") {
 			t.Fatalf("unexpected %q when tiers empty", a)
@@ -819,7 +819,7 @@ func TestBuildHyperliquidSyncProtectionArgv_NoTiersOmitsArmedJSON(t *testing.T) 
 func TestBuildHyperliquidSyncProtectionArgv_ReconcileFillHintsJSON(t *testing.T) {
 	tiers := []hlProtectionTier{{Multiple: 1, Fraction: 0.5}, {Multiple: 2, Fraction: 1}}
 	hints := []byte(`[{"oid":42,"filled":true,"fee":0.01,"count":1}]`)
-	argv := buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, tiers, 1, []int64{2, 3}, nil, hints)
+	argv := buildHyperliquidSyncProtectionArgv("ETH", "long", 0.22, 3000, 100, 1.5, tiers, 1, []int64{2, 3}, nil, false, nil, hints)
 	var got string
 	for _, a := range argv {
 		if strings.HasPrefix(a, "--reconcile-fill-hints-json=") {

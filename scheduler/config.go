@@ -942,7 +942,8 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 		// close evaluators consume `tp_tiers`; if the operator overrode
 		// close_strategy to something else, leave it alone.
 		if cs := sc.CloseStrategy; cs != nil && isTieredTPATRCloseName(cs.Name) &&
-			cs.Name != "tiered_tp_atr_regime" && cs.Name != "tiered_tp_atr_live_regime" {
+			cs.Name != "tiered_tp_atr_regime" && cs.Name != "tiered_tp_atr_live_regime" &&
+			cs.Name != dynamicCloseStrategyName {
 			// Regime-aware variants resolve their own tier list from the
 			// trend_regime block / use_defaults shortcut — manual_defaults
 			// tier seeding doesn't apply.

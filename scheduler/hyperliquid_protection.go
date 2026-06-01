@@ -22,6 +22,10 @@ type hlProtectionPlan struct {
 	// TPArmedTiers[i]==true, the tier is treated as consumed (filled) and must
 	// not be re-placed from a zero OID — see #716 / #749.
 	TPArmedTiers []bool
+	// #843: cancel+replace resting protection when the applied ATR regime changes
+	// and the new trigger price clears the min-move debounce.
+	ForceSLReplace bool
+	ForceTPReplace []bool
 }
 
 func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtectionPlan, bool) {
@@ -37,8 +41,9 @@ func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtect
 	// SL ATR multiplier: legacy scalar `stop_loss_atr_mult` wins when present;
 	// otherwise the regime-aware sibling resolves via pos.Regime. Validation
 	// ensures only one is set (#733).
+	atrRegime := protectionATRRegimeLabel(pos, sc)
 	slMult := 0.0
-	if v, ok := unifiedCloseStopLossATR(sc, positionATRRegimeLabel(pos, sc)); ok {
+	if v, ok := unifiedCloseStopLossATR(sc, atrRegime); ok {
 		// #841 2b: unified close owns the per-regime SL.
 		slMult = v
 	} else if sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 {
@@ -53,7 +58,7 @@ func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtect
 	// strategyTPTiersForRegime, so the plan emits SL only this cycle and
 	// re-emits TPs next cycle once stampPositionRegimeIfOpened populates the
 	// regime labels.
-	tiers := strategyTPTiersForRegime(sc, positionATRRegimeLabel(pos, sc))
+	tiers := strategyTPTiersForRegime(sc, atrRegime)
 	if slMult <= 0 && len(tiers) == 0 {
 		return hlProtectionPlan{}, false
 	}
@@ -101,7 +106,7 @@ func strategyTPTiersForRegime(sc StrategyConfig, regime string) []hlProtectionTi
 		if !isTieredTPATRCloseName(n) {
 			continue
 		}
-		if n == "tiered_tp_atr_regime" || n == "tiered_tp_atr_live_regime" {
+		if n == "tiered_tp_atr_regime" || n == "tiered_tp_atr_live_regime" || n == dynamicCloseStrategyName {
 			regimeAware = true
 		}
 		// #841 2b: unified per-regime block — select the active regime's scalar
@@ -340,6 +345,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 	result, stderr, err := RunHyperliquidSyncProtection(
 		sc.Script, plan.Symbol, plan.Side, plan.Size, plan.AvgCost, plan.EntryATR,
 		plan.StopLossATRMult, plan.Tiers, plan.StopLossOID, plan.TPOIDs, plan.TPArmedTiers,
+		plan.ForceSLReplace, plan.ForceTPReplace,
 		reconcileFillHintsJSON,
 	)
 	if stderr != "" && logger != nil {
@@ -480,9 +486,21 @@ func runHyperliquidProtectionSync(
 	}
 	var plan hlProtectionPlan
 	var syncOK bool
+	var oldAppliedRegime string
 	mu.RLock()
 	if pos, ok := stratState.Positions[symbol]; ok {
-		plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+		if strategyUsesDynamicRegimeClose(sc) {
+			oldAppliedRegime = pos.RegimeAppliedLabel
+			regimeChanged := advanceDynamicCloseRegime(pos, stratState, sc)
+			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+			if syncOK && regimeChanged {
+				forceSL, forceTP := dynamicProtectionForceReplace(sc, pos, plan, oldAppliedRegime, true)
+				plan.ForceSLReplace = forceSL
+				plan.ForceTPReplace = forceTP
+			}
+		} else {
+			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+		}
 	}
 	mu.RUnlock()
 	if !syncOK {
@@ -546,10 +564,11 @@ func hyperliquidPlacesOnChainTPs(sc StrategyConfig) bool {
 // end up with a race; instead they get a clean signal that on-chain
 // protection trumps the in-process evaluator.
 var closeStrategiesSuppressedByOnChainProtection = map[string]struct{}{
-	"tiered_tp_atr":             {},
-	"tiered_tp_atr_live":        {},
-	"tiered_tp_atr_regime":      {},
-	"tiered_tp_atr_live_regime": {},
+	"tiered_tp_atr":                        {},
+	"tiered_tp_atr_live":                   {},
+	"tiered_tp_atr_regime":                 {},
+	"tiered_tp_atr_live_regime":            {},
+	"tiered_tp_atr_live_regime_dynamic":    {},
 }
 
 // isTieredTPATRCloseName returns true when name is any of the four
@@ -557,7 +576,8 @@ var closeStrategiesSuppressedByOnChainProtection = map[string]struct{}{
 func isTieredTPATRCloseName(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "tiered_tp_atr", "tiered_tp_atr_live",
-		"tiered_tp_atr_regime", "tiered_tp_atr_live_regime":
+		"tiered_tp_atr_regime", "tiered_tp_atr_live_regime",
+		dynamicCloseStrategyName:
 		return true
 	}
 	return false

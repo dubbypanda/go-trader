@@ -1139,10 +1139,10 @@ func runPostTPStopLossAdjustment(
 	entryATR := pos.EntryATR
 	qty := pos.Quantity
 	currentOID := pos.StopLossOID
-	posRegime := positionATRRegimeLabel(pos, sc)
+	posRegime := protectionATRRegimeLabel(pos, sc)
 	mu.RUnlock()
 
-	if strategyUsesRegimeTieredTPATRClose(sc) {
+	if strategyUsesRegimeTieredTPATRClose(sc) || strategyUsesDynamicRegimeClose(sc) {
 		rules, _ = parseStrategyTPSLAfterRulesForRegime(sc, nil, posRegime)
 	}
 	rawRule := rules.ForTier(clearedIdx)

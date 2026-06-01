@@ -482,6 +482,8 @@ def run_sync_protection(
     tp_tiers=None,
     tp_oids=None,
     tp_armed_tiers=None,
+    force_sl_replace=False,
+    force_tp_replace=None,
     reconcile_fill_hints_json="",
 ):
     """Verify/re-place per-strategy reduce-only SL/TP orders (#601)."""
@@ -560,8 +562,26 @@ def run_sync_protection(
                 sl_px = avg_cost + stop_loss_atr_mult * entry_atr
             sl_px = adapter.round_perps_trigger_px(symbol, sl_px)
             out["stop_loss_trigger_px"] = sl_px
-            if _oid_is_open(open_oids, stop_loss_oid):
+            if _oid_is_open(open_oids, stop_loss_oid) and not force_sl_replace:
                 out["stop_loss_oid"] = int(stop_loss_oid)
+            elif _oid_is_open(open_oids, stop_loss_oid) and force_sl_replace:
+                try:
+                    adapter.cancel_order_by_oid(symbol, int(stop_loss_oid))
+                except Exception as ce:
+                    out["stop_loss_error"] = f"force replace cancel: {ce}"
+                try:
+                    resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
+                    kind, payload = _classify_sl_response(resp)
+                    if kind == "resting":
+                        out["stop_loss_oid"] = payload
+                    elif kind == "filled":
+                        out["stop_loss_filled_immediately"] = True
+                    elif kind == "error":
+                        out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
+                    else:
+                        out["stop_loss_error"] = f"place_stop_loss returned no usable status: {resp}"
+                except Exception as se:
+                    out["stop_loss_error"] = str(se)
             else:
                 action, fill = _resolve_missing_oid(stop_loss_oid)
                 if action == "filled":
@@ -616,6 +636,11 @@ def run_sync_protection(
                     armed.extend([False] * (len(tiers) - len(armed)))
                 else:
                     armed = armed[: len(tiers)]
+                force_tp = [bool(x) for x in (force_tp_replace or [])]
+                if len(force_tp) < len(tiers):
+                    force_tp.extend([False] * (len(tiers) - len(force_tp)))
+                else:
+                    force_tp = force_tp[: len(tiers)]
                 tier_sizes = compute_tp_tier_sizes(
                     size, tiers, lambda sz: adapter.floor_size(symbol, sz)
                 )
@@ -631,9 +656,15 @@ def run_sync_protection(
 
                     if tier_size <= 0:
                         continue
-                    if _oid_is_open(open_oids, prev_oid):
+                    if _oid_is_open(open_oids, prev_oid) and not (idx < len(force_tp) and force_tp[idx]):
                         tp_oids_out[idx] = prev_oid
                         continue
+                    if _oid_is_open(open_oids, prev_oid) and idx < len(force_tp) and force_tp[idx]:
+                        try:
+                            adapter.cancel_order_by_oid(symbol, int(prev_oid))
+                        except Exception as ce:
+                            tp_errors[idx] = f"force replace cancel: {ce}"
+                            continue
 
                     # #749: OID 0 means "no resting order" both before first placement
                     # and after a tier filled (Go zeros the slot; TPArmedTiers marks
@@ -1121,12 +1152,25 @@ def main():
             default="",
             help="Optional JSON array from Go reconciler prefetch (#759); skips duplicate userFills per OID.",
         )
+        parser.add_argument(
+            "--force-sl-replace",
+            action="store_true",
+            help="#843: cancel resting SL and re-place when dynamic regime changes.",
+        )
+        parser.add_argument(
+            "--force-tp-replace-json",
+            default="",
+            help="#843: JSON bool[] — cancel+replace resting TP tiers when true.",
+        )
         parser.add_argument("--mode", default="live")
         args = parser.parse_args()
         tp_tiers = json.loads(args.tp_tiers_json) if args.tp_tiers_json else None
         tp_oids = json.loads(args.tp_oids_json) if args.tp_oids_json else None
         tp_armed_tiers = (
             json.loads(args.tp_armed_tiers_json) if args.tp_armed_tiers_json else None
+        )
+        force_tp_replace = (
+            json.loads(args.force_tp_replace_json) if args.force_tp_replace_json else None
         )
         run_sync_protection(
             args.symbol,
@@ -1145,6 +1189,8 @@ def main():
             tp_tiers=tp_tiers,
             tp_oids=tp_oids,
             tp_armed_tiers=tp_armed_tiers,
+            force_sl_replace=bool(args.force_sl_replace),
+            force_tp_replace=force_tp_replace,
             reconcile_fill_hints_json=args.reconcile_fill_hints_json or "",
         )
     elif "--update-stop-loss" in sys.argv:

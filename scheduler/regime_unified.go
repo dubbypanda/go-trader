@@ -83,7 +83,7 @@ func unifiedRegimeScalarParams(params map[string]interface{}, regime string) (sc
 func strategyUsesUnifiedRegimeClose(sc StrategyConfig) bool {
 	for _, ref := range sc.closeRefs() {
 		n := strings.ToLower(strings.TrimSpace(ref.Name))
-		if n != "tiered_tp_atr_regime" && n != "tiered_tp_atr_live_regime" {
+		if n != "tiered_tp_atr_regime" && n != "tiered_tp_atr_live_regime" && n != dynamicCloseStrategyName {
 			continue
 		}
 		if closeParamsAreUnifiedRegime(ref.Params) {
@@ -100,7 +100,7 @@ func strategyUsesUnifiedRegimeClose(sc StrategyConfig) bool {
 func unifiedCloseStopLossATR(sc StrategyConfig, regime string) (float64, bool) {
 	for _, ref := range sc.closeRefs() {
 		n := strings.ToLower(strings.TrimSpace(ref.Name))
-		if n != "tiered_tp_atr_regime" && n != "tiered_tp_atr_live_regime" {
+		if n != "tiered_tp_atr_regime" && n != "tiered_tp_atr_live_regime" && n != dynamicCloseStrategyName {
 			continue
 		}
 		if !closeParamsAreUnifiedRegime(ref.Params) {
@@ -120,7 +120,7 @@ func unifiedCloseStopLossATR(sc StrategyConfig, regime string) (float64, bool) {
 func unifiedCloseRefParams(sc StrategyConfig) map[string]interface{} {
 	for _, ref := range sc.closeRefs() {
 		n := strings.ToLower(strings.TrimSpace(ref.Name))
-		if n != "tiered_tp_atr_regime" && n != "tiered_tp_atr_live_regime" {
+		if n != "tiered_tp_atr_regime" && n != "tiered_tp_atr_live_regime" && n != dynamicCloseStrategyName {
 			continue
 		}
 		if closeParamsAreUnifiedRegime(ref.Params) {
