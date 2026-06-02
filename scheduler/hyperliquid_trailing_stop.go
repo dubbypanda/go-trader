@@ -23,7 +23,8 @@ func hlSLEffectiveQty(symbol string, virtualQty float64, onChainQtyMap map[strin
 }
 
 // effectiveTrailingStopPct returns the per-position trailing-stop distance as a
-// price-% (e.g. 3.0 == 3%). HL perps only.
+// price-% (e.g. 3.0 == 3%). HL perps only, except manual strategies that
+// explicitly use trailing_tp_ratchet*.
 //
 // Resolution order:
 //   - explicit TrailingStopPct (fixed distance) wins; explicit 0 disables.
@@ -45,7 +46,19 @@ func hlSLEffectiveQty(symbol string, virtualQty float64, onChainQtyMap map[strin
 // expect a strictly fixed distance for the life of a position should not
 // edit the multiplier while a position is active.
 func effectiveTrailingStopPct(sc StrategyConfig, pos *Position) float64 {
-	if sc.Platform != "hyperliquid" || sc.Type != "perps" {
+	if sc.Platform != "hyperliquid" {
+		return 0
+	}
+	switch sc.Type {
+	case "perps":
+	case "manual":
+		// Manual strategies only run the on-chain trailing walker when the
+		// close evaluator is trailing_tp_ratchet* (#844). Other manual configs
+		// (e.g. tiered_tp_atr_live) keep the historical no-trailing behavior.
+		if !strategyUsesTrailingTPRatchetClose(sc) {
+			return 0
+		}
+	default:
 		return 0
 	}
 	// #708: Post-TP trailing transition — `sl_after: trail_from_here` stamps
