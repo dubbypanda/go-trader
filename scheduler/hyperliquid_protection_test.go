@@ -88,7 +88,7 @@ func TestApplyHyperliquidProtectionSyncPreservesExistingOIDs(t *testing.T) {
 		StopLossTriggerPx: 2900,
 		TPOIDs:            []int64{200, 300},
 	}
-	applyHyperliquidProtectionSync(pos, result)
+	applyHyperliquidProtectionSync(pos, result, nil)
 	if pos.StopLossOID != 100 || !reflect.DeepEqual(pos.TPOIDs, []int64{200, 300}) {
 		t.Errorf("OIDs mutated: SL=%d TPs=%v, want 100/[200 300]", pos.StopLossOID, pos.TPOIDs)
 	}
@@ -105,7 +105,7 @@ func TestApplyHyperliquidProtectionSyncRetainsOnZeroFields(t *testing.T) {
 	pos := &Position{Symbol: "ETH", StopLossOID: 11, TPOIDs: []int64{22, 33}}
 	applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
 		OpenOrderCheckError: "indexer down",
-	})
+	}, nil)
 	if pos.StopLossOID != 11 || !reflect.DeepEqual(pos.TPOIDs, []int64{22, 33}) {
 		t.Errorf("zero-field result mutated OIDs: SL=%d TPs=%v, want 11/[22 33]", pos.StopLossOID, pos.TPOIDs)
 	}
@@ -122,7 +122,7 @@ func TestApplyHyperliquidProtectionSyncClearsFilledExternally(t *testing.T) {
 		TPFilledExternally:       []bool{true, false},
 		// TP2 still resting in this scenario.
 		TPOIDs: []int64{0, 33},
-	})
+	}, nil)
 	if pos.StopLossOID != 0 {
 		t.Errorf("StopLossOID = %d, want 0 (cleared because filled externally)", pos.StopLossOID)
 	}
@@ -140,7 +140,7 @@ func TestApplyHyperliquidProtectionSyncStampsTPArmedTiers(t *testing.T) {
 		pos := &Position{Symbol: "ETH"}
 		applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
 			TPOIDs: []int64{111, 222},
-		})
+		}, nil)
 		if !reflect.DeepEqual(pos.TPArmedTiers, []bool{true, true}) {
 			t.Errorf("TPArmedTiers = %v, want [true true]", pos.TPArmedTiers)
 		}
@@ -150,7 +150,7 @@ func TestApplyHyperliquidProtectionSyncStampsTPArmedTiers(t *testing.T) {
 		pos := &Position{Symbol: "ETH"}
 		applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
 			TPOIDs: []int64{0, 222},
-		})
+		}, nil)
 		if !reflect.DeepEqual(pos.TPArmedTiers, []bool{false, true}) {
 			t.Errorf("TPArmedTiers = %v, want [false true]", pos.TPArmedTiers)
 		}
@@ -161,7 +161,7 @@ func TestApplyHyperliquidProtectionSyncStampsTPArmedTiers(t *testing.T) {
 		applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
 			TPOIDs:             []int64{0, 222},
 			TPFilledExternally: []bool{true, false},
-		})
+		}, nil)
 		if !reflect.DeepEqual(pos.TPArmedTiers, []bool{true, true}) {
 			t.Errorf("TPArmedTiers = %v, want [true true] (filled-externally implies armed)", pos.TPArmedTiers)
 		}
@@ -173,9 +173,57 @@ func TestApplyHyperliquidProtectionSyncStampsTPArmedTiers(t *testing.T) {
 			TP1OID:              33,
 			TP2OID:              44,
 			TP1FilledExternally: true,
-		})
+		}, nil)
 		if len(pos.TPArmedTiers) != 2 || !pos.TPArmedTiers[0] || !pos.TPArmedTiers[1] {
 			t.Errorf("TPArmedTiers = %v, want [true true]", pos.TPArmedTiers)
+		}
+	})
+}
+
+// #843: surplus tier-count-shrink cancel outcomes update pos.TPOIDs.
+func TestApplySurplusTPCancelOutcome(t *testing.T) {
+	t.Run("re-appends failed surplus OID", func(t *testing.T) {
+		pos := &Position{Symbol: "ETH", TPOIDs: []int64{10, 20}, TPArmedTiers: []bool{true, true}}
+		applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
+			TPOIDs:             []int64{10, 20},
+			TPCancelFailedOIDs: []int64{303},
+		}, []int64{303})
+		if !reflect.DeepEqual(pos.TPOIDs, []int64{10, 20, 303}) {
+			t.Errorf("TPOIDs = %v, want [10 20 303]", pos.TPOIDs)
+		}
+		if len(pos.TPArmedTiers) != 3 || !pos.TPArmedTiers[2] {
+			t.Errorf("TPArmedTiers = %v, want third tier armed", pos.TPArmedTiers)
+		}
+	})
+
+	t.Run("does not duplicate OID already present", func(t *testing.T) {
+		pos := &Position{Symbol: "ETH", TPOIDs: []int64{10, 20, 303}}
+		applySurplusTPCancelOutcome(pos, &HyperliquidProtectionSyncResult{
+			TPCancelFailedOIDs: []int64{303},
+		}, []int64{303})
+		if !reflect.DeepEqual(pos.TPOIDs, []int64{10, 20, 303}) {
+			t.Errorf("TPOIDs = %v, want unchanged [10 20 303]", pos.TPOIDs)
+		}
+	})
+
+	t.Run("clears successfully canceled surplus OID", func(t *testing.T) {
+		pos := &Position{Symbol: "ETH", TPOIDs: []int64{10, 20, 303}, TPArmedTiers: []bool{true, true, true}}
+		applySurplusTPCancelOutcome(pos, &HyperliquidProtectionSyncResult{}, []int64{303})
+		if !reflect.DeepEqual(pos.TPOIDs, []int64{10, 20, 0}) {
+			t.Errorf("TPOIDs = %v, want [10 20 0]", pos.TPOIDs)
+		}
+		if !pos.TPArmedTiers[2] {
+			t.Errorf("surplus slot should stay armed after clear")
+		}
+	})
+
+	t.Run("clears filled surplus OID", func(t *testing.T) {
+		pos := &Position{Symbol: "ETH", TPOIDs: []int64{10, 20, 303}, TPArmedTiers: []bool{true, true, true}}
+		applySurplusTPCancelOutcome(pos, &HyperliquidProtectionSyncResult{
+			TPCancelFilledOIDs: []int64{303},
+		}, []int64{303})
+		if !reflect.DeepEqual(pos.TPOIDs, []int64{10, 20, 0}) {
+			t.Errorf("TPOIDs = %v, want [10 20 0]", pos.TPOIDs)
 		}
 	})
 }

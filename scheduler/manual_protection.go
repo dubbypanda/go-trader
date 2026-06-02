@@ -30,6 +30,16 @@ func formatProtectionSyncWarnings(result *HyperliquidProtectionSyncResult) []str
 			warns = append(warns, "TP2: "+result.TP2Error)
 		}
 	}
+	for _, oid := range result.TPCancelFailedOIDs {
+		if oid > 0 {
+			warns = append(warns, fmt.Sprintf("surplus TP cancel OID=%d failed (will retry)", oid))
+		}
+	}
+	for _, oid := range result.TPCancelFilledOIDs {
+		if oid > 0 {
+			warns = append(warns, fmt.Sprintf("surplus TP OID=%d filled on-chain (reconciler)", oid))
+		}
+	}
 	return warns
 }
 
@@ -60,7 +70,7 @@ func placeManualProtectionInline(
 
 	result, stderr, err := runHLSyncProtectionFn(
 		sc.Script, sc.Symbol, side, fillQty, fillPrice, entryATR,
-		effectiveSLATRMult, tiers, stopLossOID, nil, nil, nil,
+		effectiveSLATRMult, tiers, stopLossOID, nil, nil, false, nil, nil, nil,
 	)
 	if stderr != "" {
 		fmt.Fprintf(os.Stderr, "[manual-open] sync-protection stderr: %s\n", stderr)

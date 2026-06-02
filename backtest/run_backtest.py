@@ -147,6 +147,13 @@ def load_strategy_config(config_path: str, strategy_id: str) -> dict:
             for ref in legacy:
                 if isinstance(ref, dict) and ref.get("name"):
                     close_refs.append({"name": ref["name"], "params": dict(ref.get("params") or {})})
+        for ref in close_refs:
+            if ref.get("name") == "tiered_tp_atr_live_regime_dynamic":
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} uses "
+                    f"tiered_tp_atr_live_regime_dynamic, which is HL-live-only "
+                    f"in this release (backtester parity deferred — see #843)."
+                )
         return {
             "open_strategy": {
                 "name": open_ref["name"],

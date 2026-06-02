@@ -128,6 +128,10 @@ type HyperliquidProtectionSyncResult struct {
 	StopLossFilledExternally bool      `json:"stop_loss_filled_externally,omitempty"`
 	TP1FilledExternally      bool      `json:"tp1_filled_externally,omitempty"`
 	TP2FilledExternally      bool      `json:"tp2_filled_externally,omitempty"`
+	// #843: surplus tier-count-shrink cancels — failed OIDs are re-appended to
+	// pos.TPOIDs so the next cycle retries; filled OIDs are dropped from tracking.
+	TPCancelFailedOIDs []int64 `json:"tp_cancel_failed_oids,omitempty"`
+	TPCancelFilledOIDs []int64 `json:"tp_cancel_filled_oids,omitempty"`
 }
 
 // runPython is the shared subprocess spawner. parentCtx is one of
@@ -389,7 +393,7 @@ func RunHyperliquidUpdateStopLoss(script, symbol, side string, size, triggerPx f
 
 // buildHyperliquidSyncProtectionArgv builds argv for check_hyperliquid.py
 // --sync-protection (used by RunHyperliquidSyncProtection and tests).
-func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, reconcileFillHintsJSON []byte) []string {
+func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, forceSLReplace bool, forceTPReplace []bool, cancelTPOIDs []int64, reconcileFillHintsJSON []byte) []string {
 	args := []string{
 		"--sync-protection",
 		fmt.Sprintf("--symbol=%s", symbol),
@@ -428,14 +432,27 @@ func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entr
 			fmt.Fprintf(os.Stderr, "[WARN] json.Marshal(tp armed tiers) failed: %v — sync-protection omitting --tp-armed-tiers-json\n", err)
 		}
 	}
+	if forceSLReplace {
+		args = append(args, "--force-sl-replace")
+	}
+	if len(forceTPReplace) > 0 {
+		if b, err := json.Marshal(forceTPReplace); err == nil {
+			args = append(args, fmt.Sprintf("--force-tp-replace-json=%s", string(b)))
+		}
+	}
+	if len(cancelTPOIDs) > 0 {
+		if b, err := json.Marshal(cancelTPOIDs); err == nil {
+			args = append(args, fmt.Sprintf("--cancel-tp-oids-json=%s", string(b)))
+		}
+	}
 	if len(reconcileFillHintsJSON) > 0 {
 		args = append(args, fmt.Sprintf("--reconcile-fill-hints-json=%s", string(reconcileFillHintsJSON)))
 	}
 	return args
 }
 
-func RunHyperliquidSyncProtection(script, symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, reconcileFillHintsJSON []byte) (*HyperliquidProtectionSyncResult, string, error) {
-	args := buildHyperliquidSyncProtectionArgv(symbol, side, size, avgCost, entryATR, stopLossATRMult, tiers, stopLossOID, tpOIDs, tpArmedTiers, reconcileFillHintsJSON)
+func RunHyperliquidSyncProtection(script, symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, forceSLReplace bool, forceTPReplace []bool, cancelTPOIDs []int64, reconcileFillHintsJSON []byte) (*HyperliquidProtectionSyncResult, string, error) {
+	args := buildHyperliquidSyncProtectionArgv(symbol, side, size, avgCost, entryATR, stopLossATRMult, tiers, stopLossOID, tpOIDs, tpArmedTiers, forceSLReplace, forceTPReplace, cancelTPOIDs, reconcileFillHintsJSON)
 	stdout, stderr, err := runPythonSideEffect(script, args)
 	stderrStr := string(stderr)
 	var result HyperliquidProtectionSyncResult

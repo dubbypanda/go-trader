@@ -805,6 +805,19 @@ func validateRegimeATRConfig(cfg *Config) []string {
 		// disable on-chain TPs.
 		for _, ref := range sc.closeRefs() {
 			name := strings.ToLower(strings.TrimSpace(ref.Name))
+			if name == dynamicCloseStrategyName {
+				usesRegime = true
+				subPrefix := fmt.Sprintf("%s.close_strategy(%s)", prefix, ref.Name)
+				if sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual") {
+					errs = append(errs, fmt.Sprintf("%s: %s is HL perps/manual only", subPrefix, ref.Name))
+				}
+				if !closeParamsAreUnifiedRegime(ref.Params) {
+					errs = append(errs, fmt.Sprintf("%s: requires unified per-regime trend_regime block", subPrefix))
+				} else {
+					errs = append(errs, validateDynamicRegimeClose(ref.Params, atrLabels, subPrefix)...)
+				}
+				continue
+			}
 			if name != "tiered_tp_atr_regime" && name != "tiered_tp_atr_live_regime" {
 				continue
 			}

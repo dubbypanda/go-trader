@@ -22,6 +22,13 @@ type hlProtectionPlan struct {
 	// TPArmedTiers[i]==true, the tier is treated as consumed (filled) and must
 	// not be re-placed from a zero OID — see #716 / #749.
 	TPArmedTiers []bool
+	// #843: cancel+replace resting protection when the applied ATR regime changes
+	// and the new trigger price clears the min-move debounce.
+	ForceSLReplace bool
+	ForceTPReplace []bool
+	// CancelTPOIDs lists resting reduce-only TP OIDs dropped when the active
+	// regime's ladder has fewer tiers than pos.TPOIDs (#843 tier-count shrink).
+	CancelTPOIDs []int64
 }
 
 func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtectionPlan, bool) {
@@ -37,8 +44,9 @@ func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtect
 	// SL ATR multiplier: legacy scalar `stop_loss_atr_mult` wins when present;
 	// otherwise the regime-aware sibling resolves via pos.Regime. Validation
 	// ensures only one is set (#733).
+	atrRegime := protectionATRRegimeLabel(pos, sc)
 	slMult := 0.0
-	if v, ok := unifiedCloseStopLossATR(sc, positionATRRegimeLabel(pos, sc)); ok {
+	if v, ok := unifiedCloseStopLossATR(sc, atrRegime); ok {
 		// #841 2b: unified close owns the per-regime SL.
 		slMult = v
 	} else if sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 {
@@ -53,7 +61,7 @@ func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtect
 	// strategyTPTiersForRegime, so the plan emits SL only this cycle and
 	// re-emits TPs next cycle once stampPositionRegimeIfOpened populates the
 	// regime labels.
-	tiers := strategyTPTiersForRegime(sc, positionATRRegimeLabel(pos, sc))
+	tiers := strategyTPTiersForRegime(sc, atrRegime)
 	if slMult <= 0 && len(tiers) == 0 {
 		return hlProtectionPlan{}, false
 	}
@@ -101,7 +109,7 @@ func strategyTPTiersForRegime(sc StrategyConfig, regime string) []hlProtectionTi
 		if !isTieredTPATRCloseName(n) {
 			continue
 		}
-		if n == "tiered_tp_atr_regime" || n == "tiered_tp_atr_live_regime" {
+		if n == "tiered_tp_atr_regime" || n == "tiered_tp_atr_live_regime" || n == dynamicCloseStrategyName {
 			regimeAware = true
 		}
 		// #841 2b: unified per-regime block — select the active regime's scalar
@@ -340,6 +348,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 	result, stderr, err := RunHyperliquidSyncProtection(
 		sc.Script, plan.Symbol, plan.Side, plan.Size, plan.AvgCost, plan.EntryATR,
 		plan.StopLossATRMult, plan.Tiers, plan.StopLossOID, plan.TPOIDs, plan.TPArmedTiers,
+		plan.ForceSLReplace, plan.ForceTPReplace, plan.CancelTPOIDs,
 		reconcileFillHintsJSON,
 	)
 	if stderr != "" && logger != nil {
@@ -373,7 +382,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 	return result, true
 }
 
-func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtectionSyncResult) {
+func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtectionSyncResult, cancelTPOIDs []int64) {
 	if pos == nil || result == nil {
 		return
 	}
@@ -449,6 +458,76 @@ func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtection
 			pos.TPArmedTiers[1] = true
 		}
 	}
+	applySurplusTPCancelOutcome(pos, result, cancelTPOIDs)
+}
+
+// applySurplusTPCancelOutcome updates pos.TPOIDs after dynamic tier-count shrink
+// cancels (#843): re-append failed cancels for retry, clear filled or successfully
+// canceled surplus OIDs so dust cycles do not leave stale slots.
+func applySurplusTPCancelOutcome(pos *Position, result *HyperliquidProtectionSyncResult, cancelTPOIDs []int64) {
+	if pos == nil || result == nil {
+		return
+	}
+	for _, oid := range result.TPCancelFailedOIDs {
+		if oid <= 0 {
+			continue
+		}
+		found := false
+		for _, existing := range pos.TPOIDs {
+			if existing == oid {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		pos.TPOIDs = append(pos.TPOIDs, oid)
+		if len(pos.TPArmedTiers) < len(pos.TPOIDs) {
+			extended := make([]bool, len(pos.TPOIDs))
+			copy(extended, pos.TPArmedTiers)
+			pos.TPArmedTiers = extended
+		}
+		pos.TPArmedTiers[len(pos.TPOIDs)-1] = true
+	}
+	if len(cancelTPOIDs) == 0 {
+		return
+	}
+	failed := make(map[int64]struct{}, len(result.TPCancelFailedOIDs))
+	for _, oid := range result.TPCancelFailedOIDs {
+		if oid > 0 {
+			failed[oid] = struct{}{}
+		}
+	}
+	clear := make(map[int64]struct{})
+	for _, oid := range result.TPCancelFilledOIDs {
+		if oid > 0 {
+			clear[oid] = struct{}{}
+		}
+	}
+	for _, oid := range cancelTPOIDs {
+		if oid <= 0 {
+			continue
+		}
+		if _, isFailed := failed[oid]; isFailed {
+			continue
+		}
+		clear[oid] = struct{}{}
+	}
+	if len(clear) == 0 || len(pos.TPOIDs) == 0 {
+		return
+	}
+	if len(pos.TPArmedTiers) < len(pos.TPOIDs) {
+		extended := make([]bool, len(pos.TPOIDs))
+		copy(extended, pos.TPArmedTiers)
+		pos.TPArmedTiers = extended
+	}
+	for i, oid := range pos.TPOIDs {
+		if _, ok := clear[oid]; ok {
+			pos.TPOIDs[i] = 0
+			pos.TPArmedTiers[i] = true
+		}
+	}
 }
 
 // runHyperliquidProtectionSync is the locking + plan + subprocess + apply
@@ -480,11 +559,31 @@ func runHyperliquidProtectionSync(
 	}
 	var plan hlProtectionPlan
 	var syncOK bool
-	mu.RLock()
-	if pos, ok := stratState.Positions[symbol]; ok {
-		plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+	if strategyUsesDynamicRegimeClose(sc) {
+		// Confirm-cycle state mutates Position fields — exclusive lock required
+		// (RLock would race /status JSON reads of RegimeAppliedLabel, etc.).
+		mu.Lock()
+		if pos, ok := stratState.Positions[symbol]; ok {
+			oldAppliedRegime := pos.RegimeAppliedLabel
+			regimeChanged := advanceDynamicCloseRegime(pos, stratState, sc)
+			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+			if syncOK {
+				plan.CancelTPOIDs = dynamicProtectionSurplusTPOIDs(pos.TPOIDs, len(plan.Tiers))
+				if regimeChanged {
+					forceSL, forceTP := dynamicProtectionForceReplace(sc, pos, plan, oldAppliedRegime, true)
+					plan.ForceSLReplace = forceSL
+					plan.ForceTPReplace = forceTP
+				}
+			}
+		}
+		mu.Unlock()
+	} else {
+		mu.RLock()
+		if pos, ok := stratState.Positions[symbol]; ok {
+			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+		}
+		mu.RUnlock()
 	}
-	mu.RUnlock()
 	if !syncOK {
 		return false
 	}
@@ -498,7 +597,10 @@ func runHyperliquidProtectionSync(
 	if !ok || pos == nil || pos.Quantity <= 0 || pos.Side != plan.Side {
 		return false
 	}
-	applyHyperliquidProtectionSync(pos, protection)
+	applyHyperliquidProtectionSync(pos, protection, plan.CancelTPOIDs)
+	if logger != nil && len(protection.TPCancelFilledOIDs) > 0 {
+		logger.Info("surplus TP OIDs filled on-chain (reconciler will book): %v", protection.TPCancelFilledOIDs)
+	}
 	// Re-stamp TradeHistory so the trade alert picks up SL/TP prices placed
 	// by the protection sync (#625). Without this, execute-path SL=0 leaves the
 	// trade's StopLossTriggerPx unset even though the sync correctly populated
@@ -546,10 +648,11 @@ func hyperliquidPlacesOnChainTPs(sc StrategyConfig) bool {
 // end up with a race; instead they get a clean signal that on-chain
 // protection trumps the in-process evaluator.
 var closeStrategiesSuppressedByOnChainProtection = map[string]struct{}{
-	"tiered_tp_atr":             {},
-	"tiered_tp_atr_live":        {},
-	"tiered_tp_atr_regime":      {},
-	"tiered_tp_atr_live_regime": {},
+	"tiered_tp_atr":                     {},
+	"tiered_tp_atr_live":                {},
+	"tiered_tp_atr_regime":              {},
+	"tiered_tp_atr_live_regime":         {},
+	"tiered_tp_atr_live_regime_dynamic": {},
 }
 
 // isTieredTPATRCloseName returns true when name is any of the four
@@ -557,7 +660,8 @@ var closeStrategiesSuppressedByOnChainProtection = map[string]struct{}{
 func isTieredTPATRCloseName(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "tiered_tp_atr", "tiered_tp_atr_live",
-		"tiered_tp_atr_regime", "tiered_tp_atr_live_regime":
+		"tiered_tp_atr_regime", "tiered_tp_atr_live_regime",
+		dynamicCloseStrategyName:
 		return true
 	}
 	return false

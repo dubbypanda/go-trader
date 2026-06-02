@@ -482,6 +482,9 @@ def run_sync_protection(
     tp_tiers=None,
     tp_oids=None,
     tp_armed_tiers=None,
+    force_sl_replace=False,
+    force_tp_replace=None,
+    cancel_tp_oids=None,
     reconcile_fill_hints_json="",
 ):
     """Verify/re-place per-strategy reduce-only SL/TP orders (#601)."""
@@ -492,8 +495,12 @@ def run_sync_protection(
     if side not in ("long", "short"):
         print(json.dumps({"error": f"invalid side {side!r}"}, cls=SafeEncoder))
         sys.exit(1)
-    if size <= 0 or avg_cost <= 0 or entry_atr <= 0:
-        print(json.dumps({"error": "size, avg-cost, and entry-atr must be > 0"}, cls=SafeEncoder))
+    if avg_cost <= 0 or entry_atr <= 0:
+        print(json.dumps({"error": "avg-cost and entry-atr must be > 0"}, cls=SafeEncoder))
+        sys.exit(1)
+    # Shared-coin dust can drive size to 0 while surplus TP OIDs still need cancel (#843).
+    if size <= 0 and not cancel_tp_oids:
+        print(json.dumps({"error": "size must be > 0"}, cls=SafeEncoder))
         sys.exit(1)
 
     out = {
@@ -553,6 +560,36 @@ def run_sync_protection(
                 return ("filled", fill)
             return ("place", None)
 
+        surplus_cancel_failed = []
+        surplus_cancel_filled = []
+        for surplus_oid in cancel_tp_oids or []:
+            oid = int(surplus_oid)
+            if oid <= 0:
+                continue
+            action, fill = _resolve_missing_oid(oid)
+            if action == "filled":
+                surplus_cancel_filled.append(oid)
+                print(
+                    f"[WARN] surplus TP OID={oid} already filled on-chain; not canceling — reconciler will book the close",
+                    file=sys.stderr,
+                )
+                continue
+            if action == "unknown":
+                surplus_cancel_failed.append(oid)
+                continue
+            try:
+                adapter.cancel_order_by_oid(symbol, oid)
+            except Exception as ce:
+                surplus_cancel_failed.append(oid)
+                print(
+                    f"[WARN] cancel surplus TP OID={oid} failed: {ce}",
+                    file=sys.stderr,
+                )
+        if surplus_cancel_failed:
+            out["tp_cancel_failed_oids"] = surplus_cancel_failed
+        if surplus_cancel_filled:
+            out["tp_cancel_filled_oids"] = surplus_cancel_filled
+
         if stop_loss_atr_mult > 0:
             if side == "long":
                 sl_px = avg_cost - stop_loss_atr_mult * entry_atr
@@ -560,15 +597,36 @@ def run_sync_protection(
                 sl_px = avg_cost + stop_loss_atr_mult * entry_atr
             sl_px = adapter.round_perps_trigger_px(symbol, sl_px)
             out["stop_loss_trigger_px"] = sl_px
-            if _oid_is_open(open_oids, stop_loss_oid):
+            if _oid_is_open(open_oids, stop_loss_oid) and not force_sl_replace:
                 out["stop_loss_oid"] = int(stop_loss_oid)
+            elif _oid_is_open(open_oids, stop_loss_oid) and force_sl_replace:
+                if size <= 0:
+                    out["stop_loss_oid"] = int(stop_loss_oid)
+                else:
+                    try:
+                        adapter.cancel_order_by_oid(symbol, int(stop_loss_oid))
+                    except Exception as ce:
+                        out["stop_loss_error"] = f"force replace cancel: {ce}"
+                    try:
+                        resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
+                        kind, payload = _classify_sl_response(resp)
+                        if kind == "resting":
+                            out["stop_loss_oid"] = payload
+                        elif kind == "filled":
+                            out["stop_loss_filled_immediately"] = True
+                        elif kind == "error":
+                            out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
+                        else:
+                            out["stop_loss_error"] = f"place_stop_loss returned no usable status: {resp}"
+                    except Exception as se:
+                        out["stop_loss_error"] = str(se)
             else:
                 action, fill = _resolve_missing_oid(stop_loss_oid)
                 if action == "filled":
                     out["stop_loss_filled_externally"] = True
                     out["stop_loss_fill"] = fill
                     print(f"[WARN] stop-loss OID={stop_loss_oid} already filled on-chain; not re-placing — reconciler will book the close", file=sys.stderr)
-                elif action == "place":
+                elif action == "place" and size > 0:
                     try:
                         resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
                         kind, payload = _classify_sl_response(resp)
@@ -616,6 +674,11 @@ def run_sync_protection(
                     armed.extend([False] * (len(tiers) - len(armed)))
                 else:
                     armed = armed[: len(tiers)]
+                force_tp = [bool(x) for x in (force_tp_replace or [])]
+                if len(force_tp) < len(tiers):
+                    force_tp.extend([False] * (len(tiers) - len(force_tp)))
+                else:
+                    force_tp = force_tp[: len(tiers)]
                 tier_sizes = compute_tp_tier_sizes(
                     size, tiers, lambda sz: adapter.floor_size(symbol, sz)
                 )
@@ -631,8 +694,34 @@ def run_sync_protection(
 
                     if tier_size <= 0:
                         continue
-                    if _oid_is_open(open_oids, prev_oid):
+                    if _oid_is_open(open_oids, prev_oid) and not (idx < len(force_tp) and force_tp[idx]):
                         tp_oids_out[idx] = prev_oid
+                        continue
+                    if _oid_is_open(open_oids, prev_oid) and idx < len(force_tp) and force_tp[idx]:
+                        try:
+                            adapter.cancel_order_by_oid(symbol, int(prev_oid))
+                        except Exception as ce:
+                            tp_errors[idx] = f"force replace cancel: {ce}"
+                            continue
+                        try:
+                            resp = adapter.place_take_profit_limit(
+                                symbol, tier_size, rounded_px, close_is_buy
+                            )
+                            kind, payload = _classify_sl_response(resp)
+                            if kind == "resting":
+                                tp_oids_out[idx] = payload
+                            elif kind == "filled":
+                                tp_filled_immediately[idx] = True
+                            elif kind == "error":
+                                tp_errors[idx] = (
+                                    f"place_take_profit_limit SDK error: {payload}"
+                                )
+                            else:
+                                tp_errors[idx] = (
+                                    f"place_take_profit_limit returned no usable status: {resp}"
+                                )
+                        except Exception as te:
+                            tp_errors[idx] = str(te)
                         continue
 
                     # #749: OID 0 means "no resting order" both before first placement
@@ -1121,12 +1210,33 @@ def main():
             default="",
             help="Optional JSON array from Go reconciler prefetch (#759); skips duplicate userFills per OID.",
         )
+        parser.add_argument(
+            "--force-sl-replace",
+            action="store_true",
+            help="#843: cancel resting SL and re-place when dynamic regime changes.",
+        )
+        parser.add_argument(
+            "--force-tp-replace-json",
+            default="",
+            help="#843: JSON bool[] — cancel+replace resting TP tiers when true.",
+        )
+        parser.add_argument(
+            "--cancel-tp-oids-json",
+            default="",
+            help="#843: JSON int[] — surplus resting TP OIDs to cancel after tier-count shrink.",
+        )
         parser.add_argument("--mode", default="live")
         args = parser.parse_args()
         tp_tiers = json.loads(args.tp_tiers_json) if args.tp_tiers_json else None
         tp_oids = json.loads(args.tp_oids_json) if args.tp_oids_json else None
         tp_armed_tiers = (
             json.loads(args.tp_armed_tiers_json) if args.tp_armed_tiers_json else None
+        )
+        force_tp_replace = (
+            json.loads(args.force_tp_replace_json) if args.force_tp_replace_json else None
+        )
+        cancel_tp_oids = (
+            json.loads(args.cancel_tp_oids_json) if args.cancel_tp_oids_json else None
         )
         run_sync_protection(
             args.symbol,
@@ -1145,6 +1255,9 @@ def main():
             tp_tiers=tp_tiers,
             tp_oids=tp_oids,
             tp_armed_tiers=tp_armed_tiers,
+            force_sl_replace=bool(args.force_sl_replace),
+            force_tp_replace=force_tp_replace,
+            cancel_tp_oids=cancel_tp_oids,
             reconcile_fill_hints_json=args.reconcile_fill_hints_json or "",
         )
     elif "--update-stop-loss" in sys.argv:
