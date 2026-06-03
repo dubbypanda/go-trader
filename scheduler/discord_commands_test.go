@@ -16,3 +16,32 @@ func TestDiscordBackend(t *testing.T) {
 		t.Fatalf("expected DiscordBackend to return the registered *DiscordNotifier, got %v", got)
 	}
 }
+
+func TestAuthorizeCommand(t *testing.T) {
+	const owner = "owner123"
+	cases := []struct {
+		name, invoker, guildID string
+		wantOK                 bool
+	}{
+		{"status", "anyone", "guild1", true}, // read-only in guild OK
+		{"status", "anyone", "", true},       // read-only in DM OK
+		{"positions", "anyone", "guild1", true},
+		{"logs", "anyone", "guild1", true},
+		{"restart", owner, "", true},        // ops: owner in DM OK
+		{"restart", owner, "guild1", false}, // ops: owner in guild rejected (must be DM)
+		{"restart", "intruder", "", false},  // ops: non-owner in DM rejected
+		{"backtest", owner, "", true},
+		{"backtest", "intruder", "", false},
+		{"unknown", owner, "", false}, // unknown command rejected
+	}
+	for _, c := range cases {
+		ok, reason := authorizeCommand(c.name, c.invoker, c.guildID, owner)
+		if ok != c.wantOK {
+			t.Errorf("authorizeCommand(%q, %q, guild=%q) = %v (%q), want %v",
+				c.name, c.invoker, c.guildID, ok, reason, c.wantOK)
+		}
+		if !ok && reason == "" {
+			t.Errorf("authorizeCommand(%q,...) denied without a reason", c.name)
+		}
+	}
+}
