@@ -1757,7 +1757,21 @@ func main() {
 								mu.Unlock()
 							}
 						}
-						if closeFraction, _, ok := runManualCloseEval(sc, stratState, cfg, notifier, logger); ok && closeFraction > 0 {
+						closeFraction, _, manualRegime, manualOK := runManualCloseEval(sc, stratState, cfg, notifier, logger)
+						if manualOK {
+							// #872: manual positions have no open signal, so the
+							// frozen-label close features (trailing_tp_ratchet_regime,
+							// *_atr_regime SL/TP) never see a regime and silently
+							// no-op. Stamp the current regime onto the position the
+							// first time we observe one. Idempotent — stampPosition-
+							// RegimeFromPayload only writes when pos.Regime == "" — so
+							// this fires exactly once, on the first close-eval cycle
+							// after open, regardless of live vs --record-only.
+							mu.Lock()
+							stampPositionRegimeIfOpened(stratState, sc.Symbol, manualRegime, sc, cfg.Regime)
+							mu.Unlock()
+						}
+						if manualOK && closeFraction > 0 {
 							mu.RLock()
 							pos = stratState.Positions[sc.Symbol]
 							mu.RUnlock()

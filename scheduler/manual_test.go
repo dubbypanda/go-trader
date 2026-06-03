@@ -795,3 +795,78 @@ func TestResolveManualOpenOrderSize(t *testing.T) {
 		}
 	})
 }
+
+// TestManualCloseEval_FlatReturnsEmptyPayload covers the #872 signature change:
+// runManualCloseEval now returns the cycle's regime payload as a fourth value.
+// The flat (no open position) early-return must yield an empty payload and not
+// spawn a subprocess.
+func TestManualCloseEval_FlatReturnsEmptyPayload(t *testing.T) {
+	sc := StrategyConfig{ID: "hl-manual-eth-live", Type: "manual", Platform: "hyperliquid", Symbol: "ETH"}
+	ss := &StrategyState{ID: sc.ID, Positions: map[string]*Position{}}
+	cfg := &Config{Regime: &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20}}
+
+	cf, px, payload, ok := runManualCloseEval(sc, ss, cfg, nil, nil)
+	if !ok {
+		t.Fatalf("flat manual close-eval ok = false, want true")
+	}
+	if cf != 0 || px != 0 {
+		t.Errorf("flat manual close-eval = (cf=%v, px=%v), want (0, 0)", cf, px)
+	}
+	if !payload.IsEmpty() {
+		t.Errorf("flat manual close-eval payload = %+v, want empty", payload)
+	}
+}
+
+// TestManualStampRegimeOnPosition is the #872 regression: manual positions have
+// no open signal, so the per-cycle close-eval is the only place to stamp the
+// regime onto the position. The manual dispatch feeds the runManualCloseEval
+// payload into stampPositionRegimeIfOpened; verify it stamps exactly once and
+// never overwrites a label already set, and that an empty payload (regime
+// disabled / no classifier output) leaves the position unstamped.
+func TestManualStampRegimeOnPosition(t *testing.T) {
+	rc := &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20}
+	sc := StrategyConfig{ID: "hl-manual-eth-live", Type: "manual", Platform: "hyperliquid", Symbol: "ETH"}
+
+	newState := func(regime string) *StrategyState {
+		return &StrategyState{
+			ID: sc.ID,
+			Positions: map[string]*Position{
+				"ETH": {
+					Symbol:          "ETH",
+					Quantity:        0.5,
+					InitialQuantity: 0.5,
+					AvgCost:         2000,
+					Side:            "long",
+					Regime:          regime,
+					OwnerStrategyID: sc.ID,
+				},
+			},
+		}
+	}
+
+	// Fresh position (empty regime) gets stamped from the cycle's payload.
+	ss := newState("")
+	stampPositionRegimeIfOpened(ss, sc.Symbol, RegimePayload{Legacy: "trending_up"}, sc, rc)
+	if got := ss.Positions["ETH"].Regime; got != "trending_up" {
+		t.Fatalf("expected regime stamped to trending_up, got %q", got)
+	}
+	if got := ss.Positions["ETH"].RegimeWindows[regimeWindowDefaultKey]; got != "trending_up" {
+		t.Errorf("expected default window label trending_up, got %q", got)
+	}
+
+	// Idempotent: a later close-eval cycle with a different regime must not
+	// overwrite the frozen-at-first-observation label.
+	stampPositionRegimeIfOpened(ss, sc.Symbol, RegimePayload{Legacy: "ranging"}, sc, rc)
+	if got := ss.Positions["ETH"].Regime; got != "trending_up" {
+		t.Errorf("regime must not be overwritten once set, got %q", got)
+	}
+
+	// Empty payload (regime disabled or no classifier output) leaves the
+	// position unstamped — record-only behaves identically since both paths
+	// run the same helper.
+	ssEmpty := newState("")
+	stampPositionRegimeIfOpened(ssEmpty, sc.Symbol, RegimePayload{}, sc, rc)
+	if got := ssEmpty.Positions["ETH"].Regime; got != "" {
+		t.Errorf("empty payload must not stamp a regime, got %q", got)
+	}
+}
