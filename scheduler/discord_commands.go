@@ -344,3 +344,20 @@ func formatLeaderboardResponse(cfg *Config, state *AppState, prices map[string]f
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
+
+// parseBacktestSummary extracts headline metrics from run_backtest.py's
+// single-mode text report (backtest/reporter.py::format_single_report).
+// Missing labels render as "—" so a partial report still produces output.
+func parseBacktestSummary(report string) string {
+	lines := strings.Split(report, "\n")
+	grab := func(label string) string {
+		for _, ln := range lines {
+			if idx := strings.Index(ln, label); idx >= 0 {
+				return strings.TrimSpace(ln[idx+len(label):])
+			}
+		}
+		return "—"
+	}
+	return fmt.Sprintf("Total Return: %s | Sharpe: %s | Max DD: %s | Trades: %s | Win Rate: %s",
+		grab("Total Return:"), grab("Sharpe Ratio:"), grab("Max Drawdown:"), grab("Total Trades:"), grab("Win Rate:"))
+}

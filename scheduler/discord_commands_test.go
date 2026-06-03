@@ -204,3 +204,27 @@ func TestFormatCorrelationResponseDeterministicTies(t *testing.T) {
 		t.Errorf("expected BTC<ETH<SOL ordering on ties, got: %s", first)
 	}
 }
+
+func TestParseBacktestSummary(t *testing.T) {
+	report := strings.Join([]string{
+		"  RETURNS",
+		"    Total Return:    +12.34%",
+		"  RISK METRICS",
+		"    Sharpe Ratio:    1.234",
+		"    Max Drawdown:    8.50%",
+		"  TRADE STATS",
+		"    Total Trades:    17",
+		"    Win Rate:        58.8%",
+	}, "\n")
+	got := parseBacktestSummary(report)
+	for _, want := range []string{"+12.34%", "1.234", "8.50%", "17", "58.8%"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary missing %q; got: %s", want, got)
+		}
+	}
+
+	// Missing labels degrade to a dash rather than erroring.
+	if got := parseBacktestSummary("no metrics here"); !strings.Contains(got, "—") {
+		t.Errorf("expected dash for missing metrics, got: %s", got)
+	}
+}
