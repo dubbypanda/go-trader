@@ -1744,6 +1744,24 @@ func main() {
 								if execResult != nil && trades > 0 {
 									runHyperliquidProtectionSync(sc, stratState, stateDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON)
 									runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
+									// #873/#882: for a trailing-SL owner the post-trade sync
+									// re-sized only the on-chain TPs (the walker owns the SL).
+									// Grow the trailing SL NOW via the same walker primitive
+									// instead of deferring to the next Signal==0 cycle, so a
+									// scale-in's added size is covered immediately even on a
+									// long strategy interval. No-op for non-trailing owners
+									// (their SL was already re-sized + flag cleared by the sync)
+									// and when the add wasn't a scale-in (flag unset).
+									if scaleInAddQty > 0 {
+										filledAddQty := scaleInAddQty
+										if execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.TotalSz > 0 {
+											filledAddQty = execResult.Execution.Fill.TotalSz
+										}
+										if extraTrades, slDetail := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlOnChainAbsQty, filledAddQty, &mu, notifier, logger); extraTrades > 0 {
+											trades += extraTrades
+											detail = slDetail
+										}
+									}
 									mu.Lock()
 									var pos *Position
 									if p, ok := stratState.Positions[result.Symbol]; ok {

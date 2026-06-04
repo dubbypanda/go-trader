@@ -2,8 +2,82 @@ package main
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
+
+// scaleInResizeTrailingSLNow eagerly grows a TRAILING stop-loss on the SAME cycle
+// as the add, so the increased position is covered immediately instead of waiting
+// for the next Signal==0 trailing-walker cycle (#882 review: with a long strategy
+// interval, deferring would leave the added size under-covered for up to a full
+// cycle — seriously dangerous on a fast adverse move). It is a no-op for
+// non-trailing SL owners (the post-trade protection sync already grew their SL on
+// this cycle) and for non-trailing-walker positions.
+//
+// Correctness over a single steady-state path: it reuses the exact walker
+// primitive (runHyperliquidTrailingStopUpdate with forceResize) and result
+// handler (applyTrailingStopUpdateResult) rather than a second SL-placement path,
+// so there is only one stop-placement implementation that can't drift. The only
+// added input is the #621 size cap's on-chain qty, which must reflect the GROWN
+// position: Go's per-cycle reconcile snapshot is pre-add, so we add the confirmed
+// add fill (filledAddQty) to it. If even the corrected qty is still capped (e.g.
+// shared-coin reconcile lag), it leaves ScaleInResizePending set so the next
+// walker cycle still resizes — same-cycle coverage is best-effort, never worse
+// than the deferred path.
+func scaleInResizeTrailingSLNow(
+	sc StrategyConfig,
+	stratState *StrategyState,
+	symbol string,
+	mark float64,
+	preAddOnChainAbsQty map[string]float64,
+	filledAddQty float64,
+	mu *sync.RWMutex,
+	notifier *MultiNotifier,
+	logger *StrategyLogger,
+) (int, string) {
+	if !hyperliquidIsLive(sc.Args) || stratState == nil || symbol == "" || mark <= 0 {
+		return 0, ""
+	}
+	mu.RLock()
+	pos := stratState.Positions[symbol]
+	if pos == nil || pos.Quantity <= 0 || !pos.ScaleInResizePending || effectiveTrailingStopPct(sc, pos) <= 0 {
+		mu.RUnlock()
+		return 0, ""
+	}
+	side := pos.Side
+	highWater := pos.StopLossHighWaterPx
+	triggerPx := pos.StopLossTriggerPx
+	slOID := pos.StopLossOID
+	posSnap := *pos
+	mu.RUnlock()
+
+	// #621 size cap with the on-chain qty corrected for the just-confirmed add.
+	grownOnChain := map[string]float64{symbol: preAddOnChainAbsQty[symbol] + filledAddQty}
+	slEffectiveQty, capped := hlSLEffectiveQty(symbol, posSnap.Quantity, grownOnChain)
+	if capped {
+		// Reconcile hasn't caught up enough to size the SL to the grown total;
+		// leave the flag for the next walker cycle rather than place an
+		// under-sized stop now.
+		logger.Warn("scale-in eager SL resize: %s still capped (virtual %.6f > on-chain %.6f); deferring to next walker cycle", symbol, posSnap.Quantity, slEffectiveQty)
+		return 0, ""
+	}
+	newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, symbol, side, slEffectiveQty, &posSnap, mark, highWater, triggerPx, slOID, true, notifier, logger)
+	mu.Lock()
+	defer mu.Unlock()
+	trades := 0
+	detail := ""
+	if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, slOID, newHighWater, updateConfirmed, slUpdate, logger); immediateFill {
+		trades = 1
+		detail = fmt.Sprintf("[%s] LIVE TRAILING SL %s @ $%.2f", sc.ID, symbol, fillPx)
+	}
+	if updateConfirmed {
+		if p, ok := stratState.Positions[symbol]; ok && p != nil {
+			p.ScaleInResizePending = false
+			logger.Info("Scale-in trailing SL re-sized same-cycle (qty=%.6f)", slEffectiveQty)
+		}
+	}
+	return trades, detail
+}
 
 // scaleInTradeType marks the open-side leg of a scale-in so lifetime stats can
 // exclude it from the round-trip open count (#T) — an add is a second open-side

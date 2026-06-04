@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -175,6 +176,48 @@ func TestScaleInTrailingSLOwnerDefersClearToWalker(t *testing.T) {
 	scFixed := StrategyConfig{Type: "perps", Platform: "hyperliquid", StopLossATRMult: &fixed}
 	if got := effectiveTrailingStopPct(scFixed, pos); got != 0 {
 		t.Errorf("fixed-ATR effectiveTrailingStopPct = %v, want 0 (sync owns the clear)", got)
+	}
+}
+
+// scaleInResizeTrailingSLNow no-ops (before any subprocess) when it isn't the
+// owner of the resize: not live, flag unset, non-trailing SL owner, or still
+// size-capped after correcting the on-chain qty for the add fill (#882 hybrid).
+func TestScaleInResizeTrailingSLNowGuards(t *testing.T) {
+	trail := 2.0
+	fixed := 1.5
+	liveArgs := []string{"x.py", "ETH", "1h", "--mode=live"}
+	mk := func(args []string, slMult *float64, trailMult *float64, pending bool, qty float64) (StrategyConfig, *StrategyState) {
+		sc := StrategyConfig{ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: args, StopLossATRMult: slMult, TrailingStopATRMult: trailMult}
+		st := &StrategyState{ID: "hl-eth", Positions: map[string]*Position{
+			"ETH": {Symbol: "ETH", Side: "long", Quantity: qty, InitialQuantity: qty, AvgCost: 2100, EntryATR: 50, RiskAnchorPrice: 2000, ScaleInResizePending: pending},
+		}}
+		return sc, st
+	}
+	var mu sync.RWMutex
+
+	// not live → no-op
+	sc, st := mk([]string{"x.py", "ETH", "1h"}, nil, &trail, true, 2)
+	if n, d := scaleInResizeTrailingSLNow(sc, st, "ETH", 2050, map[string]float64{"ETH": 2}, 1, &mu, nil, newTestLogger(t)); n != 0 || d != "" {
+		t.Errorf("not-live: got (%d,%q), want (0,\"\")", n, d)
+	}
+	// flag unset → no-op
+	sc, st = mk(liveArgs, nil, &trail, false, 2)
+	if n, _ := scaleInResizeTrailingSLNow(sc, st, "ETH", 2050, map[string]float64{"ETH": 2}, 1, &mu, nil, newTestLogger(t)); n != 0 {
+		t.Errorf("flag-unset: got %d, want 0", n)
+	}
+	// non-trailing SL owner (fixed ATR) → sync already handled it, no-op
+	sc, st = mk(liveArgs, &fixed, nil, true, 2)
+	if n, _ := scaleInResizeTrailingSLNow(sc, st, "ETH", 2050, map[string]float64{"ETH": 2}, 1, &mu, nil, newTestLogger(t)); n != 0 {
+		t.Errorf("non-trailing: got %d, want 0", n)
+	}
+	// still capped after correcting on-chain qty (preAdd 0.5 + fill 0.25 < virtual 2) → defer, no-op
+	sc, st = mk(liveArgs, nil, &trail, true, 2)
+	if n, _ := scaleInResizeTrailingSLNow(sc, st, "ETH", 2050, map[string]float64{"ETH": 0.5}, 0.25, &mu, nil, newTestLogger(t)); n != 0 {
+		t.Errorf("capped: got %d, want 0 (deferred)", n)
+	}
+	// flag must remain set for the deferred walker when capped
+	if !st.Positions["ETH"].ScaleInResizePending {
+		t.Errorf("capped: flag cleared, want still pending for the next walker cycle")
 	}
 }
 
