@@ -440,7 +440,7 @@ DEFAULT_PARAM_RANGES = {
         "exit_period": [5, 10, 15],
     },
     "consolidation_range": {
-        "box_width_pct": [0.03, 0.05, 0.08],
+        "box_width_pct": [0.03, 0.05, 0.08, 0.10],
         "min_bars": [12, 16, 24],
         "edge_entry_frac": [0.1, 0.2, 0.33],
     },
