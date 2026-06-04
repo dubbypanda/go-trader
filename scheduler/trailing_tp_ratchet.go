@@ -57,7 +57,7 @@ func defaultTrailingRatchetTiers() []trailingRatchetTier {
 	return []trailingRatchetTier{
 		{ATRMultiple: 2.0, CloseFraction: 0, TrailingMultAfter: 1.5},
 		{ATRMultiple: 2.5, CloseFraction: 0, TrailingMultAfter: 1.0},
-		{ATRMultiple: 3.0, CloseFraction: 0, TrailingMultAfter: 0.5},
+		{ATRMultiple: 3.0, CloseFraction: 0, TrailingMultAfter: 0.8},
 	}
 }
 
@@ -71,17 +71,17 @@ var ratchetTierGroupDefaults = map[string][]trailingRatchetTier{
 	"clean": {
 		{ATRMultiple: 3.0, CloseFraction: 0, TrailingMultAfter: 1.5},
 		{ATRMultiple: 4.5, CloseFraction: 0, TrailingMultAfter: 1.0},
-		{ATRMultiple: 6.0, CloseFraction: 0, TrailingMultAfter: 0.5},
+		{ATRMultiple: 6.0, CloseFraction: 0, TrailingMultAfter: 0.8},
 	},
 	"choppy": {
 		{ATRMultiple: 2.0, CloseFraction: 0, TrailingMultAfter: 1.5},
 		{ATRMultiple: 2.5, CloseFraction: 0, TrailingMultAfter: 1.0},
-		{ATRMultiple: 3.0, CloseFraction: 0, TrailingMultAfter: 0.5},
+		{ATRMultiple: 3.0, CloseFraction: 0, TrailingMultAfter: 0.8},
 	},
 	"ranging": {
 		{ATRMultiple: 0.75, CloseFraction: 0.4, TrailingMultAfter: 1.0},
 		{ATRMultiple: 1.5, CloseFraction: 0.8, TrailingMultAfter: 0.75},
-		{ATRMultiple: 2.0, CloseFraction: 1.0, TrailingMultAfter: 0.5},
+		{ATRMultiple: 2.0, CloseFraction: 1.0, TrailingMultAfter: 0.8},
 	},
 }
 

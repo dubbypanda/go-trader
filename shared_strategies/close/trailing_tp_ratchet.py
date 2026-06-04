@@ -26,7 +26,7 @@ from regime_atr import CANONICAL_TREND_REGIME_LABELS, regime_close_default_group
 DEFAULT_RATCHET_TIERS = [
     {"atr_multiple": 2.0, "trailing_mult_after": 1.5, "close_fraction": 0.0},
     {"atr_multiple": 2.5, "trailing_mult_after": 1.0, "close_fraction": 0.0},
-    {"atr_multiple": 3.0, "trailing_mult_after": 0.5, "close_fraction": 0.0},
+    {"atr_multiple": 3.0, "trailing_mult_after": 0.8, "close_fraction": 0.0},
 ]
 
 # #870: per-quality-group default ratchet ladders for the REGIME variant
@@ -39,17 +39,17 @@ DEFAULT_RATCHET_TIERS_BY_GROUP = {
     "clean": [
         {"atr_multiple": 3.0, "trailing_mult_after": 1.5, "close_fraction": 0.0},
         {"atr_multiple": 4.5, "trailing_mult_after": 1.0, "close_fraction": 0.0},
-        {"atr_multiple": 6.0, "trailing_mult_after": 0.5, "close_fraction": 0.0},
+        {"atr_multiple": 6.0, "trailing_mult_after": 0.8, "close_fraction": 0.0},
     ],
     "choppy": [
         {"atr_multiple": 2.0, "trailing_mult_after": 1.5, "close_fraction": 0.0},
         {"atr_multiple": 2.5, "trailing_mult_after": 1.0, "close_fraction": 0.0},
-        {"atr_multiple": 3.0, "trailing_mult_after": 0.5, "close_fraction": 0.0},
+        {"atr_multiple": 3.0, "trailing_mult_after": 0.8, "close_fraction": 0.0},
     ],
     "ranging": [
         {"atr_multiple": 0.75, "trailing_mult_after": 1.0, "close_fraction": 0.4},
         {"atr_multiple": 1.5, "trailing_mult_after": 0.75, "close_fraction": 0.8},
-        {"atr_multiple": 2.0, "trailing_mult_after": 0.5, "close_fraction": 1.0},
+        {"atr_multiple": 2.0, "trailing_mult_after": 0.8, "close_fraction": 1.0},
     ],
 }
 
