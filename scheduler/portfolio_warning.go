@@ -258,7 +258,7 @@ func portfolioWarningRecommendation(contribs []portfolioWarningContributor) stri
 		return "review portfolio exposure and recent fills before adding risk."
 	}
 	if contribs[0].PnL < 0 && contribs[0].NegativeWeight >= 0.5 {
-		return fmt.Sprintf("review open positions above; consider manual close on %s if the signal does not recover next cycle.", contribs[0].ID)
+		return fmt.Sprintf("review open positions above; consider manually closing %s if the signal does not recover next cycle.", contribs[0].ID)
 	}
 	return "review open positions above and avoid adding risk until the drawdown recovers."
 }
