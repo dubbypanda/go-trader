@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -168,7 +169,7 @@ func TestParseRegimeBundleOutputErrors(t *testing.T) {
 
 // ─── store population + failure policy ───────────────────────────────────────
 
-func stubRegimeBundleCheck(t *testing.T, fn func(regimeBundleRequest) (*RegimeBundle, error)) {
+func stubRegimeBundleCheck(t *testing.T, fn func(context.Context, regimeBundleRequest) (*RegimeBundle, error)) {
 	t.Helper()
 	orig := runRegimeBundleCheckFn
 	runRegimeBundleCheckFn = fn
@@ -182,7 +183,7 @@ func TestPopulateRegimeStoreSharesBundleAcrossPeers(t *testing.T) {
 		{ID: "hl-b", Type: "perps", Platform: "hyperliquid", Args: []string{"mean_reversion", "BTC", "1h"}},
 	}
 	var calls int
-	stubRegimeBundleCheck(t, func(req regimeBundleRequest) (*RegimeBundle, error) {
+	stubRegimeBundleCheck(t, func(_ context.Context, req regimeBundleRequest) (*RegimeBundle, error) {
 		calls++
 		payload := RegimePayload{Legacy: "trending_up"}
 		return &RegimeBundle{Key: req.Key, Payload: payload, RawRegimeJSON: `"trending_up"`, At: time.Now().UTC()}, nil
@@ -205,7 +206,7 @@ func TestPopulateRegimeStoreFailureYieldsEmptyPayload(t *testing.T) {
 	// receives the flag with an EMPTY value so it never recomputes inline.
 	rc := testRegimeConfig()
 	sc := StrategyConfig{ID: "hl-a", Type: "perps", Platform: "hyperliquid", Args: []string{"momentum", "BTC", "1h"}}
-	stubRegimeBundleCheck(t, func(req regimeBundleRequest) (*RegimeBundle, error) {
+	stubRegimeBundleCheck(t, func(_ context.Context, req regimeBundleRequest) (*RegimeBundle, error) {
 		return nil, fmt.Errorf("regime bundle %s: boom", req.Key)
 	})
 	store := &RegimeStore{}
@@ -235,7 +236,7 @@ func TestPopulateRegimeStoreClearsPriorCycle(t *testing.T) {
 	rc := testRegimeConfig()
 	sc := StrategyConfig{ID: "hl-a", Type: "perps", Platform: "hyperliquid", Args: []string{"momentum", "BTC", "1h"}}
 	ok := true
-	stubRegimeBundleCheck(t, func(req regimeBundleRequest) (*RegimeBundle, error) {
+	stubRegimeBundleCheck(t, func(_ context.Context, req regimeBundleRequest) (*RegimeBundle, error) {
 		if !ok {
 			return nil, fmt.Errorf("outage")
 		}
@@ -257,20 +258,42 @@ func TestPopulateRegimeStoreClearsPriorCycle(t *testing.T) {
 
 func TestRegimeStoreSetAfterSealDiscards(t *testing.T) {
 	store := &RegimeStore{}
-	store.resetForCycle(time.Now().UTC())
+	gen := store.resetForCycle(time.Now().UTC())
 	key := regimeBundleKey{Platform: "hyperliquid", Symbol: "BTC", Timeframe: "1h"}
 	if kept := store.seal(); kept != 0 {
 		t.Fatalf("seal kept = %d", kept)
 	}
-	store.set(&RegimeBundle{Key: key, Payload: RegimePayload{Legacy: "trending_up"}})
+	store.set(&RegimeBundle{Key: key, Payload: RegimePayload{Legacy: "trending_up"}}, gen)
 	if _, ok := store.get(key); ok {
 		t.Error("a sealed store must discard late bundles (no mid-cycle flips)")
 	}
-	// A new cycle unseals.
-	store.resetForCycle(time.Now().UTC())
-	store.set(&RegimeBundle{Key: key, Payload: RegimePayload{Legacy: "trending_up"}})
+	// A new cycle unseals — but only same-generation writes land.
+	gen2 := store.resetForCycle(time.Now().UTC())
+	store.set(&RegimeBundle{Key: key, Payload: RegimePayload{Legacy: "trending_up"}}, gen2)
 	if _, ok := store.get(key); !ok {
-		t.Error("resetForCycle must clear the seal")
+		t.Error("resetForCycle must clear the seal for the new generation")
+	}
+}
+
+func TestRegimeStoreStaleGenerationWriteDropped(t *testing.T) {
+	// Cross-cycle regression: a straggler from a budget-exceeded cycle N that
+	// completes AFTER cycle N+1 unsealed the store must not write its stale
+	// cycle-N bundle into N+1's map ("no reuse-last across cycles").
+	store := &RegimeStore{}
+	genN := store.resetForCycle(time.Now().UTC())
+	store.seal() // cycle N exceeded its budget
+	genN1 := store.resetForCycle(time.Now().UTC())
+	if genN1 == genN {
+		t.Fatal("resetForCycle must advance the generation")
+	}
+	key := regimeBundleKey{Platform: "hyperliquid", Symbol: "BTC", Timeframe: "1h"}
+	store.set(&RegimeBundle{Key: key, Payload: RegimePayload{Legacy: "trending_up"}}, genN)
+	if _, ok := store.get(key); ok {
+		t.Error("stale-generation straggler write must be dropped after the next cycle's reset")
+	}
+	store.set(&RegimeBundle{Key: key, Payload: RegimePayload{Legacy: "trending_down"}}, genN1)
+	if b, ok := store.get(key); !ok || b.Payload.Legacy != "trending_down" {
+		t.Error("current-generation write must land")
 	}
 }
 
@@ -286,7 +309,7 @@ func TestRegimeStorePhaseBudgetSealsStragglers(t *testing.T) {
 	fast := StrategyConfig{ID: "hl-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"momentum", "BTC", "1h"}}
 	slow := StrategyConfig{ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Args: []string{"momentum", "ETH", "1h"}}
 	release := make(chan struct{})
-	stubRegimeBundleCheck(t, func(req regimeBundleRequest) (*RegimeBundle, error) {
+	stubRegimeBundleCheck(t, func(_ context.Context, req regimeBundleRequest) (*RegimeBundle, error) {
 		if req.Key.Symbol == "ETH" {
 			<-release // hung subprocess
 		}
@@ -338,7 +361,7 @@ func TestRegimeBundleCheckArgs(t *testing.T) {
 
 func TestUIRegimeEntriesProjection(t *testing.T) {
 	store := &RegimeStore{}
-	store.resetForCycle(time.Now().UTC())
+	gen := store.resetForCycle(time.Now().UTC())
 	payloadJSON := `{"medium":{"regime":"trending_up","score":0.4,"metrics":{"adx":28.0}}}`
 	var payload RegimePayload
 	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
@@ -351,7 +374,7 @@ func TestUIRegimeEntriesProjection(t *testing.T) {
 		Views:         map[string]RegimeBundleViews{"medium": {ADX3: "trending_up", Composite7: "trending_up_clean"}},
 		BarTime:       "2026-06-09T12:00:00+00:00",
 		At:            time.Now().UTC(),
-	})
+	}, gen)
 	entries, _ := uiRegimeEntries(store)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d", len(entries))

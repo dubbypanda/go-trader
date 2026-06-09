@@ -19,7 +19,9 @@ package main
 // read pos.Regime, not this store.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -117,14 +119,20 @@ var regimeStorePhaseBudget = scriptTimeout + 15*time.Second
 // RegimeStore is the two-layer global store, rebuilt empty every cycle.
 // Guarded by its own mutex: writes happen on the population goroutines before
 // the check fan-out; reads come from the main loop plus the dashboard HTTP
-// handlers. Once sealed (phase budget exceeded), straggler results are
-// discarded so every strategy in the cycle reads the same — possibly empty,
-// fail-open — view instead of a mid-cycle mix.
+// handlers. Two write guards keep the per-cycle view consistent:
+//   - sealed (phase budget exceeded): straggler results are discarded so every
+//     strategy in the cycle reads the same — possibly empty, fail-open — view
+//     instead of a mid-cycle mix.
+//   - generation: each resetForCycle bumps it and writes carry the generation
+//     captured at population start, so a straggler from a budget-exceeded
+//     cycle N that completes after cycle N+1 unsealed the store cannot write
+//     its stale cycle-N bundle into N+1's map ("no reuse-last across cycles").
 type RegimeStore struct {
 	mu      sync.RWMutex
 	entries map[regimeBundleKey]*RegimeBundle
 	builtAt time.Time
 	sealed  bool
+	gen     uint64
 }
 
 // globalRegimeStore is the process-wide store. Package-level (like the other
@@ -133,24 +141,31 @@ type RegimeStore struct {
 // through every dispatch signature.
 var globalRegimeStore = &RegimeStore{}
 
-func (s *RegimeStore) resetForCycle(now time.Time) {
+// resetForCycle clears the store for a new cycle and returns the new
+// generation; writes carrying any other generation are dropped.
+func (s *RegimeStore) resetForCycle(now time.Time) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries = make(map[regimeBundleKey]*RegimeBundle)
 	s.builtAt = now
 	s.sealed = false
+	s.gen++
+	return s.gen
 }
 
-func (s *RegimeStore) set(b *RegimeBundle) {
+func (s *RegimeStore) set(b *RegimeBundle, gen uint64) {
 	if b == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sealed {
-		// Phase budget already expired: the cycle is consuming the store, so
-		// a late bundle must not flip a signature mid-cycle. Dropped, not
-		// deferred — the next cycle recomputes from scratch anyway.
+	if s.sealed || gen != s.gen {
+		// sealed: the phase budget already expired and the cycle is consuming
+		// the store — a late bundle must not flip a signature mid-cycle.
+		// gen mismatch: the bundle belongs to a PREVIOUS cycle's population
+		// (resetForCycle unsealed the store since); writing it would smuggle
+		// a stale label into the current cycle. Dropped, not deferred — the
+		// current population recomputes the signature from scratch anyway.
 		return
 	}
 	if s.entries == nil {
@@ -375,11 +390,15 @@ func parseRegimeBundleOutput(key regimeBundleKey, data []byte, now time.Time) (*
 }
 
 // runRegimeBundleCheckFn is the subprocess invoker — package var so tests can
-// stub the Python boundary (Go CI must not depend on spawning Python).
+// stub the Python boundary (Go CI must not depend on spawning Python). ctx is
+// the population context: cancelled at the phase-budget seal so in-flight
+// stragglers are killed and queued ones fast-fail, releasing their
+// pythonSemaphore slots instead of starving the check fan-out for up to a
+// full scriptTimeout each.
 var runRegimeBundleCheckFn = runRegimeBundleCheck
 
-func runRegimeBundleCheck(req regimeBundleRequest) (*RegimeBundle, error) {
-	stdout, stderr, err := runPythonReadOnly(regimeCheckScript, regimeBundleCheckArgs(req))
+func runRegimeBundleCheck(ctx context.Context, req regimeBundleRequest) (*RegimeBundle, error) {
+	stdout, stderr, err := runPython(ctx, regimeCheckScript, regimeBundleCheckArgs(req), nil)
 	now := time.Now().UTC()
 	// Subprocess contract: JSON on stdout even on error; parse regardless of
 	// exit code and prefer the script's structured error over the exit error.
@@ -438,11 +457,16 @@ func regimeBundleAlertConfig(key regimeBundleKey) StrategyConfig {
 // on the sequential main loop, so the populate goroutines must not fan sends
 // out concurrently.
 func startRegimeStorePopulation(store *RegimeStore, due []StrategyConfig, rc *RegimeConfig, notifier *MultiNotifier) func() {
-	store.resetForCycle(time.Now().UTC())
+	gen := store.resetForCycle(time.Now().UTC())
 	reqs := collectRegimeBundleRequests(due, rc)
 	if len(reqs) == 0 {
 		return func() {}
 	}
+	// Population context: derived from the read-only shutdown context like
+	// every other check subprocess, and cancelled at the phase-budget seal so
+	// stragglers release their pythonSemaphore slots instead of carrying
+	// prior-cycle regime work into the next cycle's fan-out.
+	popCtx, popCancel := context.WithCancel(shutdownReadOnlyCtx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -453,19 +477,28 @@ func startRegimeStorePopulation(store *RegimeStore, due []StrategyConfig, rc *Re
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				bundle, err := runRegimeBundleCheckFn(req)
+				bundle, err := runRegimeBundleCheckFn(popCtx, req)
 				if err != nil {
 					errs[i] = err
 					return
 				}
-				store.set(bundle)
+				store.set(bundle, gen)
 			}()
 		}
 		wg.Wait()
+		// Alerts fire after the parallel wave, off the population goroutine
+		// only (never fanned out across the per-request goroutines). A
+		// budget-cancelled request still records a failure — its signature
+		// failed open this cycle, and the 3-strike streak should surface a
+		// chronically starved signature — with a message naming the cause.
 		for i, req := range reqs {
 			if errs[i] != nil {
-				fmt.Printf("[WARN] regime store: %v\n", errs[i])
-				notifyScriptFailure(notifier, regimeBundleAlertConfig(req.Key), scriptFailureError, errs[i].Error())
+				msg := errs[i].Error()
+				if errors.Is(errs[i], context.Canceled) {
+					msg = fmt.Sprintf("cancelled at phase-budget seal (%s); signature failed open this cycle", regimeStorePhaseBudget)
+				}
+				fmt.Printf("[WARN] regime store %s: %s\n", req.Key, msg)
+				notifyScriptFailure(notifier, regimeBundleAlertConfig(req.Key), scriptFailureError, msg)
 			} else {
 				clearScriptFailure(notifier, regimeBundleAlertConfig(req.Key))
 			}
@@ -474,8 +507,13 @@ func startRegimeStorePopulation(store *RegimeStore, due []StrategyConfig, rc *Re
 	return func() {
 		select {
 		case <-done:
+			popCancel()
 		case <-time.After(regimeStorePhaseBudget):
 			kept := store.seal()
+			// Seal first (no mid-cycle flips), then cancel: in-flight
+			// subprocesses are SIGKILLed and queued ones fast-fail on the
+			// dead context, freeing semaphore slots for the check fan-out.
+			popCancel()
 			fmt.Printf("[WARN] regime store: phase budget %s exceeded; sealed with %d/%d bundles — missing signatures fail open this cycle\n",
 				regimeStorePhaseBudget, kept, len(reqs))
 		}
