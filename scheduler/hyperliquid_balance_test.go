@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1711,7 +1712,8 @@ func TestReconcileSharedCoin_Detector3_PartialUsesFillPrice(t *testing.T) {
 
 	logMgr, _ := NewLogManager(t.TempDir())
 	var mu sync.RWMutex
-	_, _, _ = reconcileHyperliquidAccountPositions(allStrategies, allStrategies, state, &mu, logMgr, positions, prices, "0xtest", nil, false)
+	dm := &countingDMSender{}
+	_, _, _ = reconcileHyperliquidAccountPositions(allStrategies, allStrategies, state, &mu, logMgr, positions, prices, "0xtest", dm, true)
 
 	owner := state.Strategies["hl-owner-eth"]
 	if len(owner.TradeHistory) != 1 {
@@ -1727,6 +1729,16 @@ func TestReconcileSharedCoin_Detector3_PartialUsesFillPrice(t *testing.T) {
 	}
 	if math.Abs(owner.Cash-(ownerStartCash+wantPnL)) > 1e-6 {
 		t.Errorf("owner Cash = %v, want %v", owner.Cash, ownerStartCash+wantPnL)
+	}
+	if dm.count != 1 {
+		t.Fatalf("protection fill DM = %d, want 1", dm.count)
+	}
+	wantPriceInDM := fmt.Sprintf("@ $%.4f", fillPx)
+	if !strings.Contains(dm.last, wantPriceInDM) {
+		t.Errorf("DM should report fill price %s, got:\n%s", wantPriceInDM, dm.last)
+	}
+	if strings.Contains(dm.last, fmt.Sprintf("@ $%.4f", mark)) {
+		t.Errorf("DM should not report mark %v, got:\n%s", mark, dm.last)
 	}
 }
 

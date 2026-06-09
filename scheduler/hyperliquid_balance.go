@@ -746,7 +746,7 @@ func syncHyperliquidAccountPositions(hlStrategies []StrategyConfig, state *AppSt
 // `notify_tp_sl_fills: false`.
 //
 // Must be called WITHOUT holding any lock; acquires Lock internally.
-func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []StrategyConfig, state *AppState, mu *sync.RWMutex, logMgr *LogManager, positions []HLPosition, prices map[string]float64, accountAddress string, notifier *MultiNotifier, notifyTPSLFills bool) (bool, []HyperliquidProtectionFillHint, []RegimeDirectionOrphanCloseJob) {
+func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []StrategyConfig, state *AppState, mu *sync.RWMutex, logMgr *LogManager, positions []HLPosition, prices map[string]float64, accountAddress string, notifier ownerDMSender, notifyTPSLFills bool) (bool, []HyperliquidProtectionFillHint, []RegimeDirectionOrphanCloseJob) {
 	// Resolve userFills BEFORE taking mu.Lock(): each lookup can sleep up
 	// to ~1.5s on indexer-lag retries, and holding the write lock blocks
 	// every reader of state (/status, /health, per-strategy phase RLocks).
@@ -1240,7 +1240,7 @@ func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []Strateg
 									Side:            closeSide,
 									FillType:        tpTierLabel(candidateTierIdx),
 									IsPartial:       true,
-									FillPrice:       mark,
+									FillPrice:       closePx,
 									CloseQty:        closeQty,
 									RemainingQty:    remaining,
 									RealizedPnL:     lastBookedTradePnL(candidateSS),
