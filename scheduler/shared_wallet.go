@@ -188,7 +188,8 @@ func fetchSharedWalletBalances(
 // contained within the subset. If a shared wallet straddles the subset
 // boundary (some members are outside the subset), that wallet's strategies
 // are virtual-summed rather than deduped — a single on-exchange balance
-// cannot be split across a partial subset (#915).
+// cannot be split across a partial subset (#915). Same-account live HL manual
+// strategies are folded into the dedup set via riskPathWalletMemberIDs (#921).
 //
 // accountShared is the shared-wallet map for the full account (all strategies),
 // used to detect straddle boundaries. Pass the result of
@@ -220,7 +221,7 @@ func computeSubsetPortfolioValue(
 	for key, subIDs := range subShared {
 		if len(subIDs) == len(accountShared[key]) {
 			fullyContainedKeys = append(fullyContainedKeys, key)
-			for _, id := range subIDs {
+			for _, id := range riskPathWalletMemberIDs(key, subIDs, subset) {
 				dedupeIDs[id] = true
 			}
 		}
@@ -250,7 +251,7 @@ func computeSubsetPortfolioValue(
 		}
 		usedFallback = true
 		sumPV := 0.0
-		for _, id := range subShared[key] {
+		for _, id := range riskPathWalletMemberIDs(key, subShared[key], subset) {
 			if s, ok := state.Strategies[id]; ok {
 				sumPV += PortfolioValue(s, prices)
 			}
@@ -303,7 +304,8 @@ func computeTotalPortfolioValue(
 // computeInitialPortfolioPeak returns the initial PortfolioRisk.PeakValue used
 // when no peak has been recorded yet. It uses real wallet balances for shared
 // wallets (#243) so the peak is not inflated by summing the same account
-// multiple times across strategies. Strategies that use capital_pct on a
+// multiple times across strategies. Same-account live HL manual strategies are
+// excluded from the standalone capital sum via riskPathWalletMemberIDs (#921). Strategies that use capital_pct on a
 // non-shared platform fall back to the legacy "wallet balance once per
 // platform" computation (Capital / CapitalPct) so existing single-strategy
 // setups are unaffected.
@@ -322,8 +324,8 @@ func computeInitialPortfolioPeak(strategies []StrategyConfig, fetcher WalletBala
 	}
 	sharedWallets := detectSharedWallets(strategies)
 	sharedStrategyIDs := make(map[string]bool)
-	for _, ids := range sharedWallets {
-		for _, id := range ids {
+	for key, ids := range sharedWallets {
+		for _, id := range riskPathWalletMemberIDs(key, ids, strategies) {
 			sharedStrategyIDs[id] = true
 		}
 	}
@@ -357,7 +359,7 @@ func computeInitialPortfolioPeak(strategies []StrategyConfig, fetcher WalletBala
 		if err != nil {
 			fmt.Printf("[WARN] shared-wallet peak init: balance fetch failed for %s/%s: %v — falling back to summed capital\n",
 				key.Platform, key.Account, err)
-			for _, id := range ids {
+			for _, id := range riskPathWalletMemberIDs(key, ids, strategies) {
 				if sc, ok := byID[id]; ok {
 					total += sc.Capital
 				}
@@ -385,15 +387,24 @@ func computeInitialPortfolioPeak(strategies []StrategyConfig, fetcher WalletBala
 // rebaseline never drops below the sum-of-capitals baseline that a fresh
 // install would use — protects against under-baseline when most surviving
 // strategies are themselves cold-started.
-func rebaselinePortfolioPeakAfterPrune(state *AppState, cfg *Config) float64 {
+//
+// Same-account live HL manual strategies on a deduped shared wallet are
+// excluded from the per-strategy sum — CheckRisk never records their peak and
+// their collateral is inside the real balance (#921).
+func rebaselinePortfolioPeakAfterPrune(state *AppState, cfg *Config, fetcher WalletBalanceFetcher) float64 {
 	byID := make(map[string]StrategyConfig, len(cfg.Strategies))
 	for _, sc := range cfg.Strategies {
 		byID[sc.ID] = sc
 	}
 
+	dedupedManual := dedupedSameAccountLiveManualIDs(cfg.Strategies)
+
 	sum := 0.0
 	for id, ss := range state.Strategies {
 		if ss == nil {
+			continue
+		}
+		if dedupedManual[id] {
 			continue
 		}
 		if ss.RiskState.PeakValue > 0 {
@@ -405,7 +416,7 @@ func rebaselinePortfolioPeakAfterPrune(state *AppState, cfg *Config) float64 {
 		}
 	}
 
-	floor := computeInitialPortfolioPeak(cfg.Strategies, nil)
+	floor := computeInitialPortfolioPeak(cfg.Strategies, fetcher)
 	if sum < floor {
 		sum = floor
 	}

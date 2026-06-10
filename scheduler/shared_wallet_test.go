@@ -673,7 +673,7 @@ func TestRebaselinePortfolioPeakAfterPrune_SumsRemainingPerStrategyPeaks(t *test
 		"spot-btc": {ID: "spot-btc", RiskState: RiskState{PeakValue: 7000}},
 	}}
 
-	got := rebaselinePortfolioPeakAfterPrune(state, cfg)
+	got := rebaselinePortfolioPeakAfterPrune(state, cfg, nil)
 	want := 7000.0
 	if got != want {
 		t.Errorf("expected rebaselined peak=%v; got %v", want, got)
@@ -696,7 +696,7 @@ func TestRebaselinePortfolioPeakAfterPrune_FloorAtCapitalSum(t *testing.T) {
 		"spot-eth": {ID: "spot-eth"},
 	}}
 
-	got := rebaselinePortfolioPeakAfterPrune(state, cfg)
+	got := rebaselinePortfolioPeakAfterPrune(state, cfg, nil)
 	want := 8000.0 // floor: 5000 + 3000
 	if got != want {
 		t.Errorf("expected floored peak=%v; got %v", want, got)
@@ -718,7 +718,7 @@ func TestRebaselinePortfolioPeakAfterPrune_FallbackToCapitalWhenPeakMissing(t *t
 		"spot-eth": {ID: "spot-eth"}, // no peak yet → use capital
 	}}
 
-	got := rebaselinePortfolioPeakAfterPrune(state, cfg)
+	got := rebaselinePortfolioPeakAfterPrune(state, cfg, nil)
 	want := 9000.0 // 6000 (peak) + 3000 (capital fallback)
 	if got != want {
 		t.Errorf("expected mixed peak=%v; got %v", want, got)
@@ -744,7 +744,7 @@ func TestRebaselinePortfolioPeakAfterPrune_PreventsImmediateKillSwitch(t *testin
 		PortfolioRisk: PortfolioRiskState{PeakValue: 15148.90}, // pre-prune peak
 	}
 
-	state.PortfolioRisk.PeakValue = rebaselinePortfolioPeakAfterPrune(state, cfg)
+	state.PortfolioRisk.PeakValue = rebaselinePortfolioPeakAfterPrune(state, cfg, nil)
 
 	prsCfg := &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80}
 	allowed, _, _, reason := CheckPortfolioRisk(&state.PortfolioRisk, prsCfg, 9034.24, 0, 0, 0)
@@ -753,6 +753,82 @@ func TestRebaselinePortfolioPeakAfterPrune_PreventsImmediateKillSwitch(t *testin
 	}
 	if state.PortfolioRisk.KillSwitchActive {
 		t.Errorf("expected kill switch inactive after rebaseline; got active")
+	}
+}
+
+// Post-prune rebaseline must match the deduped per-cycle total when a live
+// manual shares a deduped HL wallet (#921 review).
+func TestRebaselinePortfolioPeakAfterPrune_MatchesRiskPathTotalWithManual(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	cfg := &Config{Strategies: []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc", Cash: 350, Positions: map[string]*Position{}},
+		"hl-eth":    {ID: "hl-eth", Cash: 500, Positions: map[string]*Position{}},
+		"hl-manual": {ID: "hl-manual", Cash: 200, Positions: map[string]*Position{}},
+	}}
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xtest"}
+	walletBalances := map[SharedWalletKey]float64{key: 1000}
+	fetcher := stubFetcher(walletBalances, nil)
+	accountShared := detectSharedWallets(cfg.Strategies[:2])
+
+	rebaseline := rebaselinePortfolioPeakAfterPrune(state, cfg, fetcher)
+	totalPV, fb := computeTotalPortfolioValue(cfg.Strategies, state, nil, walletBalances, accountShared)
+	if rebaseline != totalPV {
+		t.Fatalf("post-prune rebaseline: peak=%.2f totalPV=%.2f, want equal", rebaseline, totalPV)
+	}
+	if fb {
+		t.Fatal("post-prune rebaseline: expected usedFallback=false")
+	}
+
+	state.PortfolioRisk.PeakValue = rebaseline
+	prsCfg := &PortfolioRiskConfig{MaxDrawdownPct: 20, WarnThresholdPct: 16}
+	allowed, _, warning, reason := CheckPortfolioRisk(&state.PortfolioRisk, prsCfg, totalPV, 0, 0, 0)
+	if !allowed || warning || state.PortfolioRisk.CurrentDrawdownPct != 0 {
+		t.Errorf("flat post-prune: allowed=%v warning=%v dd=%.2f reason=%q", allowed, warning, state.PortfolioRisk.CurrentDrawdownPct, reason)
+	}
+}
+
+// Without a shared wallet (single perps), live manual capital must still count.
+func TestRebaselinePortfolioPeakAfterPrune_SinglePerpsPlusManualSumsManual(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	cfg := &Config{Strategies: []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc"},
+		"hl-manual": {ID: "hl-manual"},
+	}}
+
+	got := rebaselinePortfolioPeakAfterPrune(state, cfg, nil)
+	if got != 700 {
+		t.Errorf("single perps + manual: want 700 (500+200 capital), got %.2f", got)
+	}
+}
+
+// Zero-capital live manual on a deduped wallet is a no-op for the sum.
+func TestRebaselinePortfolioPeakAfterPrune_DedupedManualZeroCapitalUnchanged(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	cfg := &Config{Strategies: []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 0},
+	}}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc"},
+		"hl-eth":    {ID: "hl-eth"},
+		"hl-manual": {ID: "hl-manual"},
+	}}
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xtest"}
+	fetcher := stubFetcher(map[SharedWalletKey]float64{key: 1000}, nil)
+
+	got := rebaselinePortfolioPeakAfterPrune(state, cfg, fetcher)
+	if got != 1000 {
+		t.Errorf("zero-capital manual: want 1000, got %.2f", got)
 	}
 }
 
@@ -910,5 +986,154 @@ func TestComputeTotalPortfolioValue_DelegatesCorrectly(t *testing.T) {
 	}
 	if fb {
 		t.Errorf("delegation: expected usedFallback=false")
+	}
+}
+
+// TestComputeInitialPortfolioPeak_SharedWalletManualNoDoubleCount verifies
+// peak init uses the real wallet balance once when a same-account live manual
+// shares the HL wallet with 2+ perps (#921).
+func TestComputeInitialPortfolioPeak_SharedWalletManualNoDoubleCount(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	strategies := []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xtest"}
+	fetcher := stubFetcher(map[SharedWalletKey]float64{key: 1000}, nil)
+
+	got := computeInitialPortfolioPeak(strategies, fetcher)
+	if got != 1000 {
+		t.Errorf("peak init incl. manual: want 1000 (real balance, no double count), got %.2f", got)
+	}
+}
+
+// Peak init fallback sums perps + manual capital exactly once each.
+func TestComputeInitialPortfolioPeak_SharedWalletManualFallback(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	strategies := []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xtest"}
+	fetcher := stubFetcher(nil, map[SharedWalletKey]error{key: errors.New("network down")})
+
+	got := computeInitialPortfolioPeak(strategies, fetcher)
+	if got != 1200 {
+		t.Errorf("peak init manual fallback: want 1200 (sum member capital once), got %.2f", got)
+	}
+}
+
+// Cold-start peak must match the first-cycle risk-path total so a flat account
+// shows 0% equity drawdown on cycle 1 (#921 review).
+func TestComputeInitialPortfolioPeak_MatchesRiskPathTotalOnColdStart(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	strategies := []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc", Cash: 350, Positions: map[string]*Position{}},
+		"hl-eth":    {ID: "hl-eth", Cash: 500, Positions: map[string]*Position{}},
+		"hl-manual": {ID: "hl-manual", Cash: 200, Positions: map[string]*Position{}},
+	}}
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xtest"}
+	walletBalances := map[SharedWalletKey]float64{key: 1000}
+	fetcher := stubFetcher(walletBalances, nil)
+	accountShared := detectSharedWallets(strategies[:2])
+
+	peak := computeInitialPortfolioPeak(strategies, fetcher)
+	totalPV, fb := computeTotalPortfolioValue(strategies, state, nil, walletBalances, accountShared)
+	if peak != totalPV {
+		t.Fatalf("cold start: peak=%.2f totalPV=%.2f, want equal", peak, totalPV)
+	}
+	if fb {
+		t.Fatal("cold start: expected usedFallback=false")
+	}
+
+	prs := &PortfolioRiskState{PeakValue: peak}
+	cfg := &PortfolioRiskConfig{MaxDrawdownPct: 20, WarnThresholdPct: 16}
+	allowed, _, warning, reason := CheckPortfolioRisk(prs, cfg, totalPV, 0, 0, 0)
+	if !allowed || warning || prs.CurrentDrawdownPct != 0 {
+		t.Errorf("flat cold start: allowed=%v warning=%v dd=%.2f reason=%q", allowed, warning, prs.CurrentDrawdownPct, reason)
+	}
+}
+
+// A same-account live manual strategy is outside detectSharedWallets membership
+// but inside the wallet real balance. Risk-path total must not add its modeled
+// PV on top of the balance (#921).
+func TestComputeTotalPortfolioValue_SharedWalletManualNoDoubleCount(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	strategies := []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc", Cash: 350, Positions: map[string]*Position{}},
+		"hl-eth":    {ID: "hl-eth", Cash: 500, Positions: map[string]*Position{}},
+		"hl-manual": {ID: "hl-manual", Cash: 200, Positions: map[string]*Position{}},
+	}}
+	walletBalances := map[SharedWalletKey]float64{{Platform: "hyperliquid", Account: "0xtest"}: 1000}
+	accountShared := detectSharedWallets(strategies[:2])
+
+	got, fb := computeTotalPortfolioValue(strategies, state, nil, walletBalances, accountShared)
+	if got != 1000 {
+		t.Errorf("risk path incl. manual: want exactly 1000 (real balance, no double count), got %.2f", got)
+	}
+	if fb {
+		t.Errorf("risk path incl. manual: expected usedFallback=false")
+	}
+}
+
+// Missing balance: fallback sums perps + manual member PVs once each (no double count).
+func TestComputeTotalPortfolioValue_SharedWalletManualFallback(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	strategies := []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=live"}, Capital: 200},
+	}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc", Cash: 400, Positions: map[string]*Position{}},
+		"hl-eth":    {ID: "hl-eth", Cash: 400, Positions: map[string]*Position{}},
+		"hl-manual": {ID: "hl-manual", Cash: 200, Positions: map[string]*Position{}},
+	}}
+	accountShared := detectSharedWallets(strategies[:2])
+
+	got, fb := computeTotalPortfolioValue(strategies, state, nil, nil, accountShared)
+	if got != 1000 {
+		t.Errorf("risk path manual fallback: want 1000 (sum member PVs once), got %.2f", got)
+	}
+	if !fb {
+		t.Errorf("risk path manual fallback: expected usedFallback=true")
+	}
+}
+
+// Paper / record-only same-account manuals carry a separate virtual book and
+// must stay in the per-strategy sum — only live manuals are deduped (#921).
+func TestComputeTotalPortfolioValue_PaperManualNotDeduped(t *testing.T) {
+	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xtest")
+	strategies := []StrategyConfig{
+		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"rsi", "ETH", "1h", "--mode=live"}, Capital: 500},
+		{ID: "hl-manual", Platform: "hyperliquid", Type: "manual", Symbol: "SOL", Args: []string{"hold", "SOL", "1h", "--mode=paper"}, Capital: 200},
+	}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-btc":    {ID: "hl-btc", Cash: 350, Positions: map[string]*Position{}},
+		"hl-eth":    {ID: "hl-eth", Cash: 500, Positions: map[string]*Position{}},
+		"hl-manual": {ID: "hl-manual", Cash: 200, Positions: map[string]*Position{}},
+	}}
+	walletBalances := map[SharedWalletKey]float64{{Platform: "hyperliquid", Account: "0xtest"}: 1000}
+	accountShared := detectSharedWallets(strategies[:2])
+
+	got, fb := computeTotalPortfolioValue(strategies, state, nil, walletBalances, accountShared)
+	if got != 1200 {
+		t.Errorf("paper manual: want 1200 (balance + manual PV), got %.2f", got)
+	}
+	if fb {
+		t.Errorf("paper manual: expected usedFallback=false")
 	}
 }
