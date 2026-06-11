@@ -47,6 +47,7 @@ from funding_skew import funding_skew_core
 from momentum_pro import momentum_pro_core
 from mean_reversion_pro import mean_reversion_pro_core
 from mtf_confluence import mtf_confluence_core
+from regime_adaptive import regime_adaptive_core
 from session_breakout import session_breakout_core
 from vwap_rejection_st import vwap_rejection_st_core
 from vol_momentum import vol_momentum_core
@@ -1122,6 +1123,31 @@ def vol_momentum_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
 
 
 @register(
+    "regime_adaptive",
+    "Regime Adaptive — per-bar composite regime metrics (return/range/Kaufman efficiency + ADX) switch between breakout entries in clean trends and mean-reversion fades in ranges; flat in chop",
+    {
+        "period": 20,
+        "adx_threshold": 20.0,
+        "return_eff_threshold": 0.05,
+        "range_eff_threshold": 0.03,
+        "efficiency_threshold": 0.5,
+        "breakout_lookback": 10,
+        "mr_lookback": 20,
+        "mr_entry_z": 2.0,
+        "mr_exit_z": 0.0,
+        "slow_trend_lookback": 100,
+        "slow_veto_threshold": 0.05,
+        "allow_short": False,
+    },
+    variants={
+        "futures": {"default_params": {"allow_short": True}},
+    },
+)
+def regime_adaptive_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return regime_adaptive_core(df, **params)
+
+
+@register(
     "hold",
     "Hold — always returns signal=0; used internally by type=manual strategies for the close-evaluator loop (#569)",
     {},
@@ -1149,7 +1175,7 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "donchian_breakout", "tema_cross",
         "momentum_pro", "mean_reversion_pro", "mtf_confluence",
-        "vol_momentum",
+        "vol_momentum", "regime_adaptive",
         "hold",
     ],
     "futures": [
@@ -1162,6 +1188,7 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "sweep_squeeze_combo", "adx_trend", "delta_neutral_funding",
         "funding_skew", "donchian_breakout", "session_breakout", "bear_pullback_st",
         "vwap_rejection_st", "momentum_pro", "mean_reversion_pro",
-        "consolidation_range", "mtf_confluence", "vol_momentum", "hold",
+        "consolidation_range", "mtf_confluence", "vol_momentum",
+        "regime_adaptive", "hold",
     ],
 }
