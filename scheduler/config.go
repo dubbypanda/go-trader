@@ -1100,31 +1100,6 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 func normalizeHyperliquidPeerStopLosses(strategies []StrategyConfig) {
 }
 
-// hasHyperliquidStopLossOwnership reports whether sc would place a reduce-only
-// HL trigger at any point in its lifecycle. It is the peer-conflict predicate
-// rather than the runtime price-% predicate: TrailingStopATRMult arms an
-// initial trigger only on the cycle after the position opens (EntryATR must be
-// stamped first), so EffectiveStopLossPct returns 0 at order-placement time.
-// Peer validation must still treat that strategy as the trigger owner.
-func hasHyperliquidStopLossOwnership(sc StrategyConfig) bool {
-	if EffectiveStopLossPct(sc) > 0 {
-		return true
-	}
-	if sc.TrailingStopATRMult != nil && *sc.TrailingStopATRMult > 0 {
-		return true
-	}
-	if sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 {
-		return true
-	}
-	if sc.StopLossATRRegime != nil && !sc.StopLossATRRegime.IsZero() {
-		return true
-	}
-	if sc.TrailingStopATRRegime != nil && !sc.TrailingStopATRRegime.IsZero() {
-		return true
-	}
-	return false
-}
-
 // hyperliquidPeerStrategyErrors returns validation messages for HL wallet
 // strategies that share a coin but disagree on MarginMode or exchange Leverage (#491/#619).
 // Returns an empty slice when no peer conflicts exist.
@@ -1854,7 +1829,11 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			}
 			// #870: the regime ratchet owns its trail via trailing_stop_atr_regime
 			// rather than the scalar trailing_stop_atr_mult, so accept that too.
-			regimeTrail := sc.TrailingStopATRRegime != nil && !sc.TrailingStopATRRegime.IsZero()
+			// #1111: use IsConfigured (raw-aware), NOT !IsZero() — this check runs
+			// before validateRegimeATRConfig resolves the raw block, and IsZero()
+			// reports true on an unresolved-but-configured block (see its doc), so
+			// !IsZero() would wrongly reject a strategy that did set the regime trail.
+			regimeTrail := sc.TrailingStopATRRegime.IsConfigured()
 			if fixedTrailingPct <= 0 && atrMult <= 0 && !regimeTrail {
 				errs = append(errs, fmt.Sprintf("%s: trailing_stop_min_move_pct requires trailing_stop_pct > 0, trailing_stop_atr_mult > 0, or trailing_stop_atr_regime", prefix))
 			}
