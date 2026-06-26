@@ -265,6 +265,9 @@ When in doubt, treat as runtime default and prompt. **Full narrative** for older
 - **#1121** manual default SL + ratchet fallback **2.0×ATR**; `RatchetFallbackNormalizePending` one-shot widen
 - **#1110/#1118** ratchet tier-clear owner DM; per-strategy `notify_ratchet_triggers` shadows global
 
+**Internal / no ops impact** (recent — detail in history doc)
+- **#1128** HL adapter lazy `Exchange` init (fewer `/info` bursts on regime/OHLCV-only subprocesses); transient 429/rate-limit script failures WARN-only until 15 strikes or 75m sustained — then operator DM
+
 **Opt-in field** (dormant until set — shape/detail in history doc)
 - HL stops: `trailing_stop_atr_mult`, `trailing_stop_atr_regime`, `stop_loss_margin_pct`, `margin_per_trade_usd`
 - Closes: `tiered_tp_atr_live`, `trailing_tp_ratchet*`, `*_atr_regime`, `sl_after`, N-tier `params.tiers`
