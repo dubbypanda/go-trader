@@ -153,6 +153,113 @@ def test_non_replayable_m6_close_excluded():
     assert entries["m6.good"]["precondition_errors"] == []
 
 
+def test_m6_requires_exactly_one_incumbent_source():
+    base = dict(candidates=[])
+    both = _base_spec(**base, m6={"strategy_id": "s", "baseline_config": "cfg.json",
+                                  "incumbent_close": [{"name": "tiered_tp_atr"}],
+                                  "candidate_close_variants": []})
+    with pytest.raises(ValueError, match="EXACTLY one"):
+        asug.load_spec(both, _STUDY_DIR)
+    neither = _base_spec(**base, m6={"strategy_id": "s",
+                                     "candidate_close_variants": []})
+    with pytest.raises(ValueError, match="EXACTLY one"):
+        asug.load_spec(neither, _STUDY_DIR)
+
+
+def test_m6_incumbent_close_only_spec_loads():
+    spec = asug.load_spec(_base_spec(candidates=[], m6={
+        "strategy_id": "squeeze_momentum",
+        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
+        "candidate_close_variants": [
+            {"key": "v", "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}]},
+    ), _STUDY_DIR)
+    entries = asug.expand_candidates(spec)
+    ab = [e for e in entries if e["kind"] == "exit_ab"]
+    assert len(ab) == 1 and ab[0]["precondition_errors"] == []
+    assert ab[0]["candidate"]["baseline_config"] is None
+
+
+def test_m6_missing_strategy_id_everywhere_fails_at_load():
+    # (a) incumbent_close set, no strategy_id at m6 OR variant level -> must
+    # raise at load, not surface as a broken '--strategy None' subprocess.
+    bad = _base_spec(candidates=[], m6={
+        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
+        "candidate_close_variants": [
+            {"key": "v", "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}]})
+    with pytest.raises(ValueError, match="strategy_id"):
+        asug.load_spec(bad, _STUDY_DIR)
+
+
+def test_m6_per_variant_strategy_id_override_loads_without_m6_default():
+    # (b) m6 block omits strategy_id but each variant supplies its own -> legit.
+    spec = asug.load_spec(_base_spec(candidates=[], m6={
+        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
+        "candidate_close_variants": [
+            {"key": "v", "strategy_id": "squeeze_momentum",
+             "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}]},
+    ), _STUDY_DIR)
+    ab = [e for e in asug.expand_candidates(spec) if e["kind"] == "exit_ab"]
+    assert len(ab) == 1 and ab[0]["candidate"]["strategy_id"] == "squeeze_momentum"
+
+
+def test_m6_close_stack_specs_require_m6_level_strategy_id():
+    # close_stack variants are generated and cannot carry a per-variant
+    # strategy_id, so an m6-level default is mandatory when they are present.
+    bad = _base_spec(candidates=[], m6={
+        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
+        "candidate_close_variants": [],
+        "close_stack_specs": [{"close": {"name": "atr_stop", "params": {"atr_mult": [2.0]}}}]})
+    with pytest.raises(ValueError, match="close_stack_specs"):
+        asug.load_spec(bad, _STUDY_DIR)
+
+
+def test_m6_baseline_config_path_also_requires_strategy_id():
+    # (c) the baseline_config path embeds --strategy too; same missing-value guard.
+    bad = _base_spec(candidates=[], m6={
+        "baseline_config": "cfg.json",
+        "candidate_close_variants": [
+            {"key": "v", "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}]})
+    with pytest.raises(ValueError, match="strategy_id"):
+        asug.load_spec(bad, _STUDY_DIR)
+
+
+_TEMPLATE = os.path.join(os.path.dirname(_STUDY_DIR), "suggest.template.jsonc")
+
+
+def _load_template_json():
+    import re
+    return json.loads(re.sub(r"//.*", "", open(_TEMPLATE).read()))
+
+
+def test_template_documents_every_variant_and_candidate_option():
+    # The template header asserts it "documents EVERY option the loader accepts";
+    # three prior review rounds each found one omitted key. Lock in the fixes so
+    # a future edit can't silently regress the completeness claim.
+    raw = _load_template_json()
+    # per-candidate harness override (auto_suggest.py: c.get("harnesses"))
+    assert any("harnesses" in c for c in raw["candidates"]), "template omits per-candidate harnesses"
+    m6 = raw["m6"]
+    # m6-level allowed_regimes default (seeds close_stack variants)
+    assert "allowed_regimes" in m6, "template omits m6-level allowed_regimes"
+    # per-variant strategy_id override (variant.get("strategy_id"))
+    assert any("strategy_id" in v for v in m6["candidate_close_variants"]), \
+        "template omits per-variant strategy_id override"
+
+
+def test_shipped_full_options_spec_loads_and_expands():
+    # The committed all-options default must load and expand cleanly (guards the
+    # demo from silently rotting — every generator + M6 exercised).
+    with open(os.path.join(_STUDY_DIR, "suggest.json")) as fh:
+        raw = json.load(fh)
+    spec = asug.load_spec(raw, _STUDY_DIR)
+    entries = asug.expand_candidates(spec)
+    kinds = {e["kind"] for e in entries}
+    assert kinds == {"open", "exit_ab"}          # both harness families present
+    ab = [e for e in entries if e["kind"] == "exit_ab"]
+    assert all(e["precondition_errors"] == [] for e in ab)   # all M6 closes replayable
+    assert len({e["key"] for e in entries}) == len(entries)  # keys unique
+
+
 def test_m5_params_limitation_flagged():
     spec = asug.load_spec(_base_spec(
         harnesses=["m5"],
@@ -197,6 +304,25 @@ def test_m6_argv_tail_repeats_allowed_regimes():
     assert tail.count("--allowed-regimes") == 2
     assert "--bootstrap-resamples" in tail and "10000" in tail
     assert "--candidate-stops" in tail and "inherit" in tail
+
+
+def test_m6_argv_tail_baseline_config_path():
+    m6c = {"baseline_config": "/cfg.json", "strategy_id": "s",
+           "candidate_close": [{"name": "atr_stop"}]}
+    tail = asug.m6_argv_tail(m6c, "spot", ["oos"], None, 100, 1066, "/t/m6.json")
+    assert "--baseline-config" in tail and "/cfg.json" in tail
+    assert "--incumbent-close" not in tail  # exactly one incumbent source
+
+
+def test_m6_argv_tail_incumbent_close_path_omits_baseline():
+    # The self-contained path: no baseline_config, an explicit incumbent ladder.
+    m6c = {"strategy_id": "squeeze_momentum",
+           "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
+           "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}
+    tail = asug.m6_argv_tail(m6c, "spot", ["oos"], None, 100, 1066, "/t/m6.json")
+    assert "--baseline-config" not in tail
+    assert "--incumbent-close" in tail
+    assert "--strategy" in tail and "squeeze_momentum" in tail
 
 
 def test_m5_argv_tail():

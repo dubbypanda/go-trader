@@ -164,6 +164,41 @@ def load_spec(raw: dict, spec_dir: str) -> dict:
         if bc and isinstance(bc, str):
             m6["baseline_config"] = (bc if os.path.isabs(bc)
                                      else os.path.join(spec_dir, bc))
+        # M6 resolves the incumbent from EXACTLY one of a live-daemon
+        # baseline-config (resolve the strategy's live close) or an explicit
+        # incumbent_close ladder — mirroring exit_policy_ab, which rejects both
+        # and neither. The explicit path lets a spec exercise M6 self-contained,
+        # without authoring a v15 config fixture.
+        if bool(m6.get("baseline_config")) == bool(m6.get("incumbent_close")):
+            raise ValueError(
+                "m6 block needs EXACTLY one of 'baseline_config' (resolve the "
+                "live close from a daemon config) or 'incumbent_close' (an "
+                "explicit close-ref ladder); got "
+                + ("both" if m6.get("baseline_config") else "neither"))
+        # strategy_id is embedded unconditionally into every M6 argv
+        # (m6_argv_tail's leading --strategy) on BOTH incumbent paths — the
+        # baseline_config path uses it to select the strategy inside the
+        # config, the incumbent_close path uses it as the open-strategy name.
+        # Resolution is per-variant with an m6-level default
+        # (_exit_ab_entry: variant.get("strategy_id") or m6.get("strategy_id")),
+        # so fail loudly HERE at load time if any variant would resolve to
+        # None rather than surfacing as a broken '--strategy None' subprocess.
+        if not m6.get("strategy_id"):
+            if m6.get("close_stack_specs"):
+                raise ValueError(
+                    "m6 'close_stack_specs' are generated variants that cannot "
+                    "carry a per-variant 'strategy_id'; set an m6-level "
+                    "'strategy_id' (the open-strategy name, or the config's "
+                    "strategy id when using 'baseline_config').")
+            for v in m6.get("candidate_close_variants") or []:
+                if not v.get("strategy_id"):
+                    raise ValueError(
+                        "m6 candidate_close_variant "
+                        + repr(v.get("key") or "<unkeyed>")
+                        + " has no 'strategy_id' and the m6 block sets no "
+                        "default; add an m6-level 'strategy_id' or a per-variant "
+                        "override (the open-strategy name, or the config's "
+                        "strategy id when using 'baseline_config').")
 
     return {
         "study": str(raw.get("study") or "unnamed_study"),
@@ -363,15 +398,18 @@ def m5_argv_tail(strategy, registry, direction, windows, datasets, out_json) -> 
 
 
 def m6_argv_tail(m6_candidate, registry, windows, datasets, resamples, seed, out_json) -> list:
-    tail = ["--baseline-config", m6_candidate["baseline_config"],
-            "--strategy", m6_candidate["strategy_id"],
+    tail = ["--strategy", m6_candidate["strategy_id"],
             "--registry", registry,
             "--candidate-close", json.dumps(m6_candidate["candidate_close"]),
             "--candidate-stops", m6_candidate.get("candidate_stops", "inherit"),
             "--windows", _csv(windows),
             "--bootstrap-resamples", str(resamples),
             "--seed", str(seed), "--json", out_json]
-    if m6_candidate.get("incumbent_close"):
+    # Exactly one incumbent source (load_spec enforces this): a live-daemon
+    # config to resolve the strategy's live close, or an explicit ladder.
+    if m6_candidate.get("baseline_config"):
+        tail += ["--baseline-config", m6_candidate["baseline_config"]]
+    elif m6_candidate.get("incumbent_close"):
         tail += ["--incumbent-close", json.dumps(m6_candidate["incumbent_close"])]
     for label in m6_candidate.get("allowed_regimes") or []:
         tail += ["--allowed-regimes", label]
