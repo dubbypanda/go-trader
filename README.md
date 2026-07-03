@@ -297,6 +297,20 @@ Sizing: mutually exclusive `--size` / `--notional` / `--margin` (default `--marg
 
 ---
 
+## Trade Diagnostics
+
+```bash
+./go-trader diagnostics                              # all strategies
+./go-trader diagnostics --strategy hl-btc-momentum
+```
+
+Per-trade quality report over closed positions: MFE/MAE/capture ratio, win rate
+and NET PnL split by regime-at-open and direction, with sample-size-gated
+findings and the exact backtest command to validate each one. Read-only against
+the state DB; never blocks or alters a close.
+
+---
+
 ## Build & Deploy
 
 Canonical path: `scripts/update.sh` — `git pull --ff-only` → `uv sync` → version-stamped `go build` → atomic binary swap → optional restart with `/health` verify and rollback on failure. Startup probe refuses Go/Python version mismatch — prefer the script over hand-rolled rebuilds.
@@ -354,6 +368,7 @@ Open `https://<node>.tailnet.ts.net:8443/dashboard`. `status_token` still applie
 - **Hyperliquid stop-loss** — one positive field among five scalar stop types; omitted → `default_stop_loss_atr_mult × entry_atr` (1.0); `0` opts out.
 - **On-chain N-tier TP/SL** — `tiered_tp_atr` / `tiered_tp_atr_live` (default tiers `[{1.5×, 0.4}, {3×, 0.8}, {5×, 1.0}]`).
 - **Trailing-ratchet close** — `trailing_tp_ratchet` / `trailing_tp_ratchet_regime`: cleared tiers tighten a single trailing stop; no fixed on-chain TPs. HL perps + `manual`.
+- **AVWAP stop close** — `avwap_stop`: exits when price breaches the anchored VWAP by `buffer_atr_mult`× ATR on the losing side; virtual exit only (no on-chain trigger).
 - **Regime gate**, **HL margin mode** (`isolated` default), correlation warnings (opt-in), options position limits, theta harvesting.
 
 ---

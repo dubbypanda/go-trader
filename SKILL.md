@@ -271,13 +271,17 @@ When in doubt, treat as runtime default and prompt. **Full narrative** for older
 - **#1157** owner DM added on DEFAULT-OFF/EXPIRED `regime_directional_policy` cert lines (startup + SIGHUP, deduped by snapshot — only new lines DM'd on a state change). `/status` `effective_direction`/`effective_invert_signal` now gated through the #1085 cert check (previously showed the ungated policy resolution while flat); new `directional_certification_status` (`certified`/`expired`/`uncertified`) and `directional_certification_cell` fields; Discord `/status` gets a `directional_policy:` suffix. No config change
 - **#1137** new per-strategy `llm_entry_analysis` block (`{enabled, model, max_debate_rounds, timeout_s, notify_dm, notify_channel}`, default off) — after a fresh position-open, an async LLM analyst/debate pipeline (`shared_scripts/llm_review.py`, needs `ANTHROPIC_API_KEY`) posts a word-capped digest (DM by default, `notify_channel` opt-in for the shared channel) and stamps the verdict into `trade_diagnostics.llm_verdict` at close. Advisory only — never gates/sizes/closes; runs on its own subprocess lane (never the shared 4-slot semaphore); hot-reloadable always. No version bump
 - **#1150** new per-strategy `paused` flag (bool, default `false`) — holds position-increasing signals (fresh opens, adds, flips) while closes, trailing SL/ratchet, and protection sync keep running; hot-reloadable always, including while open. Surfaces in `[config]` startup summary, `inspect`, `/status` JSON, and Discord `/status ⏸️ paused:`
+- **#1147** new operator command `go-trader diagnostics [--strategy <id>]` — per-trade quality report (MFE/MAE/capture, regime/direction splits, sample-gated hypotheses with a ready-to-run backtest command). No config change; diagnostics-only, never blocks or alters a close.
+- **#1189** dashboard/`/status`/status-log regime label for a strategy overriding `regime_gate_window` now shows that window's live label instead of the shared-default window's. Display-only — no trading-decision change.
+- **#1190** kill-switch reset DM now includes the drawdown reason, trader-instance label, HL wallet address, and a protection-gap warning when the close plan hasn't confirmed flat. No config change.
+- **#1205** new operator command `/go-trader-apply-regime-gate` — interactively wires a named regime entry-gate preset onto a chosen flat strategy (restart-applied). See Discord Slash Commands.
 
 **Internal / no ops impact** (recent — detail in history doc)
 - **#1128** HL adapter lazy `Exchange` init (fewer `/info` bursts on regime/OHLCV-only subprocesses); transient 429/rate-limit script failures WARN-only until 15 strikes or 75m sustained — then operator DM
 
 **Opt-in field** (dormant until set — shape/detail in history doc)
 - HL stops: `trailing_stop_atr_mult`, `trailing_stop_atr_regime`, `stop_loss_margin_pct`, `margin_per_trade_usd`
-- Closes: `tiered_tp_atr_live`, `trailing_tp_ratchet*`, `*_atr_regime`, `sl_after`, N-tier `params.tiers`
+- Closes: `tiered_tp_atr_live`, `trailing_tp_ratchet*`, `*_atr_regime`, `sl_after`, N-tier `params.tiers`, `avwap_stop` (#1196 — exits on a `buffer_atr_mult`-ATR breach of the anchored VWAP; virtual exit only, no on-chain trigger)
 - Regime: `regime.enabled`, `allowed_regimes`, `regime.display_windows`, `regime_directional_policy`, `regime_window_divergence`, `regime_profile_allocation`
 - Manual: `type: manual` + `manual-open`/`manual-close` CLI; `user_defaults.manual` (legacy top-level `manual_defaults` migrates on load); shares coin with HL perps (#619)
 - Alerts: `discord.trade_alert_channels`, `notify_ratchet_triggers`, `circuit_breaker`
@@ -335,7 +339,9 @@ Discord developer portal OAuth2 URL generator.
 **Read-only** (usable in a guild OR a DM, by anyone):
 `/go-trader-status`, `/go-trader-health`, `/go-trader-positions`, `/go-trader-pnl`,
 `/go-trader-leaderboard [top]`, `/go-trader-circuit-breakers`, `/go-trader-dead-strategies`,
-`/go-trader-correlation`. These read live in-process state via the
+`/go-trader-correlation`, `/go-trader-closing-strategies` (#1203 — catalogs every registered
+close evaluator: name, description, platforms, config params; marks params overridden by
+`user_defaults.close`; caches the registry after first read-only subprocess call). These read live in-process state via the
 `StatusServer` (no HTTP round-trip). The four that fetch live marks (`/go-trader-status`,
 `/go-trader-positions`, `/go-trader-pnl`, `/go-trader-leaderboard`) use a deferred ACK + follow-up so they don't blow
 Discord's 3-second interaction deadline (`fetchLiveMarkPrices` spawns a Python subprocess +
@@ -367,6 +373,7 @@ in the handler by `authorizeCommand`):
 - `/go-trader-remove-strategy <id>` — removes a strategy from config after an out-of-band DM confirm. Requires `restartSelf()` (shape change).
 - `/go-trader-add-platform <name>` — emits a setup checklist for the requested platform (secrets live in `/opt/go-trader/.env`, never the config file).
 - `/go-trader-paper-to-live <strategy>` — flips a strategy from `--mode=paper` to `--mode=live` after an out-of-band DM confirm. Requires `restartSelf()`.
+- `/go-trader-apply-regime-gate` (#1205) — interactive: `AskDM` numbered-list picker of type-eligible (`futures`/`perps`) live/paper strategies, applies a named regime entry-gate preset (ships `comp_up_clean_p21` — composite `trending_up_clean`@period 21, #1197), then an `AskDM` confirm before writing. Refuses a non-flat target (checked before AND after the confirm). The confirm also lists any OTHER strategy whose dormant `allowed_regimes` gate gets reactivated by the accompanying `regime.enabled` flip — read that list before confirming. Applies via a full restart (adding a `regime.windows` entry is SIGHUP-rejected).
 
 All config writes serialize on `ss.configWriteMu`; mutating commands use `restartSelf()` for deployment-agnostic restart (#893 — tries `systemctl restart` with `GO_TRADER_SERVICE` name, falls back to `syscall.Exec` for signal-mode deploys). Pure helpers (`redactConfigForDisplay`, `buildAddStrategyEntry`, `flipStrategyToLive`, `applyTopLevelConfigSet`, `buildTunerOverride`, `classifyConfigSetKey`) are unit-tested in `discord_mutating_commands_test.go` without a gateway.
 
@@ -644,6 +651,28 @@ Notes:
 
 ---
 
+## Trade Diagnostics (#1147)
+
+Per-trade quality report over the closed-trade history:
+
+```bash
+./go-trader diagnostics                    # all strategies
+./go-trader diagnostics --strategy hl-btc-momentum
+```
+
+Every full close eagerly inserts a `trade_diagnostics` row (identity/outcome) at
+close time; a background worker fills in MFE/MAE/capture-ratio from hold-window
+OHLCV afterward (never blocks or alters the close — failure just leaves those
+columns NULL and `metrics_status` downgraded). The report opens the state DB
+read-only, aggregates NET PnL per strategy via the trades join (so tiered-TP and
+partial exits sum correctly across legs), splits by regime-at-open/direction, and
+prints sample-size-gated hypotheses with the exact `run_backtest.py` command to
+validate each one. Synthetic closes (`hl_sync_external`, `*_corrupt`,
+`*_dup_oid`) are excluded. `llm_verdict` (from #1137 below) shows per row when
+present but is written only by the LLM entry-analysis pipeline, never here.
+
+---
+
 ## Backtesting
 
 Use `uv run --no-sync python` for all backtests.
@@ -843,7 +872,7 @@ Short-name conventions:
 - `triple_ema_bidir` is futures/perps only and needs `"direction": "both"` (formerly `"allow_shorts": true`; v14 migrates automatically). Use `"direction": "short"` to run any bidirectional strategy as a dedicated bear-only instrument (#656).
 - Short-focused strategies (futures/perps only): `bear_pullback_st` (rally-into-EMA20/50 in EMA50<EMA200 + ADX>20 regime, RSI 55–65 rebound, #655), `vwap_rejection_st` (intraday VWAP/EMA20/EMA50 rejection inside bearish HTF + RSI≤50 confirmation, #657). Both emit `signal=-1` only and are pre-registered as bidirectional so `direction: "short"` or `"both"` is required. Pair with `allowed_regimes: ["trending_down"]` for clean entry gating.
 - **New bidirectional strategies (#895):** `momentum_pro` (`mompro`) — stacked-EMA trend-pullback entry (fast>mid>long EMA), ADX-confirmed, volume-backed bar break; requires `direction: "both"`. `mean_reversion_pro` (`mrpro`) — z-score reversion gated by no-trend ADX ceiling + RSI extreme confirmation; requires `direction: "both"`. Both spot + futures/perps. Walk-forward OOS result: `momentum_pro` BTC 4h is marginally validated (~+6% median Sharpe ~1, high variance); `mean_reversion_pro` is not OOS validated — paper-trade before live. `momentum_pro` (#980) and `mean_reversion_pro` (#981) both gained default-off research kwargs (`vol_target_atr_pct`/`vol_target_atr_period`/`vol_target_min_fraction` on momentum_pro; `touch_entry`/`turn_entry` on mean_reversion_pro) — M1-validated negative for a default change, live behavior unchanged unless explicitly set. `momentum_pro`'s standalone short leg is also negative (#1166: regime-gating the short via `regime_directional_policy` doesn't clear the M1 bar either).
-- **Anchored VWAP family:** `anchored_vwap` (`avwap`, #1016) — single anchored-VWAP S/R flip; bidirectional (emits short on buffered breakdown below the line). Research-negative at default params (#1039) — treat as experimental; validate before live. `anchored_vwap_channel` (`avwapch`, #1169) — dual-anchor channel (swing-low support / swing-high resistance line), range-edge mean reversion: long a bounce off support, short a rejection off resistance. `anchored_vwap_reversion` (`avwaprev`, #1170) — fades ATR-measured stretches beyond the anchored VWAP back toward the line (long below, short above), distinct per-bar from `anchored_vwap`'s breach trade. All three spot + futures/perps, pre-gated to composite `{ranging_quiet, ranging_volatile}` by default (channel/reversion) or unbounded (plain `anchored_vwap`).
+- **Anchored VWAP family:** `anchored_vwap` (`avwap`, #1016) — single anchored-VWAP S/R flip; bidirectional (emits short on buffered breakdown below the line). Research-negative at default params (#1039) — treat as experimental; validate before live. **#1017 rider B:** default-off `gate_rsi_period`/`gate_rsi_level` (0/50.0) and `gate_ema_period` (0) momentum/trend gates — when set, longs need RSI≥level (or close≥EMA) on the signal bar, shorts the mirror; NaN warmup fails open (veto). Defaults keep `--list-json` bit-identical to pre-#1017. `anchored_vwap_channel` (`avwapch`, #1169) — dual-anchor channel (swing-low support / swing-high resistance line), range-edge mean reversion: long a bounce off support, short a rejection off resistance. `anchored_vwap_reversion` (`avwaprev`, #1170) — fades ATR-measured stretches beyond the anchored VWAP back toward the line (long below, short above), distinct per-bar from `anchored_vwap`'s breach trade. All three spot + futures/perps, pre-gated to composite `{ranging_quiet, ranging_volatile}` by default (channel/reversion) or unbounded (plain `anchored_vwap`). Pair `anchored_vwap` with the new `avwap_stop` close evaluator (exits on loss of the same line) for a self-consistent entry/exit — see `/go-trader-closing-strategies`.
 - **Range strategies (#896):** `consolidation_range` (`cr`) — range-edge mean-reversion at the top/bottom of a consolidation box; bidirectional (emits `signal=-1` at the top edge), requires `direction: "both"` for HL perps. Negative OOS at default params — tune `box_width_pct` and `atr_stop_mult` before live. `range_scalper` (`rs`) — **deprecated/hidden from discovery (#1034)**; unidirectional support/resistance scalper kept loadable for explicit configs.
 - **`atr_band_revert` (`abr`, #1069):** ranging mean-reversion — fade ATR-scaled bands around an SMA (long below `mid − k·ATR`; short above `mid + k·ATR` on the futures/perps `direction:"both"` variant). Entries only; exit is config not code — pair `tiered_tp_atr` (~`k_entry/2` & `k_entry` ATR tiers) + `stop_loss_atr_mult`. Spot long-only. `init` ships it pre-gated to `allowed_regimes:["ranging_quiet","ranging_volatile"]` on a composite "medium" window. Tunable baseline — backtest before live.
 - `donchian_breakout`, `chart_pattern`, `liquidity_sweeps` already emitted `signal=-1` for bearish setups but were generated long-only by `init.go`. Since #654 they default to `direction: "both"` so existing perps configs need a regenerate or a manual `direction` flip to capture the short side. `liquidity_sweeps` research-deprecate (#1032) — still in discovery; prefer other structure strategies. `donchian_breakout` (`dbo`) is **deprecated/hidden from discovery (#985)** — long leg fails all M1 windows ungated and under every regime-gate variant; short leg has a real OOS edge but fails both bull-year held-outs; kept loadable for explicit configs.
