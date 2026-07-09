@@ -298,24 +298,6 @@ func regimeRequiredOhlcvLimit(rc *RegimeConfig) int {
 	return limit
 }
 
-func regimeLabelAtOpen(pos *Position, windowKey string, rc *RegimeConfig) string {
-	if pos == nil {
-		return ""
-	}
-	key := normalizeRegimeWindowKey(windowKey)
-	if key == "" || key == regimeWindowDefaultKey {
-		if regimeMultiWindowEnabled(rc) {
-			key = primaryRegimeWindowKey(rc)
-		}
-	}
-	if key != "" && key != regimeWindowDefaultKey && len(pos.RegimeWindows) > 0 {
-		if label, ok := pos.RegimeWindows[key]; ok && strings.TrimSpace(label) != "" {
-			return strings.TrimSpace(label)
-		}
-	}
-	return strings.TrimSpace(pos.Regime)
-}
-
 func regimeLabelFromWindows(windows map[string]string, windowKey string, rc *RegimeConfig) string {
 	if len(windows) == 0 {
 		return ""
@@ -434,11 +416,6 @@ func regimeWindowExists(rc *RegimeConfig, key string) bool {
 	return ok
 }
 
-// regimeWindowsJSON forwards to regimeWindowsSpecJSON (#795).
-func regimeWindowsJSON(rc *RegimeConfig) string {
-	return regimeWindowsSpecJSON(rc)
-}
-
 func syncStrategyRegimeState(stratState *StrategyState, payload RegimePayload, rc *RegimeConfig) {
 	if stratState == nil {
 		return
@@ -447,10 +424,6 @@ func syncStrategyRegimeState(stratState *StrategyState, payload RegimePayload, r
 	if labels := payload.WindowLabels(); len(labels) > 0 {
 		stratState.RegimeWindows = cloneStringMap(labels)
 	}
-}
-
-func positionRegimeForFeature(pos *Position, sc StrategyConfig, rc *RegimeConfig, feature string) string {
-	return regimeLabelAtOpen(pos, resolveStrategyRegimeWindow(sc, feature, rc), rc)
 }
 
 func strategyRegimeWindowField(sc StrategyConfig, field string) string {
