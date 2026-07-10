@@ -136,6 +136,14 @@ func main() {
 	for _, sc := range cfg.Strategies {
 		fmt.Println(formatStrategySummaryLine(sc, explicitKeys[sc.ID]))
 	}
+	// #1275: warn loudly when a configured open strategy carries the M5
+	// fee-audit deprecate verdict (documented gross edge <= 0). Advisory only
+	// — the config keeps loading and trading; the same lines are replayed to
+	// the owner DM once the notifier is wired.
+	deprecatedEdgeWarnings := deprecatedEdgeStartupWarnings(cfg.Strategies)
+	for _, msg := range deprecatedEdgeWarnings {
+		fmt.Fprintln(os.Stderr, "[config] "+msg)
+	}
 	// #1269: surface a configured daily loss limit at startup so the operator
 	// can audit the portfolio-wide entry gate without grepping the JSON.
 	if line := dailyLossStartupSummaryLine(cfg.PortfolioRisk); line != "" {
@@ -478,6 +486,16 @@ func main() {
 	// #1157: surface uncertified/expired directional policy to owner DM at startup.
 	notifyDirectionalCertStartupSummary(notifier, directionalCertSummaryLines)
 
+	// #1275: replay M5-deprecated-strategy warnings to the owner DM so an
+	// operator live-trading a documented negative-gross-edge strategy sees it
+	// even when not tailing stderr. One-time per startup; suppressed
+	// per-strategy by allow_deprecated.
+	if len(deprecatedEdgeWarnings) > 0 && notifier.HasOwner() {
+		for _, msg := range deprecatedEdgeWarnings {
+			notifier.SendOwnerDM("[config] " + msg)
+		}
+	}
+
 	// #339: Forward the missing-state-DB warning to the owner. Captured before
 	// OpenStateDB ran (which would have created an empty DB), surfaced here
 	// once the notifier is available.
@@ -627,6 +645,10 @@ func main() {
 			return
 		}
 		mu.Lock()
+		// #1275: snapshot the pre-reload strategy shapes so a hot reload that
+		// moves an open leg onto an M5-deprecated name (or drops an
+		// allow_deprecated ack) re-fires the deprecated-edge warning below.
+		prevStrategies := append([]StrategyConfig(nil), cfg.Strategies...)
 		changes, err := applyHotReloadConfig(cfg, nextCfg, state, notifier, server)
 		if err != nil {
 			mu.Unlock()
@@ -654,6 +676,18 @@ func main() {
 			fmt.Printf("[reload] %s\n", line)
 		}
 		notifyDirectionalCertStartupSummary(notifier, reloadCertLines)
+
+		// #1275: a hot reload can move a strategy's open leg onto an
+		// M5-deprecated name or flip allow_deprecated off — surface the same
+		// loud warning (stderr + owner DM) the startup path emits, but only
+		// for strategies whose deprecated-unacked state is new to this reload
+		// so unchanged strategies don't re-spam on every SIGHUP.
+		for _, msg := range newlyDeprecatedEdgeWarnings(prevStrategies, cfg.Strategies) {
+			fmt.Fprintln(os.Stderr, "[reload] "+msg)
+			if notifier.HasOwner() {
+				notifier.SendOwnerDM("[reload] " + msg)
+			}
+		}
 
 		if len(changes) == 0 {
 			fmt.Println("[reload] Config reload applied: no hot-reloadable changes")
