@@ -307,5 +307,46 @@ outperformance — but that is a hypothetical, not a flip today, so no follow-up
 decision issue is filed. The corrected `tp_tight` continuous numbers above
 supersede the step-5 table for any future comparison.
 
+## Addendum 2026-07-10 — re-run under intra-bar stop resolution + corrected HL fees (#1294)
+
+Re-ran `audit_headline.py` (baseline; `tp_tight` + `trail_atr_3.0`) and
+`validate_shortlist.py` (default shortlist) on current `main` — #1271
+`ohlc_walk` intrabar default and the #1320 audit fee-model switch — under BOTH
+`--intrabar-resolution` modes (the drivers now thread the flag, #1294),
+identical cache snapshot (last bars 2026-06-04 → 2026-06-12, zero drift).
+**The keep-baseline verdict holds.**
+
+M1 protocol table (default shortlist): baseline OOS PASS (held-out 0/3),
+`trail_atr_3.0` FAIL (0/3), `tp_tight` FAIL (2/3), `tp_tight_trail3` FAIL (0/3)
+— **identical to the documented table, in both modes.** The decisive
+judged-OOS crash-window failure of every non-baseline candidate is intact, so
+no promotion guidance changes.
+
+Two shortlist candidates arm engine-tracked stops and are therefore
+#1271-reached: `trail_atr_3.0` (bare trailing stop) and `tp_tight_trail3`
+(tiered TP + `trailing_stop_atr_mult` 3.0, the analog of squeeze_983's
+`tp_runner_trail3`). Both have mode-different numbers; `baseline` and
+`tp_tight` (evaluator ladders only) reproduce byte-identically across the
+mode pair. Continuous audit window:
+
+| run | metric | documented (2026-07-05) | `bar_close` re-run | `ohlc_walk` re-run | attribution |
+|---|---|---:|---:|---:|---|
+| baseline | Sharpe / ret / vsB&H / worstDD / #T | +0.02 / -1.08% / +43.74 / -52.17% / 260 | +0.145 / +3.87% / +48.70 / -51.80% / 260 | identical to bar_close | fee model only |
+| `tp_tight` | " | +0.150 / +0.86% / +45.69 / -34.28% / 148 | +0.203 / +1.96% / +46.79 / -34.22% / 148 | identical to bar_close | fee model only (evaluator ladder, no engine stop) |
+| `trail_atr_3.0` | " | -0.495 / -14.86% / +29.97 / -51.62% / 371 | -0.288 / -9.34% / +35.49 / -50.13% / 371 | **-0.433 / -10.54% / +34.29 / -47.50% / 412** | fee model (bar_close column) + intra-bar walk (delta between the two re-run columns) |
+
+The `trail_atr_3.0` mode-pair isolates #1271 cleanly: the intra-bar walk
+converts stop touches into same-bar trigger-price exits (#T 371 → 412), trims
+the worst DD (-50.13% → -47.50%) and gives back return/Sharpe — the expected
+"strictly more conservative for tight stops" direction. It stays a deep M1
+FAIL either way. `tp_tight_trail3`'s mode pair (M1 pooled windows, Sharpe /
+DDadj): IS +0.09 / +0.70 under `bar_close` → **-0.39 / +0.58** under
+`ohlc_walk`; OOS -1.11 / -0.62 → -0.98 / -0.58. Its pooled-IS window label
+flips PASS → FAIL under the intra-bar walk, but the protocol verdict is
+unchanged in both modes (judged-OOS FAIL, held-out 0/3, matching the
+documented table). The #1243 finding that `tp_tight`'s documented continuous
+collapse was refuted stands (it is intrabar-unreached; only fees moved it).
+
 ---
 Updated with LLM: Opus 4.8 | high | Harness: Claude Code
+Updated with LLM: Fable 5 | high | Harness: Claude Code
