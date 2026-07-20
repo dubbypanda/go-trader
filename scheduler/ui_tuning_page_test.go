@@ -71,6 +71,7 @@ func TestTuningStaticAppWiresRunAndLiveConfigAPIs(t *testing.T) {
 	for _, want := range []string{
 		`document.body.dataset.page === "tuning"`,
 		`/api/tuning/runs`,
+		`/api/tuning/apply`,
 		`/api/strategies/`,
 		`baseline-drifted`,
 		`baseline-unknown`,
@@ -79,6 +80,10 @@ func TestTuningStaticAppWiresRunAndLiveConfigAPIs(t *testing.T) {
 		`memoized server-side`,
 		`detailReloadPending`,
 		`Defer clearing until replacement content is ready`,
+		`apply_eligibility`,
+		`Apply tuning suggestion`,
+		`open-as-close`,
+		`loadRunDetail()`,
 	} {
 		if !strings.Contains(js, want) {
 			t.Errorf("tuning app wiring missing %q", want)
@@ -168,6 +173,38 @@ assert.strictEqual(logic.detailLoadAction("", false, ""), "idle");
 assert.strictEqual(logic.detailLoadAction("run-a", false, ""), "start");
 assert.strictEqual(logic.detailLoadAction("run-a", true, "run-a"), "skip");
 assert.strictEqual(logic.detailLoadAction("run-b", true, "run-a"), "queue");
+
+let apply = logic.applyButtonState("eligible");
+assert.strictEqual(apply.enabled, true);
+assert.strictEqual(apply.label, "Apply");
+
+apply = logic.applyButtonState("already_applied", "2026-07-20T12:00:00Z");
+assert.strictEqual(apply.enabled, false);
+assert.ok(String(apply.reason).includes("2026-07-20T12:00:00Z"));
+
+apply = logic.applyButtonState("baseline_drifted");
+assert.strictEqual(apply.enabled, false);
+assert.ok(String(apply.reason).includes("Re-run tuning"));
+
+apply = logic.applyButtonState("legacy_artifact");
+assert.strictEqual(apply.enabled, false);
+
+apply = logic.applyButtonState("not_survivor");
+assert.strictEqual(apply.enabled, false);
+
+let confirm = logic.applyConfirmMessage("spot-a", "cand_1", {has_open_position: false});
+assert.ok(confirm.includes("spot-a"));
+assert.ok(!confirm.includes("open trade"));
+
+confirm = logic.applyConfirmMessage("spot-a", "cand_1", {
+  has_open_position: true,
+  close_strategy: {name: "tiered_tp_atr"}
+});
+assert.ok(!confirm.includes("open trade"));
+
+confirm = logic.applyConfirmMessage("spot-a", "cand_1", {has_open_position: true});
+assert.ok(confirm.includes("open trade"));
+assert.ok(confirm.includes("exits"));
 `
 	cmd := exec.Command("node", "-e", script)
 	if output, err := cmd.CombinedOutput(); err != nil {
