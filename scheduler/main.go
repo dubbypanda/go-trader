@@ -188,7 +188,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to load state: %v\n", err)
 		os.Exit(1)
 	}
-	ValidateState(state)
+	ValidateState(state, cfg.Strategies)
 
 	// #87: Resolve capital_pct at startup so initial state gets the right capital.
 	resolveCapitalPct(cfg.Strategies)
@@ -201,14 +201,18 @@ func main() {
 	initialCapitalChangeInfos, initialCapitalChangeErrors := ReconcileConfigInitialCapital(cfg, state, stateDB)
 
 	// Initialize new strategies and sync config values for existing ones
+	sharedWalletTransitionBlockers := sharedWalletPoolTransitionBlockers(cfg.Strategies, state)
+	var sharedWalletTransitionWarnings []string
 	for i := range cfg.Strategies {
 		sc := &cfg.Strategies[i]
 		// For live Hyperliquid strategies without capital_pct, override capital with the real wallet balance.
 		if sc.CapitalPct == 0 {
 			syncHyperliquidLiveCapital(sc)
 		}
-		if s, exists := state.Strategies[sc.ID]; !exists {
-			state.Strategies[sc.ID] = NewStrategyState(*sc)
+		s, stateExisted := state.Strategies[sc.ID]
+		if !stateExisted {
+			s = NewStrategyState(*sc)
+			state.Strategies[sc.ID] = s
 			fmt.Printf("  Initialized strategy: %s (type=%s, capital=$%.0f)\n", sc.ID, sc.Type, sc.Capital)
 		} else {
 			// Sync config → state (config is source of truth).
@@ -235,6 +239,37 @@ func main() {
 						pos.Leverage = sc.Leverage
 					}
 				}
+			}
+		}
+		transitionErr := sharedWalletTransitionBlockers[sc.ID]
+		poolTransition := sharedWalletPoolStateUnchanged
+		if transitionErr == nil {
+			poolTransition, transitionErr = applySharedWalletPoolStateMode(*sc, s)
+		}
+		if transitionErr != nil {
+			// A transition can be unsafe while any wallet peer remains open,
+			// or a pool→capital_pct transition can be temporarily unresolvable
+			// when the exchange balance fetch fails. Keep every durable book
+			// marker intact, force the affected wallet into manage-only mode,
+			// and retry the one-time transition on a later flat restart.
+			// Exits/protection keep running; fresh opens/adds/flips may not.
+			msg := deferSharedWalletPoolTransition(sc, transitionErr)
+			fmt.Fprintf(os.Stderr, "[CRITICAL] %s\n", msg)
+			sharedWalletTransitionWarnings = append(sharedWalletTransitionWarnings, msg)
+			continue
+		}
+		if poolTransition != sharedWalletPoolStateUnchanged {
+			if stateExisted {
+				if err := stateDB.PersistSharedWalletPoolStateTransition(s); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to persist shared-wallet pool state for %s: %v\n", sc.ID, err)
+					os.Exit(1)
+				}
+			}
+			switch poolTransition {
+			case sharedWalletPoolStateEntered:
+				fmt.Printf("  Reset %s virtual allocation for shared-wallet pool budgeting\n", sc.ID)
+			case sharedWalletPoolStateLeft:
+				fmt.Printf("  Reseeded %s allocated cash book at $%.2f after leaving shared-wallet pool budgeting\n", sc.ID, s.InitialCapital)
 			}
 		}
 	}
@@ -499,6 +534,15 @@ func main() {
 		}
 	}
 
+	// A deferred pool transition is deliberately non-fatal so protection
+	// management stays live, but it requires prominent operator visibility
+	// because entries remain held until a successful flat restart.
+	if len(sharedWalletTransitionWarnings) > 0 && notifier.HasOwner() {
+		for _, msg := range sharedWalletTransitionWarnings {
+			notifier.SendOwnerDM("[state] CRITICAL: " + msg)
+		}
+	}
+
 	// #336/#656: Forward startup direction-vs-position warnings to the owner
 	// so the desync is surfaced even when the operator isn't tailing stderr.
 	if len(directionConfigWarnings) > 0 && notifier.HasOwner() {
@@ -754,6 +798,8 @@ func main() {
 
 	saveFailures := 0
 	var resetGoroutineRunning atomic.Bool
+	sharedWalletRiskBalances := make(map[SharedWalletKey]sharedWalletRiskBalanceSnapshot)
+	sharedWalletRiskGeneration := 0
 
 	// Main loop
 	for {
@@ -970,8 +1016,11 @@ func main() {
 			for _, ss := range state.Strategies {
 				if ss != nil {
 					ss.SharedWalletValueSet = false
+					ss.SharedWalletPerformanceOnly = false
 				}
 			}
+			state.LatestSharedWalletBalances = nil
+			state.LatestSharedWalletMembers = nil
 			mu.Unlock()
 			mu.RLock()
 			totalPV, _ = computeTotalPortfolioValue(cfg.Strategies, state, prices, nil, sharedWallets)
@@ -1213,8 +1262,12 @@ func main() {
 				}
 			}
 
+			sharedWalletRiskGeneration++
 			mu.RLock()
-			totalPV, usedPVFallback = computeTotalPortfolioValue(cfg.Strategies, state, prices, walletBalances, sharedWallets)
+			riskWalletBalances, usedStaleRiskBalance, pooledEquityComplete := resolveSharedWalletRiskBalances(
+				cfg.Strategies, state.Strategies, sharedWallets, walletBalances,
+				sharedWalletRiskBalances, sharedWalletRiskGeneration)
+			totalPV, usedPVFallback = computeTotalPortfolioValue(cfg.Strategies, state, prices, riskWalletBalances, sharedWallets)
 			totalNotional := PortfolioNotional(state.Strategies, prices)
 			// #296: aggregate perps margin drawdown inputs alongside the
 			// equity total so the portfolio kill switch can fire on a
@@ -1224,7 +1277,7 @@ func main() {
 			// #1269: evaluate the portfolio-wide daily loss limit once per
 			// cycle (pure read — stale per-strategy days count as 0, matching
 			// what rolloverDailyPnL would reset them to).
-			dailyLossStatus := evaluateDailyLossLimit(cfg.PortfolioRisk, state.Strategies, time.Now().UTC())
+			dailyLossStatus := evaluateDailyLossLimit(cfg.PortfolioRisk, state.Strategies, cfg.Strategies, time.Now().UTC())
 			// #1270: evaluate the same-direction exposure cap once per cycle
 			// (pure read over positions + this cycle's prices; totalPV is the
 			// concentration basis). Like the notional cap, this measures the
@@ -1239,15 +1292,19 @@ func main() {
 			// false peak would persist and could later trip a false drawdown).
 			// CheckPortfolioRisk auto-ratchets PeakValue when totalValue > peak;
 			// we snapshot before the call and restore if we're on a fallback
-			// cycle. Drawdown detection still runs against the frozen peak.
+			// or one-generation-stale cycle. Allocated-wallet fallback and a
+			// bounded pooled snapshot still evaluate equity against the frozen
+			// peak; a pooled wallet with no trustworthy snapshot suppresses
+			// only the equity arm inside checkPortfolioRiskWithEquityAvailability.
 			origPeak := state.PortfolioRisk.PeakValue
 			prevWarningSent := state.PortfolioRisk.WarningSent
-			portfolioAllowed, nb, portfolioWarning, portfolioReason := CheckPortfolioRisk(&state.PortfolioRisk, cfg.PortfolioRisk, totalPV, totalNotional, perpsLoss, perpsMargin)
+			portfolioAllowed, nb, portfolioWarning, portfolioReason := checkPortfolioRiskWithEquityAvailability(
+				&state.PortfolioRisk, cfg.PortfolioRisk, totalPV, totalNotional, perpsLoss, perpsMargin, pooledEquityComplete)
 			// True only on the cycle that first enters the warn band; false on
 			// repeat cycles while still in band. Used to gate kill-switch event
 			// log appends — notifications still fire every cycle via portfolioWarning.
 			portfolioWarnBandEntered := portfolioWarning && !prevWarningSent
-			if usedPVFallback && state.PortfolioRisk.PeakValue > origPeak {
+			if (usedPVFallback || usedStaleRiskBalance || !pooledEquityComplete) && state.PortfolioRisk.PeakValue > origPeak {
 				state.PortfolioRisk.PeakValue = origPeak
 			}
 			if !portfolioAllowed {
@@ -1492,10 +1549,17 @@ func main() {
 				}
 				if !notifier.HasOwner() {
 					if plan.CanAutoResetWithoutOwner() {
+						peakRebaselineAvailable := portfolioPeakRebaselineAvailable(
+							usedPVFallback, usedStaleRiskBalance, pooledEquityComplete)
 						killSwitchAutoReset = AutoResetConfirmedFlatKillSwitch(&state.PortfolioRisk, totalPV,
+							peakRebaselineAvailable,
 							"confirmed flat after portfolio kill-switch close; no DM owner configured, latch auto-cleared")
 						if killSwitchAutoReset {
-							fmt.Printf("[CRITICAL] Portfolio kill switch auto-reset after confirmed flat close (no owner configured, peak re-baselined to $%.2f)\n", totalPV)
+							if peakRebaselineAvailable {
+								fmt.Printf("[CRITICAL] Portfolio kill switch auto-reset after confirmed flat close (no owner configured, peak re-baselined to $%.2f)\n", totalPV)
+							} else {
+								fmt.Printf("[CRITICAL] Portfolio kill switch auto-reset after confirmed flat close (no owner configured, prior peak retained because current equity is not trustworthy)\n")
+							}
 						}
 					} else {
 						fmt.Println("[CRITICAL] Portfolio kill switch auto-reset suppressed: operator-required close gaps remain")
@@ -1783,6 +1847,7 @@ func main() {
 					var hlPosQty float64
 					var hlPosSide string
 					var hlAvgCost float64
+					var hlPosLeverage float64
 					var hlEntryATR float64
 					var hlPosCtx PositionCtx
 					var hlStopLossOID int64
@@ -1795,10 +1860,16 @@ func main() {
 					var hlAddedNotionalUSD float64
 					var hlScaleInCash float64
 					var hlScaleInResizePending bool
+					var hlPoolBalanceKnown bool
 					var hlProfileState *RegimeProfileState
 					if sc.Type == "perps" && sc.Platform == "hyperliquid" {
 						if hlLiveStrategy {
-							hlCash = stratState.Cash
+							if poolCash, pooled, balanceKnown := sharedWalletPoolAvailableMargin(sc, cfg.Strategies, state, prices, sharedWallets, walletBalances); pooled {
+								hlCash = poolCash
+								hlPoolBalanceKnown = balanceKnown
+							} else {
+								hlCash = stratState.Cash
+							}
 						}
 						// #998: snapshot the regime-profile switch state under the
 						// Phase-1 RLock so the lock-free resolution reads a stable copy.
@@ -1810,6 +1881,11 @@ func main() {
 						// strategy cash like a fresh open — captured for paper too
 						// (hlCash above is live-only), under the same RLock.
 						hlScaleInCash = stratState.Cash
+						if hlLiveStrategy {
+							if poolCash, pooled, _ := sharedWalletPoolAvailableMargin(sc, cfg.Strategies, state, prices, sharedWallets, walletBalances); pooled {
+								hlScaleInCash = poolCash
+							}
+						}
 						// Live-order sizing/cancel snapshots below are intentionally
 						// consumed only inside live execution branches. Paper paths
 						// should continue using PositionCtx only for close evaluation.
@@ -1819,6 +1895,7 @@ func main() {
 								hlPosSide = hlPosCtx.Side
 								hlPosQty = hlPosCtx.Quantity
 								hlAvgCost = hlPosCtx.AvgCost
+								hlPosLeverage = pos.Leverage
 								hlEntryATR = pos.EntryATR
 								hlStopLossOID = pos.StopLossOID
 								hlTPOIDs = cloneInt64s(pos.TPOIDs)
@@ -1837,10 +1914,21 @@ func main() {
 					var okxPosQty float64
 					var okxPosSide string
 					var okxAvgCost float64
+					var okxPosLeverage float64
+					var okxPoolBalanceKnown bool
 					var okxPosCtx PositionCtx
 					if sc.Platform == "okx" {
 						if okxLiveStrategy {
-							okxCash = stratState.Cash
+							if sc.Type == "perps" {
+								if poolCash, pooled, balanceKnown := sharedWalletPoolAvailableMargin(sc, cfg.Strategies, state, prices, sharedWallets, walletBalances); pooled {
+									okxCash = poolCash
+									okxPoolBalanceKnown = balanceKnown
+								} else {
+									okxCash = stratState.Cash
+								}
+							} else {
+								okxCash = stratState.Cash
+							}
 							okxCashReconcile = stratState.CashReconcileRequired
 						}
 						if sym := okxSymbol(sc.Args); sym != "" {
@@ -1849,6 +1937,7 @@ func main() {
 								okxPosSide = okxPosCtx.Side
 								okxPosQty = okxPosCtx.Quantity
 								okxAvgCost = okxPosCtx.AvgCost
+								okxPosLeverage = pos.Leverage
 							}
 						}
 					}
@@ -2005,7 +2094,7 @@ func main() {
 								var execResult *OKXExecuteResult
 								liveExecFailed := false
 								if okxIsLive(sc.Args) && result.Signal != 0 {
-									if er, ok2 := runOKXExecuteOrder(sc, result, price, okxCash, okxCashReconcile, okxPosQty, okxPosSide, okxAvgCost, notifier, logger); ok2 {
+									if er, ok2 := runOKXExecuteOrder(sc, result, price, okxCash, okxPoolBalanceKnown, okxCashReconcile, okxPosQty, okxPosSide, okxAvgCost, okxPosLeverage, notifier, logger); ok2 {
 										execResult = er
 									} else {
 										liveExecFailed = true
@@ -2252,7 +2341,7 @@ func main() {
 								var execResult *OKXExecuteResult
 								liveExecFailed := false
 								if okxIsLive(sc.Args) && result.Signal != 0 {
-									if er, ok2 := runOKXExecuteOrder(sc, result, price, okxCash, okxCashReconcile, okxPosQty, okxPosSide, okxAvgCost, notifier, logger); ok2 {
+									if er, ok2 := runOKXExecuteOrder(sc, result, price, okxCash, okxPoolBalanceKnown, okxCashReconcile, okxPosQty, okxPosSide, okxAvgCost, okxPosLeverage, notifier, logger); ok2 {
 										execResult = er
 									} else {
 										liveExecFailed = true
@@ -2502,7 +2591,7 @@ func main() {
 										liveExecFailed = true
 									}
 								} else {
-									er, ok2 := runHyperliquidExecuteOrder(sc, result, price, hlCash, hlPosQty, hlPosSide, hlAvgCost, hlStopLossOID, hlTPOIDs, hlReconcileAll, walletSnapshot, notifier, logger)
+									er, ok2 := runHyperliquidExecuteOrder(sc, result, price, hlCash, hlPoolBalanceKnown, hlPosQty, hlPosSide, hlAvgCost, hlPosLeverage, hlStopLossOID, hlTPOIDs, hlReconcileAll, walletSnapshot, notifier, logger)
 									if ok2 {
 										execResult = er
 									} else {
@@ -3506,7 +3595,7 @@ func executeOptionsResult(sc StrategyConfig, s *StrategyState, result *OptionsRe
 // capital_pct is set but capital resolved to $0 (balance fetch failed and
 // no fallback capital configured).
 func shouldSkipZeroCapital(sc StrategyConfig) bool {
-	return sc.CapitalPct > 0 && sc.Capital <= 0
+	return sc.CapitalPct > 0 && sc.Capital <= 0 && !sc.sharedWalletModeDeferred
 }
 
 func notifyPerStrategyCircuitBreaker(sc StrategyConfig, reason string, portfolioValue float64, notifier *MultiNotifier, portfolioKillSwitchFired bool) {
@@ -3807,7 +3896,7 @@ func shouldCloseFullPosition(closeFraction float64, symbol string, hlLiveAll []S
 // Trade record, leaving state silently behind actual exchange holdings. See
 // issue #298 — 0.716 ETH of live fills were lost this way because the
 // "already long, skipping buy" branch sat AFTER RunHyperliquidExecute.
-func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, price, cash, posQty float64, posSide string, avgCost float64, existingStopLossOID int64, existingTPOIDs []int64, hlLiveAll []StrategyConfig, walletSnapshot hlExecuteSnapshot, notifier *MultiNotifier, logger *StrategyLogger) (*HyperliquidExecuteResult, bool) {
+func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, price, cash float64, poolBalanceKnown bool, posQty float64, posSide string, avgCost, posLeverage float64, existingStopLossOID int64, existingTPOIDs []int64, hlLiveAll []StrategyConfig, walletSnapshot hlExecuteSnapshot, notifier *MultiNotifier, logger *StrategyLogger) (*HyperliquidExecuteResult, bool) {
 	directionEnum := EffectiveDirection(sc)
 	if reason := PerpsOrderSkipReason(result.Signal, posSide, directionEnum); reason != "" {
 		logger.Info("Skipping live order for %s: %s", result.Symbol, reason)
@@ -3821,7 +3910,15 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 	// distance (ATR owners read the check payload's indicators.atr — the same
 	// value stampEntryATRIfOpened later freezes, so sizing and SL geometry
 	// agree) and fails closed on fresh opens when the distance is unresolvable.
-	sizing := PerpsSizingFor(sc, price, indicatorsATRValue(result.Indicators))
+	sizing := withSharedWalletPoolSizing(
+		sc,
+		PerpsSizingFor(sc, price, indicatorsATRValue(result.Indicators)),
+		posQty,
+		price,
+		avgCost,
+		posLeverage,
+		poolBalanceKnown,
+	)
 	size, ok, reason := perpsLiveOrderSize(result.Signal, price, cash, posQty, avgCost, sizing, posSide, directionEnum, result.CloseFraction)
 	if !ok {
 		logger.Info("%s for %s", reason, result.Symbol)
@@ -4622,7 +4719,7 @@ func runOKXCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCt
 // ExecutePerpsSignalWithLeverage that must be mirrored to avoid the #298 bug class
 // (live fill placed but no Trade recorded because the in-memory execution
 // returned 0). See #300.
-func runOKXExecuteOrder(sc StrategyConfig, result *OKXResult, price, cash float64, cashReconcileRequired bool, posQty float64, posSide string, avgCost float64, notifier *MultiNotifier, logger *StrategyLogger) (*OKXExecuteResult, bool) {
+func runOKXExecuteOrder(sc StrategyConfig, result *OKXResult, price, cash float64, poolBalanceKnown, cashReconcileRequired bool, posQty float64, posSide string, avgCost, posLeverage float64, notifier *MultiNotifier, logger *StrategyLogger) (*OKXExecuteResult, bool) {
 	var skip string
 	if sc.Type == "perps" {
 		skip = PerpsOrderSkipReason(result.Signal, posSide, EffectiveDirection(sc))
@@ -4646,7 +4743,15 @@ func runOKXExecuteOrder(sc StrategyConfig, result *OKXResult, price, cash float6
 	// hardcoded 0.95 safety buffer. risk_per_trade_pct (#1268) is HL-only, so
 	// PerpsSizingFor resolves zero risk fields here (validation rejects it on
 	// OKX at load).
-	sizing := PerpsSizingFor(sc, price, indicatorsATRValue(result.Indicators))
+	sizing := withSharedWalletPoolSizing(
+		sc,
+		PerpsSizingFor(sc, price, indicatorsATRValue(result.Indicators)),
+		posQty,
+		price,
+		avgCost,
+		posLeverage,
+		poolBalanceKnown,
+	)
 	var size float64
 	if sc.Type == "perps" {
 		var ok bool
