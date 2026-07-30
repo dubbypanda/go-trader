@@ -152,7 +152,7 @@ Generate via `./go-trader init` or `--json`. Skeleton:
 | Field | Description | Default |
 |-------|-------------|---------|
 | `portfolio_risk.max_drawdown_pct` | Kill switch — halt all trading if portfolio drops this % from peak | 25 |
-| `portfolio_risk.max_notional_usd` | Hard cap on total notional exposure (0 = disabled) | 0 |
+| `portfolio_risk.max_notional_usd` | Cap on total gross notional — holds new opens when exceeded; closes/SL keep running (0 = disabled) | 0 |
 | `portfolio_risk.warn_threshold_pct` | Warning when drawdown reaches this % of `max_drawdown_pct` | 60 |
 | `portfolio_risk.daily_max_loss_usd` / `daily_max_loss_pct` | Hard daily loss limit — holds new entries (not closes) until UTC rollover; both may be set, lower resolved USD wins (0 = disabled) | 0 |
 | `portfolio_risk.max_same_direction_notional_usd` / `max_asset_concentration_pct` | Blocks new same-direction/single-asset opens once the cap would be exceeded (0 = disabled) | 0 |
