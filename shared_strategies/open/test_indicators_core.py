@@ -18,9 +18,11 @@ import pandas as pd
 import pytest
 
 from indicators_core import (
+    HURST_DFA_MIN_POINTS,
     atr_from_true_range,
     atr_sma,
     atr_sma_series,
+    hurst_exponent,
     round_atr_large,
     true_range,
     true_range_series,
@@ -542,3 +544,207 @@ def test_standard_atr_reexport_threads_wilder():
     # latest_atr threads the method: on a >=100-ATR frame the simple value is
     # integer-rounded and the wilder one is not, so they must differ.
     assert atr_mod.latest_atr(df, method="wilder") != atr_mod.latest_atr(df)
+
+
+# --- Hurst exponent (#1409) ---------------------------------------------------
+
+
+def _ar1_log_price_series(n, phi, seed, drift=0.0, scale=100.0):
+    """Cumulative log-price walk from an AR(1) increment process.
+
+    phi > 0 makes increments positively autocorrelated (persistent/trending);
+    phi < 0 makes them negatively autocorrelated (mean-reverting); phi == 0
+    is a plain Gaussian random walk.
+    """
+    rng = np.random.RandomState(seed)
+    eps = rng.randn(n)
+    steps = np.zeros(n)
+    for i in range(1, n):
+        steps[i] = phi * steps[i - 1] + eps[i]
+    log_price = np.cumsum(steps) * 0.01 + np.linspace(0.0, drift, n)
+    return pd.Series(scale * np.exp(log_price))
+
+
+def test_hurst_random_walk_near_half():
+    close = _ar1_log_price_series(2000, phi=0.0, seed=1)
+    h = hurst_exponent(close)
+    assert 0.35 <= h <= 0.65, h
+
+
+def test_hurst_persistent_series_above_half():
+    close = _ar1_log_price_series(2000, phi=0.7, seed=2)
+    h = hurst_exponent(close)
+    assert h > 0.55, h
+
+
+def test_hurst_mean_reverting_series_below_half():
+    close = _ar1_log_price_series(2000, phi=-0.6, seed=3)
+    h = hurst_exponent(close)
+    assert h < 0.45, h
+
+
+def test_hurst_insufficient_data_returns_nan():
+    close = pd.Series(np.linspace(100.0, 110.0, HURST_DFA_MIN_POINTS))  # one short of the floor
+    assert np.isnan(hurst_exponent(close))
+
+
+def test_hurst_exactly_at_minimum_is_not_nan():
+    close = _ar1_log_price_series(HURST_DFA_MIN_POINTS + 1, phi=0.0, seed=4)
+    h = hurst_exponent(close)
+    assert not np.isnan(h)
+
+
+def test_hurst_constant_price_returns_nan():
+    close = pd.Series(np.full(300, 100.0))
+    assert np.isnan(hurst_exponent(close))
+
+
+def test_hurst_non_positive_price_returns_nan():
+    close = pd.Series(np.concatenate([np.full(150, 100.0), [-1.0], np.full(150, 100.0)]))
+    assert np.isnan(hurst_exponent(close))
+
+
+def test_hurst_never_raises_on_degenerate_input():
+    for close in (
+        pd.Series([], dtype=float),
+        pd.Series([100.0]),
+        pd.Series(np.full(500, float("nan"))),
+    ):
+        h = hurst_exponent(close)
+        assert np.isnan(h)
+
+
+def test_hurst_deterministic():
+    close = _ar1_log_price_series(500, phi=0.3, seed=5)
+    assert hurst_exponent(close) == hurst_exponent(close)
+
+
+def test_hurst_custom_min_points():
+    close = _ar1_log_price_series(60, phi=0.0, seed=6)
+    assert np.isnan(hurst_exponent(close, min_points=100))
+    assert not np.isnan(hurst_exponent(close, min_points=50))
+
+
+# --- Short-scale null-distribution bias (#1419 review) ------------------------
+#
+# DFA carries a known small upward bias on memoryless (Gaussian random walk) data
+# at short segment scales -- see the caveat in `hurst_exponent`'s docstring. These
+# regression-test the mitigation (`_HURST_DFA_MIN_SCALE` raised from 4 to 8) rather
+# than any specific mean value, so they stay valid if the floor is tuned further.
+
+
+def test_hurst_random_walk_mean_near_half_at_live_frame_size():
+    """At n=200 (the live `check_regime.py --ohlcv-limit` default), the estimator's
+    OWN mean over many independent random walks must sit close to the true H=0.5 --
+    not the ~0.54 the review measured before the min-scale fix."""
+    values = [
+        hurst_exponent(_ar1_log_price_series(201, phi=0.0, seed=100 + i))
+        for i in range(200)
+    ]
+    values = [v for v in values if not np.isnan(v)]
+    assert len(values) > 150, "too many NaN draws to measure the null mean"
+    mean_h = float(np.mean(values))
+    assert abs(mean_h - 0.5) < 0.03, mean_h
+
+
+def test_hurst_random_walk_mean_near_half_at_enriched_column_frame_size():
+    """Same null-mean check at n=101 -- the exact per-bar segment length
+    `backtest/regime_enriched_features._hurst_column` uses (HURST_DFA_MIN_POINTS+1)."""
+    values = [
+        hurst_exponent(_ar1_log_price_series(HURST_DFA_MIN_POINTS + 1, phi=0.0, seed=200 + i))
+        for i in range(200)
+    ]
+    values = [v for v in values if not np.isnan(v)]
+    assert len(values) > 150, "too many NaN draws to measure the null mean"
+    mean_h = float(np.mean(values))
+    assert abs(mean_h - 0.5) < 0.03, mean_h
+
+
+# --- Null-distribution spread pinned to the docstring caveat (#1419 review) ---
+#
+# The mean-only tests above don't catch an understated spread: a reading can sit
+# well outside a narrow claimed sd while the *mean* over many draws still looks
+# fine. These regression-pin the empirical sd/percentiles the docstring caveat
+# now cites, using 1000-trial samples (same order as the review's own re-measure)
+# and seeds disjoint from the mean tests above so the two don't share draws.
+
+
+def test_hurst_random_walk_sd_within_caveat_at_live_frame_size():
+    """At n=201, the null-distribution sd must stay close to the ~0.08 the
+    docstring caveat cites -- not silently drift to the wider n=101 figure."""
+    values = [
+        hurst_exponent(_ar1_log_price_series(201, phi=0.0, seed=10_000 + i))
+        for i in range(1000)
+    ]
+    values = np.array([v for v in values if not np.isnan(v)])
+    assert len(values) > 800, "too many NaN draws to measure the null sd"
+    sd = float(values.std())
+    assert 0.05 < sd < 0.11, sd
+
+
+def test_hurst_random_walk_sd_within_caveat_at_enriched_column_frame_size():
+    """At n=101 -- the exact frame `regime_enriched_features` computes at -- the
+    null-distribution sd must stay close to the ~0.12 the docstring caveat cites.
+    A caveat claiming the tighter n=201 spread here would understate how often a
+    memoryless draw reads well above the 0.50-0.55 'no memory' band."""
+    values = [
+        hurst_exponent(_ar1_log_price_series(HURST_DFA_MIN_POINTS + 1, phi=0.0, seed=20_000 + i))
+        for i in range(1000)
+    ]
+    values = np.array([v for v in values if not np.isnan(v)])
+    assert len(values) > 800, "too many NaN draws to measure the null sd"
+    sd = float(values.std())
+    assert 0.09 < sd < 0.16, sd
+
+
+def test_hurst_random_walk_high_percentile_exceeds_no_memory_band_at_enriched_column_frame_size():
+    """At n=101, the docstring warns a single reading above 0.55 -- even above
+    0.7 -- is not reliable evidence of persistence on its own. Pin that: the 95th
+    percentile of memoryless draws must sit meaningfully above 0.55, matching the
+    caveat's ~0.72 figure within a wide tolerance."""
+    values = [
+        hurst_exponent(_ar1_log_price_series(HURST_DFA_MIN_POINTS + 1, phi=0.0, seed=30_000 + i))
+        for i in range(1000)
+    ]
+    values = np.array([v for v in values if not np.isnan(v)])
+    assert len(values) > 800, "too many NaN draws to measure the percentile"
+    p95 = float(np.percentile(values, 95))
+    assert 0.60 < p95 < 0.85, p95
+
+
+def test_hurst_dfa_fluctuation_vectorization_matches_naive_per_segment_polyfit():
+    """#1419 review perf fix: `_hurst_dfa_fluctuation` now fits every segment at a
+    scale with one batched pseudo-inverse product instead of one `np.polyfit` call
+    per segment. Regression-pin it against the original naive per-segment-polyfit
+    reference implementation across a range of profile lengths and scales."""
+    from indicators_core import _hurst_dfa_fluctuation
+
+    def naive_fluctuation(profile, scale):
+        n = len(profile)
+        n_segments = n // scale
+        if n_segments < 1:
+            return float("nan")
+        t = np.arange(scale, dtype=float)
+        starts = [profile[: n_segments * scale]]
+        tail = profile[n - n_segments * scale:]
+        if not np.array_equal(tail, starts[0]):
+            starts.append(tail)
+        sq_residuals = []
+        for block in starts:
+            for seg in block.reshape(n_segments, scale):
+                coeffs = np.polyfit(t, seg, 1)
+                trend = np.polyval(coeffs, t)
+                sq_residuals.append(float(np.mean((seg - trend) ** 2)))
+        return float(np.sqrt(np.mean(sq_residuals)))
+
+    rng = np.random.default_rng(7)
+    for _ in range(50):
+        n = int(rng.integers(20, 400))
+        scale = int(rng.integers(4, max(5, n // 3)))
+        profile = np.cumsum(rng.normal(0, 1, n))
+        expected = naive_fluctuation(profile, scale)
+        actual = _hurst_dfa_fluctuation(profile, scale)
+        if np.isnan(expected):
+            assert np.isnan(actual)
+            continue
+        assert actual == pytest.approx(expected, rel=1e-9)
