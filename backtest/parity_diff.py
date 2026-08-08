@@ -179,6 +179,22 @@ class ParityConfig:
     # the Backtester so it applies the SAME per-state sign gate the live daemon
     # does — a state whose config contradicts the certified sign resolves to base.
     regime_directional_certified_states: Optional[dict] = None
+    # #1411: the resolved hurst_gate block (None = off). When set, the parity
+    # frame carries the per-bar H, hysteresis state, hold flag and applied size
+    # multiplier so a live-vs-backtest disagreement on the GATE surfaces the
+    # same way a label disagreement already does.
+    hurst_gate: Optional[dict] = None
+    # #1411: the resolved regime ``windows`` spec, threaded here for ONE
+    # purpose — ``hurst_live_frame_bars``. The live OHLCV fetch depth takes the
+    # MAX period over every configured window (scheduler/regime_multi_window.go
+    # regimeOHLCVLimit), and the Backtester passes its own
+    # ``regime_windows_spec`` to the same helper. Computing the depth from
+    # ``regime_period`` alone would make this tool read H over a different
+    # frame length than the two engines it compares whenever any window period
+    # exceeds 95 (2*p-1+10 > 200), turning the Hurst columns into spurious
+    # disagreements. NOT used for the ADX regime series below, which stays on
+    # ``regime_period`` exactly as before.
+    regime_windows_spec: Optional[dict] = None
 
     def __post_init__(self):
         self.regime_directional_policy = _normalize_regime_directional_policy(
@@ -249,6 +265,12 @@ def config_from_live_config(config_path: str, strategy_id: str,
         invert_signal=bool(loaded.get("invert_signal")),
         regime_directional_policy=rdp,
         regime_directional_certified_states=rdp_cert_states,
+        # #1411: load_strategy_config already validated the block and rejected
+        # anything unbacktestable, so what it returns is safe to replay here.
+        hurst_gate=loaded.get("hurst_gate"),
+        # #1411: the same resolved spec the Backtester receives, so the Hurst
+        # frame depth here matches the engine's and the live daemon's.
+        regime_windows_spec=loaded.get("regime_windows_spec"),
     )
 
 
@@ -711,6 +733,30 @@ def compute_parity_frame(
     else:
         contexts, registry_fracs = [None] * len(df), [0.0] * len(df)
 
+    # #1411: replay the Hurst gate over the same bars. The DECISION series is
+    # the rolling estimate shifted one bar (a signal at bar N reads H through
+    # N-1), matching both the engine and the live gate's one-bar lag. The state
+    # machine is stepped on EVERY bar from the start of the frame — not only on
+    # compared bars — because hysteresis is path-dependent: sampling it at a
+    # stride would produce a state the engine never occupied.
+    hurst_series = None
+    hurst_states = None
+    if cfg.hurst_gate and cfg.hurst_gate.get("enabled"):
+        from hurst_gate import HurstGate, hurst_live_frame_bars, rolling_hurst
+
+        # The depth MUST be the max period over every configured window, not
+        # just regime_period — that is what the live daemon fetches and what
+        # the Backtester passes to this same helper.
+        frame_bars = hurst_live_frame_bars(
+            cfg.regime_windows_spec, cfg.regime_period
+        )
+        hurst_series = rolling_hurst(df["close"], frame_bars).shift(1)
+        runner = HurstGate(cfg.hurst_gate)
+        hurst_states = []
+        for j in range(len(df)):
+            blocked, mult = runner.step(hurst_series.iloc[j], True)
+            hurst_states.append((runner.state, bool(blocked), float(mult)))
+
     start = (window - 1) if window is not None else (LIVE_MIN_CANDLES - 1)
     rows = []
     for i in range(start, len(df), stride):
@@ -754,6 +800,13 @@ def compute_parity_frame(
             row["bt_regime"] = str(regime_full.iloc[i])
             row["live_regime"] = str(live["regime"])
             match = match and row["bt_regime"] == row["live_regime"]
+        if hurst_states is not None:
+            h = hurst_series.iloc[i]
+            state, blocked, mult = hurst_states[i]
+            row["bt_hurst"] = None if pd.isna(h) else float(h)
+            row["bt_hurst_state"] = state or "unknown"
+            row["bt_hurst_holds"] = blocked
+            row["bt_hurst_size_mult"] = mult
         # Post-shift(1) inputs the engine reads at bar i — informational.
         if i > 0:
             row["backtest_effective_signal"] = int(bt["signal"].iloc[i - 1])
@@ -789,6 +842,15 @@ def extract_fills(df: pd.DataFrame, cfg: ParityConfig) -> list:
         regime_enabled=cfg.regime_enabled,
         regime_period=cfg.regime_period,
         regime_adx_threshold=cfg.regime_adx_threshold,
+        # #1411: the engine (run_backtest) hands the Backtester BOTH of these
+        # (run_backtest.py, the `regime_windows_spec=` / `hurst_gate=` kwargs).
+        # Omitting them here would make --fills report entries a hurst-gated
+        # engine holds, and would classify a composite config's regime by ADX
+        # — the opposite of what this tool exists to show. `hurst_gate` is None
+        # for every config that does not opt in, so the ungated baseline is
+        # byte-identical.
+        regime_windows_spec=cfg.regime_windows_spec,
+        hurst_gate=cfg.hurst_gate,
         direction=cfg.direction,
         invert_signal=cfg.invert_signal,
         regime_directional_policy=cfg.regime_directional_policy,
