@@ -3,14 +3,33 @@ package main
 // hurst_gate.go — #1411 per-strategy Hurst entry gate and persistence-scaled
 // position sizing. DEFAULT-OFF; per-strategy opt-in only; never auto-enabled.
 //
-// CALIBRATION STATUS. The #1410 study (backtest/research/hurst_gate_calibration.md)
-// returned Recommendation INCONCLUSIVE: 0 of 30 tested configurations reached
-// Benjamini-Hochberg significance at alpha=0.05, and the report states "Do not
-// build a Hurst entry gate on this evidence. Re-run this study before revisiting
-// the question." This mechanism therefore ships with NO recommended thresholds
-// anywhere (config.example.json carries no hurst_gate block) and stays off until
-// an operator explicitly opts a strategy in. Nothing here reads a default
-// threshold, and nothing enables itself.
+// CALIBRATION STATUS. The live evidence is the #1422 POWER study
+// (backtest/research/hurst_gate_calibration.md — the contract path, now owned by
+// hurst_1422_gate_power.py; the superseded #1410 render lives beside it at
+// hurst_1410_gate_calibration.md). Recommendation: INCONCLUSIVE again, on ~5x
+// #1410's trade pool, with a correct cluster null and a MEASURED detection limit.
+//
+// The reason is a MEASURED bound rather than an open question. On the primary
+// (confirmatory) cohort the design resolves 0.96 pp per trade, and that cohort's
+// own anti-signal split separates by 0.37 pp — under the limit, so an edge that
+// size is invisible here. The null therefore excludes an edge of 0.96 pp or
+// larger and says nothing either way about a smaller one; the binding constraint
+// is power, not an absent signal. Best primary hypothesis: cluster p=0.0485.
+//
+// The better-powered EXPLORATORY pools do resolve their separations and the
+// separations do not survive the cluster null (exploratory grid 0.99 pp against
+// a 0.42 pp limit, cluster p=0.4923; #1410's cells 1.04 pp against 0.38 pp,
+// cluster p=0.4583). That contrast is not pre-registered and licenses no gate,
+// but it is consistent with whole datasets moving together rather than with H
+// sorting trades within them.
+//
+// This mechanism therefore still ships with NO recommended thresholds anywhere
+// (config.example.json carries no hurst_gate block) and stays off until an
+// operator explicitly opts a strategy in. Nothing here reads a default threshold,
+// and nothing enables itself. #1422 also answers #1412's Stage 0 gate:
+// NO JOINT SEPARATION on both families, so fusing H into the composite
+// classifier is not justified and this standalone gate remains the correct
+// amount of Hurst.
 //
 // LAYERING. This is a STANDALONE gate stacked ON TOP of the allowed_regimes
 // label gate. It never touches applyRegimeGate, regimeBlocksOpen,
