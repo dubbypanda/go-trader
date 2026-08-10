@@ -294,9 +294,13 @@ When in doubt, treat as runtime default and prompt. **Full narrative** for older
 - **#1408** shared-wallet pool trade budgets — 2+ live HL/OKX perps may omit `capital`/`capital_pct`/`initial_capital` when every member sets positive `margin_per_trade_usd`; mixed pooled/allocated rejected. Allocated↔pool is flat-only + restart. See Adjustable Settings / ARCHITECTURE.md.
 - **#1344** `portfolio_risk.max_notional_usd` now holds new opens/adds/flips when over the cap without skipping the strategy cycle — closes, reductions, and SL/TP maintenance keep running (same shape as pause/daily-loss/exposure). Cap changes still require restart. See Adjustable Settings.
 - **#1394/#1400** live spot fills that overshoot virtual cash are always booked (venue already filled); the strategy latches `CashReconcileRequired`, CRITICAL-alerts, and blocks further live buys until you clear via `/go-trader-clear-cash-reconcile` after books match the venue. Closes still run. No config change.
+- **#1159** new opt-in per-strategy `hedge` block — auto-managed correlated HL perps leg on a different coin, qty-event mirrored from the primary via one per-cycle reconciler; hot-reloadable only while flat (blocked while either leg open). See Adjustable Settings.
+- **#1411** new opt-in per-strategy `hurst_gate` block — standalone Hurst entry gate (`mode=gate`) or persistence-scaled sizing (`mode=size`), layered on top of `allowed_regimes`; requires composite `regime.windows`. #1424 resolution study INCONCLUSIVE with validity gate failed — no recommended thresholds in `config.example.json`. Hot-reloadable always. Backtest via `--config` (keep `hurst_gate` in `run_backtest.py`'s `stop_keys` allowlist). See Adjustable Settings.
+- **#1416** ratchet tier tighten now cancel+replaces the resting SL same cycle (incl. scale-in add cycles that also clear a tier) — one-shot bypass of `trailing_stop_min_move_pct` debounce. No config change.
 
 **Internal / no ops impact** (recent — detail in history doc)
 - **#1128** HL adapter lazy `Exchange` init (fewer `/info` bursts on regime/OHLCV-only subprocesses); transient 429/rate-limit script failures WARN-only until 15 strikes or 75m sustained — then operator DM
+- **#1408 (display)** Discord category summaries drop the per-strategy Value column when shared-wallet pool budgeting is active (misleading under pool equity). PnL/% columns unchanged.
 
 **Opt-in field** (dormant until set — shape/detail in history doc)
 - HL stops: `trailing_stop_atr_mult`, `trailing_stop_atr_regime`, `stop_loss_margin_pct`, `margin_per_trade_usd`
@@ -304,6 +308,8 @@ When in doubt, treat as runtime default and prompt. **Full narrative** for older
 - Regime: `regime.enabled`, `allowed_regimes`, `regime.display_windows`, `regime_directional_policy`, `regime_window_divergence`, `regime_profile_allocation`
 - Manual: `type: manual` + `manual-open`/`manual-close` CLI; `user_defaults.manual` (legacy top-level `manual_defaults` migrates on load); shares coin with HL perps (#619)
 - Alerts: `discord.trade_alert_channels`, `notify_ratchet_triggers`, `circuit_breaker`
+- Hedge: `hedge` (`{enabled, symbol, side, ratio, margin_mode, leverage}` — HL perps only, phase 1; #1159)
+- Hurst gate: `hurst_gate` (`{enabled, mode, min, max, disarm_min, disarm_max, window_key, on_failure, size_floor}` — composite window required; #1411)
 - Open strategies: see registry / `go-trader init --list-json` (incl. hidden deprecated: `amd_ifvg`, `donchian_breakout`, `range_scalper`, `session_breakout`, `vol_momentum`)
 
 **Internal / no ops impact** — dashboard, Discord formatting, probe/shutdown hardening, backtest parity fixes, etc. → [`docs/POST_UPDATE_HISTORY.md`](docs/POST_UPDATE_HISTORY.md) § Internal
@@ -314,6 +320,7 @@ When in doubt, treat as runtime default and prompt. **Full narrative** for older
 - `invert_signal` toggle blocked while open
 - `regime_directional_policy` add/remove/shape change blocked while open (flatten first or restart after close)
 - `regime_window_divergence` add/remove/shape change blocked while open (flatten first)
+- `hedge` add/remove/shape change blocked while either the primary or hedge leg is open (#1159)
 
 ---
 
@@ -817,6 +824,8 @@ Per-strategy:
 | Sizing leverage | `sizing_leverage` | Perps — notional multiplier (`cash * sizing_leverage`); defaults to `leverage` (#497). |
 | Margin per trade | `margin_per_trade_usd` | Perps (opt-in) — `notional = min(margin_per_trade_usd, cash) × leverage`. Overrides `sizing_leverage`. SIGHUP-aware (#520). **#1408 shared-wallet pool mode** (2+ live HL/OKX perps, every member omits capital fields): notional = `min(cap, account equity − deployed wallet margin) × leverage`; entry/mark reservation; missing balance blocks opens not closes. |
 | Risk-per-trade sizing | `risk_per_trade_pct` | HL perps only, opt-in — `qty = (cash × pct/100) / stop_distance`, capped at `cash × exchange_leverage`. Bounds `(0, 10]`. Mutually exclusive with `sizing_leverage`/`margin_per_trade_usd`/`allow_scale_in`; requires a stop owner resolvable at sizing time (regime-resolved/unified-close owners rejected at load). Fail-closed: an unresolvable stop distance refuses the open rather than falling back to notional sizing. Hot-reload: value tweaks always apply, risk↔notional mode switch blocked while open. Backtestable via `Backtester(risk_per_trade_pct=…)`/`--config` (#1268). |
+| Correlated hedge leg | `hedge` | HL perps only (live+paper), opt-in — `{enabled, symbol, side:"inverse", ratio, margin_mode, leverage}` auto-manages a reduce-only leg on a different coin, qty-event mirrored from the primary via `runHedgeSync` (no independent SL/TP/close evaluator). Hedge coin must be nobody's primary and no other strategy's hedge coin. Hedge PnL excluded from primary loss streak. Fail-closed: hedge failure on a cycle that added primary exposure unwinds that increment + CRITICAL DM. Hot-reloadable only while flat; blocked while either leg open. Backtester rejects an enabled block (#1159). |
+| Hurst entry gate / sizing | `hurst_gate` | Opt-in — `{enabled, mode:"gate"\|"size", min, max, disarm_min, disarm_max, window_key, on_failure, size_floor}`. Standalone gate on top of `allowed_regimes` (label gate unchanged). `mode=gate` holds position-increasing signals while disarmed; `mode=size` scales computed open size by `clamp(\|H-0.5\|/0.15, size_floor, 1.0)` (never >1). Reads `metrics["hurst"]` from a composite regime window only (adx/missing rejected at load). `on_failure` inherits `regime.hurst_gate_on_failure` then `"open"`. Hot-reloadable always incl. while open. #1424 calibration INCONCLUSIVE — no shipped thresholds. Backtest via `--config` (#1411). |
 | Regime-gate failure policy | `regime_gate_on_failure` | `"open"` (default; legacy fail-open) or `"closed"` (holds fresh opens only — posQty>0 management and closes always pass — while the regime store can't produce a gate label: subprocess failure, sealed budget, missing window). Overrides global `regime.gate_on_failure`; empty inherits. Hot-reloadable always, incl. while open. `closed` + `allowed_regimes` + `regime.enabled=false` rejected at load (permanent block) (#1278). |
 | ATR smoothing method (override) | `atr_method` | Per-strategy override of the global `atr_method` (`"simple"`\|`"wilder"`; empty inherits). Same scope as the global default (`standard_atr` surface only). Rejected on `type=options`. Hot-reload blocked while open (#1277). |
 | Margin mode | `margin_mode` | HL perps, `isolated` (default) or `cross`. Applied from flat. |
