@@ -3,33 +3,48 @@ package main
 // hurst_gate.go — #1411 per-strategy Hurst entry gate and persistence-scaled
 // position sizing. DEFAULT-OFF; per-strategy opt-in only; never auto-enabled.
 //
-// CALIBRATION STATUS. The live evidence is the #1422 POWER study
+// CALIBRATION STATUS. The live evidence is the #1424 RESOLUTION study
 // (backtest/research/hurst_gate_calibration.md — the contract path, now owned by
-// hurst_1422_gate_power.py; the superseded #1410 render lives beside it at
-// hurst_1410_gate_calibration.md). Recommendation: INCONCLUSIVE again, on ~5x
-// #1410's trade pool, with a correct cluster null and a MEASURED detection limit.
+// hurst_1424_gate_resolution.py; the superseded #1422 and #1410 renders live
+// beside it at hurst_1422_gate_power.md and hurst_1410_gate_calibration.md, and
+// neither of those scripts may write the contract path any more).
+// Recommendation: INCONCLUSIVE, and the study's own VALIDITY GATE FAILED.
 //
-// The reason is a MEASURED bound rather than an open question. On the primary
-// (confirmatory) cohort the design resolves 0.96 pp per trade, and that cohort's
-// own anti-signal split separates by 0.37 pp — under the limit, so an edge that
-// size is invisible here. The null therefore excludes an edge of 0.96 pp or
-// larger and says nothing either way about a smaller one; the binding constraint
-// is power, not an absent signal. Best primary hypothesis: cluster p=0.0485.
+// #1424 attacked #1422's power shortfall three ways at once: ONE pre-registered
+// hypothesis instead of four (so the rank-1 Benjamini-Hochberg bar is alpha, not
+// alpha/4), eight added pre-2020 calendar clusters from two venues the binanceus
+// cache cannot reach (Bitstamp and Coinbase Exchange, 2013-2020H1), and a
+// bounded-variance primary target (signed efficiency over a fixed 96-hour
+// horizon). Pool: 860 legs, 26 datasets, 16 windows, ~29.0k primary-cohort rows.
 //
-// The better-powered EXPLORATORY pools do resolve their separations and the
-// separations do not survive the cluster null (exploratory grid 0.99 pp against
-// a 0.42 pp limit, cluster p=0.4923; #1410's cells 1.04 pp against 0.38 pp,
-// cluster p=0.4583). That contrast is not pre-registered and licenses no gate,
-// but it is consistent with whole datasets moving together rather than with H
-// sorting trades within them.
+// The gate is read ROW-MATCHED and DIRECTIONALLY on the CONFIRMATORY family
+// (momentum, 7,992 rows — the family the single pre-registered hypothesis
+// belongs to). Those rows resolve 0.013 efficiency units and 0.94 pp of net
+// return, and they separate by -0.005 and -0.12 pp. The sign is the finding:
+// every null and injection here is one-sided on mean(kept) - mean(suppressed),
+// so a NEGATIVE separation means the trades this gate would have SUPPRESSED did
+// BETTER, which is the direction the design cannot detect at any magnitude. The
+// run therefore carries no bound on the confirmatory family in either
+// direction. It is NOT evidence that no edge exists, and it is not the null the
+// key risk described; the pre-registered key-risk prediction is UNRESOLVED.
+// (The POOLED primary limit is 0.008 over both families' 28,998 rows. It is
+// printed in the report but the gate must never read it: a larger pool resolves
+// a smaller effect, so pairing it with one family's separation compares two
+// samples and biases the gate toward passing.)
+//
+// The pinned hypothesis (momentum/gate/W512/arm0.52/dis0.48) reached cluster
+// p=0.3557 on the primary target and p=0.3387 on net return. #1422's disclosed
+// interim look on a SUBSET of these rows read p=0.0485; it did not reproduce on
+// the superset.
 //
 // This mechanism therefore still ships with NO recommended thresholds anywhere
 // (config.example.json carries no hurst_gate block) and stays off until an
 // operator explicitly opts a strategy in. Nothing here reads a default threshold,
-// and nothing enables itself. #1422 also answers #1412's Stage 0 gate:
-// NO JOINT SEPARATION on both families, so fusing H into the composite
-// classifier is not justified and this standalone gate remains the correct
-// amount of Hurst.
+// and nothing enables itself. #1424 re-answers #1412's Stage 0 gate on a larger
+// pool: NO JOINT SEPARATION on both families (cluster p=0.9696 momentum, 0.7061
+// mean_reversion, against a Bonferroni bar of 0.025), so fusing H into the
+// composite classifier is not justified and this standalone gate remains the
+// correct amount of Hurst.
 //
 // LAYERING. This is a STANDALONE gate stacked ON TOP of the allowed_regimes
 // label gate. It never touches applyRegimeGate, regimeBlocksOpen,
