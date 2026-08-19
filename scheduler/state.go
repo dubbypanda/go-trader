@@ -23,6 +23,20 @@ const maxTradeHistory = 1000
 // instead of keeping them global.
 var tradeRecorder func(strategyID string, trade Trade) error
 
+// suspendEagerTradePersist disables the #289 eager InsertTrade hook until the
+// returned restore function runs. RecordTrade still appends to TradeHistory
+// with persisted=false, so the next SaveStateWithDB inserts those rows in the
+// SAME transaction as positions and replay_mirror_watermark. The paper replay
+// mirror uses this so a kill during that save cannot leave a committed trade
+// row while rolling back the watermark — which would re-apply and duplicate
+// the trade (#1435 review). Same test caveat as tradeRecorder: not safe under
+// t.Parallel().
+func suspendEagerTradePersist() func() {
+	prev := tradeRecorder
+	tradeRecorder = nil
+	return func() { tradeRecorder = prev }
+}
+
 // tradePersistWarn is the operator-visible warning hook for RecordTrade failures
 // (#289 observability follow-up). main.go sets this after MultiNotifier is
 // constructed to route warnings to owner DM. When nil, RecordTrade falls back
@@ -132,6 +146,12 @@ type StrategyState struct {
 	// ClosedOptionPositions mirrors ClosedPositions for option-position
 	// lifecycle tracking; flushed to closed_option_positions table. (#288)
 	ClosedOptionPositions []ClosedOptionPosition `json:"-"`
+	// pendingTradeDiagnostics is the deferred #1147 identity-insert buffer.
+	// captureTradeDiagnostics appends here when eager persist is suspended
+	// (paper replay apply); SaveState / SaveStrategyBook insert the rows in
+	// the same transaction as the close and then enqueue the metrics worker.
+	// Cleared only after a successful commit. (#1435)
+	pendingTradeDiagnostics []TradeDiagnosticsRow `json:"-"`
 
 	// SharedWalletValue is the exchange-authoritative display value for this
 	// strategy when it is a member of a shared on-exchange wallet (#918). It is
@@ -170,6 +190,17 @@ type StrategyState struct {
 	// buys routinely end fee-negative (cash=-fee), and perps/futures can go
 	// negative from leveraged PnL.
 	CashReconcileRequired bool `json:"cash_reconcile_required,omitempty"`
+
+	// ReplayMirrorWatermark is the #1431 paper mirror's durable cursor: the
+	// highest decision-log row ID whose state mutation has been persisted to
+	// THIS strategy's book. Persisted (strategies.replay_mirror_watermark)
+	// inside the same SaveState transaction as the book mutation itself, so a
+	// crash between the save and the shared log's MarkDecisionsApplied can
+	// never re-apply a row on restart — the mirror skips rows <= the
+	// watermark and only re-marks them in the log. Complements the in-memory
+	// replayMirrorProgress high-water, which covers the same gap within one
+	// process lifetime.
+	ReplayMirrorWatermark int64 `json:"replay_mirror_watermark,omitempty"`
 }
 
 func NewStrategyState(cfg StrategyConfig) *StrategyState {
@@ -580,4 +611,14 @@ func LoadStateWithDB(cfg *Config, sdb *StateDB) (*AppState, error) {
 // SaveStateWithDB saves state to SQLite.
 func SaveStateWithDB(state *AppState, cfg *Config, sdb *StateDB) error {
 	return sdb.SaveState(state)
+}
+
+// SaveStrategyBookWithDB persists ONE strategy's book (strategy row including
+// replay_mirror_watermark, live positions DELETE-then-INSERT, option
+// positions, unpersisted trades, closed-position buffers, and deferred
+// diagnostics) without rewriting the rest of the fleet. The paper replay
+// mirror uses this so the cost of persisting one replayed decision does
+// not grow with unrelated strategies.
+func SaveStrategyBookWithDB(s *StrategyState, sdb *StateDB) error {
+	return sdb.SaveStrategyBook(s)
 }
