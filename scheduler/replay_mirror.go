@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // replay_mirror.go — #1431 paper side of the live decision replay log.
@@ -54,6 +55,103 @@ func replayMirrorSetLastApplied(strategyID string, id int64) {
 	}
 }
 
+// #1436 — book-drift kinds that DM the owner. Fragments are the throttle-key
+// suffix and must stay exact: a rename would split the (strategy, kind) slot
+// and re-fire inside the current window. Close-while-flat is INFO and is
+// deliberately not a kind.
+const (
+	replayDriftKindOpenWhileHolding       = "open-while-holding"
+	replayDriftKindScaleInWhileMismatched = "scale-in-while-mismatched"
+	replayDriftKindPartialCloseWhileFlat  = "partial-close-while-flat"
+)
+
+type replayDriftKey struct {
+	strategyID string
+	kind       string
+}
+
+type replayDriftSlot struct {
+	lastNotifiedAt time.Time
+}
+
+// replayDriftTracker is the process-lifetime, once-per-window throttle for
+// paper book-drift DMs. Key is (strategy_id, kind). Restart clears the map
+// (same lifetime as LiveExecFailureThrottle) so the first post-restart drift
+// always notifies. Do NOT route through shouldNotifyDrainFailure — that
+// helper also re-alerts on every 10th event and would violate the
+// once-per-window rule.
+type replayDriftTracker struct {
+	mu      sync.Mutex
+	entries map[replayDriftKey]*replayDriftSlot
+}
+
+var replayDriftAlerts = &replayDriftTracker{}
+
+// replayDriftWarn is the operator-visible warning hook for throttled paper
+// book-drift skips (owner DM), mirroring decisionLogPersistWarn. When nil
+// (tests, subcommands), apply still consumes the row; nothing is sent.
+// Test caveat: tests that swap this hook must NOT use t.Parallel().
+var replayDriftWarn func(msg string)
+
+// Record reports whether this drift should notify. Fires when the slot is
+// empty or now.Sub(lastNotifiedAt) >= effectiveAlertThrottleInterval()
+// (config alert_throttle_interval, empty → 6h). Stamps lastNotifiedAt under
+// mu when it decides to notify, before the caller sends.
+func (t *replayDriftTracker) Record(strategyID, kind string, now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.entries == nil {
+		t.entries = make(map[replayDriftKey]*replayDriftSlot)
+	}
+	k := replayDriftKey{strategyID: strategyID, kind: kind}
+	e := t.entries[k]
+	if e == nil {
+		e = &replayDriftSlot{}
+		t.entries[k] = e
+	}
+	if e.lastNotifiedAt.IsZero() || now.Sub(e.lastNotifiedAt) >= effectiveAlertThrottleInterval() {
+		e.lastNotifiedAt = now
+		return true
+	}
+	return false
+}
+
+func (t *replayDriftTracker) reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.entries = make(map[replayDriftKey]*replayDriftSlot)
+}
+
+// sendReplayDriftWarns delivers already-throttled DM texts through the nil-safe
+// hook. Call AFTER mu.Unlock() — never from applyReplayedLiveDecisions.
+func sendReplayDriftWarns(msgs []string) {
+	if replayDriftWarn == nil {
+		return
+	}
+	for _, msg := range msgs {
+		if msg != "" {
+			replayDriftWarn(msg)
+		}
+	}
+}
+
+func replayDriftMaybeNotify(strategyID, kind, msg string, now time.Time) string {
+	if !replayDriftAlerts.Record(strategyID, kind, now) {
+		return ""
+	}
+	return msg
+}
+
+func formatReplayDriftDM(strategyID, kind, detail string) string {
+	return fmt.Sprintf("paper replay drift [%s] %s: %s — skipping (audit the live/paper pair) (#1436)", strategyID, kind, detail)
+}
+
+func appendReplayDriftDM(dst *[]string, strategyID, kind, detail string, now time.Time) {
+	if msg := replayDriftMaybeNotify(strategyID, kind, formatReplayDriftDM(strategyID, kind, detail), now); msg != "" {
+		*dst = append(*dst, msg)
+	}
+}
+
 // applyReplayedLiveDecisions books every pending live decision for a mirrored
 // paper strategy against its virtual state. MUST be called under mu.Lock (it
 // mutates positions/cash/trades). price is paper's current mark from this
@@ -63,11 +161,13 @@ func replayMirrorSetLastApplied(strategyID string, id int64) {
 // Rows are applied strictly in decision_id order. Every visited row is
 // returned in appliedIDs (drift skips included — a row the mirror cannot
 // apply, e.g. an open while paper is already holding, is an operator-visible
-// WARN, not a retry loop: leaving it pending would wedge every later row
-// behind it). Live downtime needs no special-casing: a gap simply produces
-// no rows and paper holds its last replayed state until the next decision
-// appears (resume policy (c) from the issue).
-func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []ReplayDecision, price float64, result *HyperliquidResult, cfg *Config, logger *StrategyLogger) (appliedIDs []int64, trades int, details []string) {
+// WARN plus a throttled owner DM, not a retry loop: leaving it pending would
+// wedge every later row behind it). Book-drift DMs (the three WARN skip
+// kinds) are returned in driftDMs already throttled; the caller sends them
+// AFTER mu.Unlock(). Live downtime needs no special-casing: a gap simply
+// produces no rows and paper holds its last replayed state until the next
+// decision appears (resume policy (c) from the issue).
+func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []ReplayDecision, price float64, result *HyperliquidResult, cfg *Config, logger *StrategyLogger) (appliedIDs []int64, trades int, details []string, driftDMs []string) {
 	// Replay bookings must not eager-InsertTrade. recordPositionOpen /
 	// bookPerpsClose / bookPerpsPartialCloseWithFillFee all call RecordTrade,
 	// which otherwise commits a trades row immediately. A kill during the
@@ -97,6 +197,7 @@ func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []R
 			lastApplied = id
 		}
 	}
+	now := time.Now()
 	for _, row := range pending {
 		if row.DecisionID <= lastApplied {
 			// Already applied to the persisted book (watermark) or earlier this
@@ -110,6 +211,8 @@ func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []R
 			if pos := s.Positions[row.Symbol]; pos != nil && pos.Quantity > 0 {
 				logger.Warn("Replay mirror: live opened %s %s %.6f @ $%.4f but paper already holds qty=%.6f — skipping open (drift; audit the live/paper pair) (#1431)",
 					row.Side, row.Symbol, row.Quantity, row.ReferencePrice, pos.Quantity)
+				appendReplayDriftDM(&driftDMs, sc.ID, replayDriftKindOpenWhileHolding,
+					fmt.Sprintf("live opened %s %s %.6f @ $%.4f but paper already holds qty=%.6f", row.Side, row.Symbol, row.Quantity, row.ReferencePrice, pos.Quantity), now)
 				markApplied(row.DecisionID)
 				continue
 			}
@@ -130,6 +233,8 @@ func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []R
 				}
 				logger.Warn("Replay mirror: live scaled in %s %s +%.6f @ $%.4f but paper holds %s qty=%.6f — skipping add (drift; audit the live/paper pair) (#1431)",
 					row.Side, row.Symbol, row.Quantity, row.ReferencePrice, heldSide, heldQty)
+				appendReplayDriftDM(&driftDMs, sc.ID, replayDriftKindScaleInWhileMismatched,
+					fmt.Sprintf("live scaled in %s %s +%.6f @ $%.4f but paper holds %s qty=%.6f", row.Side, row.Symbol, row.Quantity, row.ReferencePrice, heldSide, heldQty), now)
 				markApplied(row.DecisionID)
 				continue
 			}
@@ -152,6 +257,8 @@ func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []R
 			if pos == nil || pos.Quantity <= 0 {
 				logger.Warn("Replay mirror: live partially closed %s %.6f but paper is flat — skipping (drift; audit the live/paper pair) (#1431)",
 					row.Symbol, row.Quantity)
+				appendReplayDriftDM(&driftDMs, sc.ID, replayDriftKindPartialCloseWhileFlat,
+					fmt.Sprintf("live partially closed %s %.6f but paper is flat", row.Symbol, row.Quantity), now)
 				markApplied(row.DecisionID)
 				continue
 			}
@@ -191,7 +298,7 @@ func applyReplayedLiveDecisions(sc StrategyConfig, s *StrategyState, pending []R
 		// BEFORE the shared log's MarkDecisionsApplied runs.
 		s.ReplayMirrorWatermark = lastApplied
 	}
-	return appliedIDs, trades, details
+	return appliedIDs, trades, details, driftDMs
 }
 
 // replayBookOpen books a replayed live open against the flat paper book:
