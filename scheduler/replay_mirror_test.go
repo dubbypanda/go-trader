@@ -21,10 +21,12 @@ func replayMirrorTestSetup(t *testing.T, id string) (StrategyConfig, *StrategySt
 	replayMirrorProgress.Lock()
 	replayMirrorProgress.last = map[string]int64{}
 	replayMirrorProgress.Unlock()
+	replayDriftAlerts.reset()
 	t.Cleanup(func() {
 		replayMirrorProgress.Lock()
 		replayMirrorProgress.last = map[string]int64{}
 		replayMirrorProgress.Unlock()
+		replayDriftAlerts.reset()
 	})
 	return sc, s, logger
 }
@@ -41,7 +43,7 @@ func TestMirrorReplayOpenBooksLiveFill(t *testing.T) {
 		{DecisionID: 7, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: decidedAt, Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1908.25},
 	}
 
-	applied, trades, details := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), cfg, logger)
+	applied, trades, details, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), cfg, logger)
 	if trades != 1 || len(applied) != 1 || applied[0] != 7 {
 		t.Fatalf("trades=%d applied=%v, want 1 trade, [7]", trades, applied)
 	}
@@ -74,7 +76,7 @@ func TestMirrorReplayShortOpen(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "short", Quantity: 0.25, ReferencePrice: 1900},
 	}
-	_, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger)
+	_, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger)
 	if trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
@@ -90,7 +92,7 @@ func TestMirrorReplayFullCloseBooksMirrorReason(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 3, StrategyID: sc.ID, DecisionType: ReplayDecisionFullClose, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900.5, CloseReason: "hl_sync_stop_loss"},
 	}
-	applied, trades, details := applyReplayedLiveDecisions(sc, s, pending, 1902.0, replayTestResult(), &Config{}, logger)
+	applied, trades, details, _ := applyReplayedLiveDecisions(sc, s, pending, 1902.0, replayTestResult(), &Config{}, logger)
 	if trades != 1 || len(applied) != 1 {
 		t.Fatalf("trades=%d applied=%v", trades, applied)
 	}
@@ -118,7 +120,7 @@ func TestMirrorReplayFullCloseWhenAlreadyFlat(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 9, StrategyID: sc.ID, DecisionType: ReplayDecisionFullClose, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900, CloseReason: "signal"},
 	}
-	applied, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger)
+	applied, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger)
 	if trades != 0 || len(applied) != 1 || applied[0] != 9 {
 		t.Fatalf("trades=%d applied=%v, want 0 trades and the row consumed", trades, applied)
 	}
@@ -130,7 +132,7 @@ func TestMirrorReplayScaleInBlends(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 4, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1920},
 	}
-	_, trades, details := applyReplayedLiveDecisions(sc, s, pending, 1920.0, replayTestResult(), &Config{}, logger)
+	_, trades, details, _ := applyReplayedLiveDecisions(sc, s, pending, 1920.0, replayTestResult(), &Config{}, logger)
 	if trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
@@ -149,7 +151,7 @@ func TestMirrorReplayPartialCloseReduces(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 5, StrategyID: sc.ID, DecisionType: ReplayDecisionPartialClose, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.4, ReferencePrice: 1912, CloseReason: "tiered_tp"},
 	}
-	_, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1911.0, replayTestResult(), &Config{}, logger)
+	_, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1911.0, replayTestResult(), &Config{}, logger)
 	if trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
@@ -171,7 +173,7 @@ func TestMirrorReplayDriftSkipsWithoutWedging(t *testing.T) {
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1908},
 		{DecisionID: 2, StrategyID: sc.ID, DecisionType: ReplayDecisionFullClose, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1905, CloseReason: "signal"},
 	}
-	applied, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1905.0, replayTestResult(), &Config{}, logger)
+	applied, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1905.0, replayTestResult(), &Config{}, logger)
 	if len(applied) != 2 {
 		t.Fatalf("applied = %v, want both rows consumed", applied)
 	}
@@ -189,14 +191,14 @@ func TestMirrorReplayHighWaterPreventsDoubleApply(t *testing.T) {
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 		{DecisionID: 2, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1910},
 	}
-	applied, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger)
+	applied, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger)
 	if trades != 2 || len(applied) != 2 {
 		t.Fatalf("first pass trades=%d applied=%v, want 2/2", trades, applied)
 	}
 	// Simulate a MarkDecisionsApplied failure: the same rows come back next
 	// cycle. The in-memory high-water must re-mark WITHOUT re-applying — a
 	// repeated scale_in would double the book.
-	applied, trades, _ = applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger)
+	applied, trades, _, _ = applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger)
 	if trades != 0 {
 		t.Fatalf("second pass re-applied %d trades — double-apply protection failed", trades)
 	}
@@ -287,7 +289,7 @@ func TestMirrorReplayPersistedWatermarkSurvivesRestart(t *testing.T) {
 		{DecisionID: 2, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1910},
 		{DecisionID: 3, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1920},
 	}
-	applied, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1920.0, replayTestResult(), &Config{}, logger)
+	applied, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1920.0, replayTestResult(), &Config{}, logger)
 	if trades != 1 {
 		t.Fatalf("trades = %d, want 1 (only row 3 re-applied)", trades)
 	}
@@ -307,7 +309,7 @@ func TestMirrorReplayWatermarkAdvancesOnApply(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 7, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
 	if s.ReplayMirrorWatermark != 7 {
@@ -324,7 +326,7 @@ func TestMirrorReplayOpenSeedsLiveStamps(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900, EntryATR: 42.5, Regime: "trending_up"},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, result, &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, result, &Config{}, logger); trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
 	pos := s.Positions["ETH"]
@@ -345,7 +347,7 @@ func TestMirrorReplayOpenFallsBackToPaperStamps(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, result, &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, result, &Config{}, logger); trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
 	if pos := s.Positions["ETH"]; pos.EntryATR != 33.0 {
@@ -400,7 +402,7 @@ func TestMirrorReplaySuspendsEagerTradePersist(t *testing.T) {
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 		{DecisionID: 2, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1910},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger); trades != 2 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger); trades != 2 {
 		t.Fatalf("trades = %d, want 2", trades)
 	}
 	if inserts != 0 {
@@ -436,7 +438,7 @@ func TestMirrorReplayKillDuringSaveDoesNotDuplicateTrades(t *testing.T) {
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 		{DecisionID: 2, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1910},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger); trades != 2 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1910.0, replayTestResult(), &Config{}, logger); trades != 2 {
 		t.Fatalf("first apply trades = %d, want 2", trades)
 	}
 	_, n, err := sdb.QueryTradeHistory(sc.ID, "", time.Time{}, time.Time{}, 100, 0)
@@ -449,7 +451,7 @@ func TestMirrorReplayKillDuringSaveDoesNotDuplicateTrades(t *testing.T) {
 
 	// Kill: in-memory high-water and watermark are gone; pending rows return.
 	sc2, s2, logger2 := replayMirrorTestSetup(t, "hl-paper-eth")
-	if _, trades, _ := applyReplayedLiveDecisions(sc2, s2, pending, 1910.0, replayTestResult(), &Config{}, logger2); trades != 2 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc2, s2, pending, 1910.0, replayTestResult(), &Config{}, logger2); trades != 2 {
 		t.Fatalf("restart re-apply trades = %d, want 2", trades)
 	}
 	state := NewAppState()
@@ -482,7 +484,7 @@ func TestMirrorReplayTradesFlushWithWatermarkSave(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 7, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
 	state := NewAppState()
@@ -551,7 +553,7 @@ func TestSaveStrategyBookDoesNotRewriteUnrelatedStrategies(t *testing.T) {
 	pending := []ReplayDecision{
 		{DecisionID: 7, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
 	if err := sdb.SaveStrategyBook(s); err != nil {
@@ -611,7 +613,7 @@ func TestMirrorReplayFullCloseDefersDiagnosticsUntilSave(t *testing.T) {
 	}
 
 	// Aborted attempt 1: apply, no save (kill during SaveStrategyBook).
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, pending, 1902.0, replayTestResult(), &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, pending, 1902.0, replayTestResult(), &Config{}, logger); trades != 1 {
 		t.Fatalf("first apply trades = %d, want 1", trades)
 	}
 	if inserts != 0 {
@@ -638,7 +640,7 @@ func TestMirrorReplayFullCloseDefersDiagnosticsUntilSave(t *testing.T) {
 		Symbol: "ETH", Quantity: 0.5, InitialQuantity: 0.5, AvgCost: 1900, Side: "long", Multiplier: 1,
 		TradePositionID: "pos-replay-eth", OpenedAt: time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC),
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc2, s2, pending, 1902.0, replayTestResult(), &Config{}, logger2); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc2, s2, pending, 1902.0, replayTestResult(), &Config{}, logger2); trades != 1 {
 		t.Fatalf("second apply trades = %d, want 1", trades)
 	}
 	rows, err = sdb.TradeDiagnosticsRows(sc.ID)
@@ -679,7 +681,7 @@ func TestMirrorReplayFullCloseDefersDiagnosticsUntilSave(t *testing.T) {
 	if s3 == nil {
 		t.Fatal("mirrored strategy missing after save")
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc3, s3, pending, 1902.0, replayTestResult(), &Config{}, logger3); trades != 0 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc3, s3, pending, 1902.0, replayTestResult(), &Config{}, logger3); trades != 0 {
 		t.Fatalf("watermark skip re-applied %d trades", trades)
 	}
 	if err := sdb.SaveStrategyBook(s3); err != nil {
@@ -708,7 +710,7 @@ func TestSaveStrategyBookReplacesOpenPositionAcrossCycles(t *testing.T) {
 	open := []ReplayDecision{
 		{DecisionID: 1, StrategyID: sc.ID, DecisionType: ReplayDecisionOpen, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1900},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, open, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, open, 1900.0, replayTestResult(), &Config{}, logger); trades != 1 {
 		t.Fatalf("open trades = %d, want 1", trades)
 	}
 	if err := sdb.SaveStrategyBook(s); err != nil {
@@ -718,7 +720,7 @@ func TestSaveStrategyBookReplacesOpenPositionAcrossCycles(t *testing.T) {
 	add := []ReplayDecision{
 		{DecisionID: 2, StrategyID: sc.ID, DecisionType: ReplayDecisionScaleIn, DecidedAt: time.Now().UTC(), Symbol: "ETH", Side: "long", Quantity: 0.5, ReferencePrice: 1910},
 	}
-	if _, trades, _ := applyReplayedLiveDecisions(sc, s, add, 1910.0, replayTestResult(), &Config{}, logger); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc, s, add, 1910.0, replayTestResult(), &Config{}, logger); trades != 1 {
 		t.Fatalf("scale-in trades = %d, want 1", trades)
 	}
 	if err := sdb.SaveStrategyBook(s); err != nil {
@@ -741,7 +743,7 @@ func TestSaveStrategyBookReplacesOpenPositionAcrossCycles(t *testing.T) {
 	}
 	sc2, s2, logger2 := replayMirrorTestSetup(t, "hl-paper-eth")
 	s2 = got
-	if _, trades, _ := applyReplayedLiveDecisions(sc2, s2, partial, 1911.0, replayTestResult(), &Config{}, logger2); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc2, s2, partial, 1911.0, replayTestResult(), &Config{}, logger2); trades != 1 {
 		t.Fatalf("partial-close trades = %d, want 1", trades)
 	}
 	if err := sdb.SaveStrategyBook(s2); err != nil {
@@ -761,7 +763,7 @@ func TestSaveStrategyBookReplacesOpenPositionAcrossCycles(t *testing.T) {
 	}
 	sc3, s3, logger3 := replayMirrorTestSetup(t, "hl-paper-eth")
 	s3 = got
-	if _, trades, _ := applyReplayedLiveDecisions(sc3, s3, full, 1905.0, replayTestResult(), &Config{}, logger3); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc3, s3, full, 1905.0, replayTestResult(), &Config{}, logger3); trades != 1 {
 		t.Fatalf("full-close trades = %d, want 1", trades)
 	}
 	if err := sdb.SaveStrategyBook(s3); err != nil {
@@ -788,7 +790,7 @@ func TestSaveStrategyBookReplacesOpenPositionAcrossCycles(t *testing.T) {
 	}
 	sc4, s4, logger4 := replayMirrorTestSetup(t, "hl-paper-eth")
 	s4 = got
-	if _, trades, _ := applyReplayedLiveDecisions(sc4, s4, reopen, 1920.0, replayTestResult(), &Config{}, logger4); trades != 1 {
+	if _, trades, _, _ := applyReplayedLiveDecisions(sc4, s4, reopen, 1920.0, replayTestResult(), &Config{}, logger4); trades != 1 {
 		t.Fatalf("reopen trades = %d, want 1", trades)
 	}
 	if err := sdb.SaveStrategyBook(s4); err != nil {

@@ -547,6 +547,13 @@ func main() {
 		decisionLogPersistWarn = func(msg string) {
 			notifier.SendOwnerDM("[replay] " + msg)
 		}
+		// #1436: paper book-drift skips (open-while-holding /
+		// scale-in-while-mismatched / partial-close-while-flat) to the
+		// owner DM. Apply returns already-throttled texts; the send runs
+		// after mu.Unlock() so the Discord HTTP call is outside the lock.
+		replayDriftWarn = func(msg string) {
+			notifier.SendOwnerDM("[replay] " + msg)
+		}
 		// #343: Forward baseline-guard warnings (a SaveState caller tried to
 		// rewrite initial_capital) to the owner DM. Dedup is handled inside
 		// SaveState — this only fires once per strategy per process lifetime.
@@ -2885,7 +2892,7 @@ func main() {
 									logger.Error("Replay mirror: failed to read decision log: %v — holding last replayed state (#1431)", perr)
 								case len(pending) > 0:
 									mu.Lock()
-									appliedIDs, replayTrades, replayDetails := applyReplayedLiveDecisions(sc, stratState, pending, price, result, cfg, logger)
+									appliedIDs, replayTrades, replayDetails, driftDMs := applyReplayedLiveDecisions(sc, stratState, pending, price, result, cfg, logger)
 									// Crash-atomicity (review finding): the applied
 									// book mutations + watermark + trade rows +
 									// deferred diagnostics must hit the state DB
@@ -2906,6 +2913,7 @@ func main() {
 										saveErr = SaveStrategyBookWithDB(stratState, stateDB)
 									}
 									mu.Unlock()
+									sendReplayDriftWarns(driftDMs)
 									if replayTrades > 0 {
 										trades += replayTrades
 										detail = mergeTradeDetails(detail, replayDetails...)
