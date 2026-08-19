@@ -18,8 +18,8 @@ import (
 const scriptFailureAlertThreshold = 3
 
 // scriptFailureTransientAlertThreshold is the consecutive transient-only failure
-// count before operator alert (#1128/#1432). Higher than scriptFailureAlertThreshold
-// so brief 429/5xx storms stay journald-only, while a sustained upstream error
+// count before operator alert (#1128/#1432/#1433). Higher than scriptFailureAlertThreshold
+// so brief 429/5xx/timeout storms stay journald-only, while a sustained upstream error
 // still surfaces the #829 dead-strategy signal.
 const scriptFailureTransientAlertThreshold = 15
 
@@ -29,17 +29,21 @@ const scriptFailureTransientAlertThreshold = 15
 // in the same window without waiting for 15 sparse cycles.
 const scriptFailureTransientAlertMaxDuration = 75 * time.Minute
 
-// scriptFailureTransientRE matches operator-visible upstream throttle and HTTP
-// 5xx errors. Deliberately excludes bare status numbers (prices, OIDs, counts)
-// and bare HTML tags (parser errors). 4xx other than 429 stays on the primary
-// tracker. status: 5xx (colon) is excluded, matching the existing 429 shape.
+// scriptFailureTransientRE matches operator-visible upstream throttle, HTTP 5xx,
+// and subprocess timeouts (`script timed out after`). Deliberately excludes bare
+// status numbers (prices, OIDs, counts), bare HTML tags (parser errors), Go
+// net/http timeout strings, and phase-budget cancellation. 4xx other than 429
+// stays on the primary tracker. status: 5xx (colon) is excluded, matching the
+// existing 429 shape.
 var scriptFailureTransientRE = regexp.MustCompile(
 	`(?i)(\(429[,\)]|(?:http|status)[\s_]?429|status_code[=:]\s*429|rate.?limit|error from cloudfront` +
 		`|\(5\d\d[,\)]|(?:http|status)[\s_]?5\d\d|status_code[=:]\s*5\d\d|bad.?gateway` +
+		`|script timed out after` +
 		`)`)
 
 // scriptFailureErrorIsTransient reports whether errMsg is a short-lived
-// upstream throttle or HTTP 5xx that should not count toward the 3-strike alert.
+// upstream throttle, HTTP 5xx, or subprocess timeout that should not count
+// toward the 3-strike alert.
 func scriptFailureErrorIsTransient(errMsg string) bool {
 	return scriptFailureTransientRE.MatchString(errMsg)
 }
@@ -118,8 +122,8 @@ func (t *ScriptFailureTracker) Clear(strategyID string) (bool, int) {
 // scriptFailureTracker is the package-level singleton; resets on restart.
 var scriptFailureTracker = &ScriptFailureTracker{}
 
-// scriptFailureTransientTracker counts consecutive throttle/5xx failures per
-// strategy; cleared on recovery alongside scriptFailureTracker.
+// scriptFailureTransientTracker counts consecutive throttle/5xx/timeout failures
+// per strategy; cleared on recovery alongside scriptFailureTracker.
 var scriptFailureTransientTracker = &ScriptFailureTracker{}
 
 // formatScriptFailureAlert builds the operator message for a failing signal
@@ -141,7 +145,9 @@ func formatScriptRecoveredAlert(sc StrategyConfig, priorCount int) string {
 }
 
 // formatScriptFailureTransientAlert builds the operator message when a strategy
-// has been failing with upstream throttle or HTTP 5xx errors long enough to escalate.
+// has been failing with upstream throttle, HTTP 5xx, or subprocess timeout
+// errors long enough to escalate. Wording stays "upstream error" so a hang is
+// not labeled a script bug.
 func formatScriptFailureTransientAlert(sc StrategyConfig, mode scriptFailureMode, errMsg string, count int) string {
 	return fmt.Sprintf("**SIGNAL SCRIPT FAILING (sustained upstream error)** [%s] %s %s (pid=%d, %s, %d consecutive transient failures): %s",
 		sc.ID, sc.Platform, sc.Script, os.Getpid(), scriptFailureModeLabel(mode), count, errMsg)
