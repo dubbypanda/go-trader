@@ -40,7 +40,7 @@
 - `version_probe.go`/`probe_cmd.go`/`exit_codes.go` — new runtime CLI flag → both probe argvs; `ExitProbeFailure=78`.
 - `trade_diagnostics*.go` (#1147) — EAGER insert in `recordClosedPosition`; MFE/MAE async outside `mu`; never write `llm_verdict`.
 - `agent_info.go` (#1051) — read-only dump; `--bootstrap-md`→`AGENTS.generated.md` (NEVER `AGENTS.md`).
-- `failure_alerts.go`/`script_failure_alerts.go` — wire notifier on new `run*Check`; primary at 3; **#1128** transient 429/5xx → WARN until 15 strikes or 75m.
+- `failure_alerts.go`/`script_failure_alerts.go` — wire notifier on new `run*Check`; primary at 3; **#1128** transient 429/5xx/timeout → WARN until 15 strikes or 75m.
 - `discord_commands.go`/`discord_mutating_commands.go`/… — new mutating cmd → `opsCommandNames`+`slashCommands()`+dispatch; `/clear-cash-reconcile` (#1400); `/closing-strategies` read-only.
 - `shared_wallet.go`/`shared_wallet_reconcile.go`/… (#918/#954/#921/#1408) — PRE-FEE `realized_pnl`; net via `tradeNetPnL*`; drift $0.01/2-cycle. **#1408 pool budgeting:** 2+ live HL/OKX perps omit capital fields + positive `margin_per_trade_usd` each; sizing from account equity − deployed margin; allocated↔pool flat-only/restart. **Mechanics → ARCHITECTURE.md.**
 - `cashflow_journal.go`/… (#1100-#1106) — HL total-drift LIVE; OKX/TopStep shadow; OUTSIDE `mu`.
