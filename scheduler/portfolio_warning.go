@@ -24,6 +24,16 @@ type PortfolioWarningMessageInputs struct {
 	PerpsMargin float64
 	Recent      []Trade
 	Now         time.Time
+	// EquityGuardArmed mirrors the equityAvailable && PeakValue > 0 condition
+	// the risk check evaluated for this cycle (#1449 review). It decides which
+	// signal owns the "distance to kill switch" label: with the guard armed
+	// the latch belongs to equity and margin is only distance-to-limit, but on
+	// the unarmed path (pooled wallet with no trustworthy balance, or a
+	// PeakValue == 0 cold start) margin is the arm that flattens the book. The
+	// warn band is reachable on that path, since portfolioWarnBandSignals
+	// reports marginInBand independently of equityInBand, so the message must
+	// be able to tell the two apart rather than always pointing at equity.
+	EquityGuardArmed bool
 }
 
 type portfolioWarningContributor struct {
@@ -69,18 +79,63 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 	b.WriteString(fmt.Sprintf("Kill switch: %.1f%% drawdown | Warn threshold: %.1f%% | In band since: %s (%s)\n",
 		maxDD, warnDD, entered.Format("2006-01-02 15:04 UTC"), formatWarningDuration(now.Sub(entered))))
 
-	b.WriteString(fmt.Sprintf("Current: equity=%.1f%% ($%.0f / peak $%.0f)", prs.CurrentDrawdownPct, in.TotalValue, prs.PeakValue))
+	if in.EquityGuardArmed {
+		// The substituted marker is load-bearing here: on an untrusted cycle
+		// CurrentDrawdownPct is the floored decision value, so the percentage
+		// and the two dollar figures on this line do not reconcile. Labeling
+		// it stops an operator reading the mismatch as corrupt data during
+		// exactly the incident a post-mortem would reconstruct.
+		note := ""
+		if prs.DrawdownReadingSubstituted {
+			note = "* (carried forward; balance substituted this cycle, does not reconcile with the figures below)"
+		}
+		b.WriteString(fmt.Sprintf("Current: equity=%.1f%%%s ($%.0f / peak $%.0f)", prs.CurrentDrawdownPct, note, in.TotalValue, prs.PeakValue))
+	} else {
+		b.WriteString("Current: equity=n/a (guard not armed: no trustworthy portfolio total this cycle)")
+	}
 	if in.PerpsMargin > 0 {
 		b.WriteString(fmt.Sprintf(" | perps margin=%.1f%% ($%.0f loss on $%.0f margin)", prs.CurrentMarginDrawdownPct, in.PerpsLoss, in.PerpsMargin))
 	}
 	b.WriteByte('\n')
 
-	b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% equity", positiveDistance(maxDD, prs.CurrentDrawdownPct)))
-	if in.PerpsMargin > 0 {
-		b.WriteString(fmt.Sprintf(" / %.1f%% margin", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+	// #1448/#1449 review: "distance to kill switch" must name whichever arm
+	// can actually latch THIS cycle, and the two arms are mutually exclusive.
+	// With the equity guard armed the latch belongs to equity, so margin is
+	// distance-to-margin-LIMIT only — calling that distance-to-kill-switch
+	// would tell an operator mid-incident that a flatten is imminent when it
+	// is not. With the guard unarmed the margin arm is the one that flattens
+	// the book, so the labels swap: pointing at a stale equity figure the
+	// check did not update this cycle would put the operator's eyes on the
+	// wrong number. The #292 per-strategy circuit breaker acts on margin on
+	// every path.
+	//
+	// #1449 review round 3: a deferred latch is the one case where the equity
+	// distance reads 0.0% without a flatten following. Printing the bare
+	// distance there would tell the operator the book is about to close when
+	// the check has deliberately held it back, so the deferral takes over the
+	// line and names its own deadline instead.
+	switch {
+	case in.EquityGuardArmed && !prs.UntrustedOverLimitSince.IsZero():
+		b.WriteString(fmt.Sprintf("Distance to kill switch: equity %.1f%% is already OVER the %.1f%% limit, but the total is untrusted — full-book latch DEFERRED, escalates %s unless a trusted measurement lands first",
+			prs.CurrentDrawdownPct, maxDD,
+			prs.UntrustedOverLimitSince.Add(untrustedEquityLatchDeferral).Format("2006-01-02 15:04 UTC")))
+		if in.PerpsMargin > 0 {
+			b.WriteString(fmt.Sprintf(" | perps margin %.1f%% from limit", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+		}
+		b.WriteString("\nPer-strategy circuit breakers (#292) remain the active protection while the latch is deferred.")
+	case in.EquityGuardArmed:
+		b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% equity", positiveDistance(maxDD, prs.CurrentDrawdownPct)))
+		if in.PerpsMargin > 0 {
+			b.WriteString(fmt.Sprintf(" | perps margin %.1f%% from limit", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+		}
+	case in.PerpsMargin > 0:
+		b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% perps margin (equity guard not armed, so margin owns the latch)",
+			positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+	default:
+		b.WriteString("Distance to kill switch: n/a (equity guard not armed and no perps margin deployed)")
 	}
 	b.WriteByte('\n')
-	b.WriteString(formatPortfolioWarningTrend(prs, in.PerpsMargin > 0))
+	b.WriteString(formatPortfolioWarningTrend(prs, in.EquityGuardArmed, in.PerpsMargin > 0))
 	b.WriteByte('\n')
 
 	if len(contribs) > 0 {
@@ -178,12 +233,19 @@ func portfolioWarningLead(contribs []portfolioWarningContributor) string {
 	return fmt.Sprintf("%s (dd=%.1f%%) is leading portfolio drawdown", contribs[0].ID, contribs[0].DrawdownPct)
 }
 
-func formatPortfolioWarningTrend(prs PortfolioRiskState, includeMargin bool) string {
+// formatPortfolioWarningTrend renders the per-cycle deltas. includeEquity is
+// the armed flag: the risk check forces WarningEquityDeltaPct to 0 when the
+// equity total is unavailable, so printing it there would show a reassuring
+// "+0.0%" for a signal that was never measured (#1449 review).
+func formatPortfolioWarningTrend(prs PortfolioRiskState, includeEquity, includeMargin bool) string {
 	eq := prs.WarningEquityDeltaPct
 	margin := prs.WarningMarginDeltaPct
 	trend := "STABLE"
-	primary := eq
-	if includeMargin && math.Abs(margin) >= math.Abs(eq) {
+	primary := 0.0
+	if includeEquity {
+		primary = eq
+	}
+	if includeMargin && math.Abs(margin) >= math.Abs(primary) {
 		primary = margin
 	}
 	if primary > 0.05 {
@@ -191,7 +253,12 @@ func formatPortfolioWarningTrend(prs PortfolioRiskState, includeMargin bool) str
 	} else if primary < -0.05 {
 		trend = "RECOVERING"
 	}
-	parts := []string{fmt.Sprintf("equity dd %s since last cycle", formatSignedPct(eq))}
+	var parts []string
+	if includeEquity {
+		parts = append(parts, fmt.Sprintf("equity dd %s since last cycle", formatSignedPct(eq)))
+	} else {
+		parts = append(parts, "equity dd n/a (guard not armed)")
+	}
 	if includeMargin {
 		parts = append(parts, fmt.Sprintf("margin dd %s", formatSignedPct(margin)))
 	}

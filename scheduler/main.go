@@ -1328,9 +1328,12 @@ func main() {
 			riskOpenSymbols := snapshotOpenSymbolsByStrategy(state)
 			totalNotional := PortfolioNotional(state.Strategies, prices)
 			// #296: aggregate perps margin drawdown inputs alongside the
-			// equity total so the portfolio kill switch can fire on a
-			// leveraged margin blow-up that would otherwise hide inside
-			// equity-only drawdown for all-perps accounts.
+			// equity total. These feed the portfolio margin WARNING, and the
+			// portfolio latch only on the paths where the equity guard cannot
+			// measure (pooled wallet without a trustworthy balance, or a cold
+			// start that has never recorded a positive valuation) — #1448.
+			// Per-position margin protection is the #292 per-strategy circuit
+			// breaker's job.
 			perpsLoss, perpsMargin := AggregatePerpsMarginInputs(state.Strategies, cfg.Strategies, prices)
 			// #1269: evaluate the portfolio-wide daily loss limit once per
 			// cycle (pure read — stale per-strategy days count as 0, matching
@@ -1408,8 +1411,17 @@ func main() {
 
 			origPeak := state.PortfolioRisk.PeakValue
 			prevWarningSent := state.PortfolioRisk.WarningSent
+			// #1449 review: pooledEquityComplete alone says the total EXISTS;
+			// it does not say the total is trustworthy. usedPVFallback (a
+			// failed shared-wallet balance fetch substituted by sum(member PV))
+			// and usedStaleRiskBalance (a one-generation-old cached balance)
+			// both leave it true while already being distrusted enough to roll
+			// the peak back below. Pass that distrust in so the risk check can
+			// freeze the ratchet and floor the drawdown itself, instead of the
+			// latch running off a number only the caller knows is substituted.
+			equityTrusted := pooledEquityComplete && !usedPVFallback && !usedStaleRiskBalance
 			portfolioAllowed, nb, portfolioWarning, portfolioReason := checkPortfolioRiskWithEquityAvailability(
-				&state.PortfolioRisk, cfg.PortfolioRisk, totalPV, totalNotional, perpsLoss, perpsMargin, pooledEquityComplete)
+				&state.PortfolioRisk, cfg.PortfolioRisk, totalPV, totalNotional, perpsLoss, perpsMargin, pooledEquityComplete, equityTrusted)
 			// True only on the cycle that first enters the warn band; false on
 			// repeat cycles while still in band. Used to gate kill-switch event
 			// log appends — notifications still fire every cycle via portfolioWarning.
@@ -1706,10 +1718,43 @@ func main() {
 			}
 
 			// Warning alert: drawdown approaching kill switch threshold.
+			//
+			// #1449 review: the band can now persist indefinitely (a margin
+			// reading above the limit no longer ends it by latching), so the
+			// send is throttled. Reset first, unconditionally, so a band that
+			// cleared — or that ended because the kill switch latched — re-arms
+			// and its next entry notifies on the first cycle.
+			if !portfolioWarning {
+				portfolioWarningAlertsReset()
+			}
 			if portfolioWarning && notifier.HasBackends() {
 				warnNow := time.Now().UTC()
+				mu.RLock()
+				warnEquityInBand, warnMarginInBand := portfolioWarnBandSignals(cfg.PortfolioRisk, &state.PortfolioRisk, pooledEquityComplete)
+				warnEquityDD := state.PortfolioRisk.CurrentDrawdownPct
+				warnMarginDD := state.PortfolioRisk.CurrentMarginDrawdownPct
+				// #1449 review round 3: non-zero means the equity arm measured
+				// OVER the limit on an untrusted total and the full-book latch
+				// is being held back (see untrustedEquityLatchDeferral).
+				warnLatchDeferredSince := state.PortfolioRisk.UntrustedOverLimitSince
+				mu.RUnlock()
+				notifyWarn, nextWarnAlerts := portfolioWarningShouldNotify(
+					portfolioWarningAlerts, warnEquityInBand, warnMarginInBand, warnEquityDD, warnMarginDD, warnNow)
+				portfolioWarningAlerts = nextWarnAlerts
+				// A deferred latch is an escalation, not a routine band cycle:
+				// the book is over the limit and the only thing holding the
+				// flatten back is a distrusted total. The throttle exists so a
+				// permanent warn band cannot spam the operator, but silence
+				// here would hide the one window in which a manual decision
+				// still changes the outcome. So it always sends.
+				if !warnLatchDeferredSince.IsZero() {
+					notifyWarn = true
+				}
+
+				// The recent-trade lookup only feeds the message body, so it is
+				// skipped on a throttled cycle along with the send.
 				var recentTrades []Trade
-				if stateDB != nil {
+				if notifyWarn && stateDB != nil {
 					if rows, err := stateDB.RecentTrades(warnNow.Add(-portfolioWarningRecentWindow), portfolioWarningMaxRows); err != nil {
 						fmt.Printf("[WARN] portfolio warning recent-trade lookup failed: %v\n", err)
 					} else {
@@ -1718,8 +1763,11 @@ func main() {
 				}
 				var warnMsg string
 				mu.Lock()
-				// Source mirrors CheckPortfolioRisk's tie-break: margin wins
-				// ties so the newer #296 signal is surfaced preferentially.
+				// The warn event names the LARGER of the two signals, so the
+				// audit row carries the headline number an operator would
+				// quote. This is a labeling choice for the warning band only:
+				// since #1448 the margin signal does not own the portfolio
+				// latch while the equity guard can measure.
 				source := "equity"
 				warnDD := state.PortfolioRisk.CurrentDrawdownPct
 				if state.PortfolioRisk.CurrentMarginDrawdownPct >= warnDD {
@@ -1733,21 +1781,40 @@ func main() {
 				if portfolioWarnBandEntered {
 					addKillSwitchEvent(&state.PortfolioRisk, "warning", source, warnDD, totalPV, state.PortfolioRisk.PeakValue, portfolioReason)
 				}
-				warnMsg = BuildPortfolioWarningMessage(PortfolioWarningMessageInputs{
-					Reason:      portfolioReason,
-					Config:      cfg.PortfolioRisk,
-					State:       state,
-					Prices:      prices,
-					TotalValue:  totalPV,
-					PerpsLoss:   perpsLoss,
-					PerpsMargin: perpsMargin,
-					Recent:      recentTrades,
-					Now:         warnNow,
-				})
+				if notifyWarn {
+					warnMsg = BuildPortfolioWarningMessage(PortfolioWarningMessageInputs{
+						Reason:      portfolioReason,
+						Config:      cfg.PortfolioRisk,
+						State:       state,
+						Prices:      prices,
+						TotalValue:  totalPV,
+						PerpsLoss:   perpsLoss,
+						PerpsMargin: perpsMargin,
+						Recent:      recentTrades,
+						Now:         warnNow,
+						// #1449 review: same condition the risk check used for
+						// this cycle, so the message labels the arm that can
+						// actually latch. The peak read here is the one the
+						// check decided on: it only ratchets on a trusted
+						// cycle, and the untrusted rollback above is therefore
+						// a no-op rather than a value the message could miss.
+						EquityGuardArmed: pooledEquityComplete && state.PortfolioRisk.PeakValue > 0,
+					})
+				}
 				mu.Unlock()
-				notifier.SendToAllChannels(warnMsg)
-				notifier.SendOwnerDM(warnMsg)
-				fmt.Printf("[WARN] %s\n", portfolioReason)
+				if notifyWarn {
+					notifier.SendToAllChannels(warnMsg)
+					notifier.SendOwnerDM(warnMsg)
+				}
+				// The stdout line stays per-cycle: the throttle exists for
+				// operator channels, and the log is where an incident review
+				// reconstructs how long the band ran. A deferred latch logs at
+				// CRITICAL — it is an over-limit book, not an approach to one.
+				if warnLatchDeferredSince.IsZero() {
+					fmt.Printf("[WARN] %s\n", portfolioReason)
+				} else {
+					fmt.Printf("[CRITICAL] %s\n", portfolioReason)
+				}
 			}
 
 			// Correlation tracking: compute per-asset directional exposure.
@@ -1788,9 +1855,12 @@ func main() {
 						return
 					}
 					mu.Lock()
-					state.PortfolioRisk.KillSwitchActive = false
-					state.PortfolioRisk.KillSwitchAt = time.Time{}
-					addKillSwitchEvent(&state.PortfolioRisk, "reset", "", state.PortfolioRisk.CurrentDrawdownPct, 0, state.PortfolioRisk.PeakValue, "manual reset via DM")
+					// #1449 review: clears the drawdown readings as well as the
+					// latch flags — see ResetPortfolioKillSwitchManual. The
+					// returned reading is the pre-reset one, so the audit event
+					// still records the drawdown the operator reset from.
+					resetDrawdownPct := ResetPortfolioKillSwitchManual(&state.PortfolioRisk)
+					addKillSwitchEvent(&state.PortfolioRisk, "reset", "", resetDrawdownPct, 0, state.PortfolioRisk.PeakValue, "manual reset via DM")
 					if err := SaveStateWithDB(state, cfg, stateDB); err != nil {
 						fmt.Printf("[CRITICAL] Failed to save state after kill switch reset: %v\n", err)
 					}
@@ -2145,6 +2215,18 @@ func main() {
 						cbSnapshot = snapshotPerStrategyCircuitBreaker(stratState, prices)
 					}
 					mu.Unlock()
+					// #1449 review: a disabled circuit breaker that just crossed
+					// a halt threshold is an ABSENT auto-protective mechanism, so
+					// it escalates to the owner instead of only reaching the
+					// strategy log. Drained unconditionally (a suppression leaves
+					// allowed==true, so this cannot sit inside the !allowed
+					// branch) and outside mu, per the #880 no-notifier-I/O rule.
+					// Draining even with no owner keeps the queue bounded.
+					for _, cbAlert := range drainCircuitBreakerSuppressionAlerts() {
+						if notifier.HasOwner() {
+							notifier.SendOwnerDM(formatCircuitBreakerSuppressionDM(cbAlert))
+						}
+					}
 					// #1046: a latched per-strategy circuit breaker on an HL perps
 					// strategy with an open position falls through in manage-only
 					// mode rather than skipping — the dispatch below forces the

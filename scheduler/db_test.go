@@ -170,6 +170,17 @@ func makeTestState() *AppState {
 			// survive a restart — an unpersisted latch would re-run the peak
 			// migration on every start and walk the kill-switch threshold.
 			ManualMarkBasisRebaselined: true,
+			// #1449 (PR review): the substituted marker must survive a restart
+			// too — reloading a floored reading with the marker lost would
+			// present a decision value as a direct measurement on every
+			// operator surface.
+			DrawdownReadingSubstituted: true,
+			// #1449 (PR review round 3): the deferral window is the reason a
+			// full-book latch is being held back. If a restart lost it, a
+			// crash-restart loop during a balance-endpoint outage would keep
+			// reopening a fresh window and the escalation deadline would never
+			// arrive — the latch would be disarmed for as long as the loop ran.
+			UntrustedOverLimitSince: now.Add(-7 * time.Minute),
 			Events: []KillSwitchEvent{
 				{Timestamp: now.Add(-3 * time.Hour), Type: "warning", Source: "margin", DrawdownPct: 18.7, PortfolioValue: 1950, PeakValue: 2050, Details: "approaching threshold"},
 			},
@@ -289,6 +300,14 @@ func TestSaveAndLoadDBRoundTrip(t *testing.T) {
 	}
 	if !loaded.PortfolioRisk.ManualMarkBasisRebaselined {
 		t.Error("PortfolioRisk.ManualMarkBasisRebaselined = false, want true (one-shot latch must survive a restart)")
+	}
+	if !loaded.PortfolioRisk.DrawdownReadingSubstituted {
+		t.Error("PortfolioRisk.DrawdownReadingSubstituted = false, want true (a substituted reading must stay labeled across a restart)")
+	}
+	if loaded.PortfolioRisk.UntrustedOverLimitSince.IsZero() ||
+		!loaded.PortfolioRisk.UntrustedOverLimitSince.Equal(original.PortfolioRisk.UntrustedOverLimitSince) {
+		t.Errorf("PortfolioRisk.UntrustedOverLimitSince = %v, want %v (a restart must not reopen the deferral window)",
+			loaded.PortfolioRisk.UntrustedOverLimitSince, original.PortfolioRisk.UntrustedOverLimitSince)
 	}
 	if !loaded.PortfolioRisk.WarningSent {
 		t.Error("PortfolioRisk.WarningSent should be true")

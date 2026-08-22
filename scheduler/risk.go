@@ -579,6 +579,15 @@ func mergeFuturesMarks(prices map[string]float64, marks map[string]float64) {
 
 const maxKillSwitchEvents = 50
 
+// untrustedEquityLatchDeferral bounds how long the portfolio equity latch will
+// wait out an over-limit reading taken from an untrusted total (#1449 review).
+// It is the maximum extra exposure a genuine crash can accumulate while the
+// shared-wallet balance endpoint is unreachable, and simultaneously the
+// minimum outage a spurious understated substitute must sustain before it can
+// flatten the book. Deliberately not configurable: it is a safety bound on an
+// auto-protective mechanism, and CurrentConfigVersion stays 17.
+const untrustedEquityLatchDeferral = 15 * time.Minute
+
 // KillSwitchEvent records a kill switch lifecycle event for audit purposes.
 //
 // Source identifies which drawdown signal drove a "triggered" or "warning"
@@ -604,23 +613,51 @@ type KillSwitchEvent struct {
 // (perps unrealized loss / deployed margin). Keeping them as separate fields
 // preserves the arithmetic invariant that (PeakValue, CurrentDrawdownPct) is
 // reconstructable, while still exposing the margin signal for operators and
-// the kill switch. The kill switch fires on whichever signal breaches first.
+// the kill switch. #1448: the portfolio latch is owned by CurrentDrawdownPct
+// whenever the equity guard can measure (equityAvailable && PeakValue > 0);
+// CurrentMarginDrawdownPct warns, and trips the latch only when the equity
+// guard cannot measure.
+//
+// #1449 review: that reconstructability invariant has EXACTLY ONE exception,
+// and DrawdownReadingSubstituted is the marker for it. On an untrusted cycle
+// (a substituted or one-generation-stale total) CurrentDrawdownPct carries the
+// floored reading the kill switch actually decided on rather than the raw
+// quotient, so the persisted number always matches the number that governed
+// the cycle. DrawdownReadingSubstituted is true on exactly those cycles, and
+// every operator surface that prints CurrentDrawdownPct next to PeakValue must
+// label the reading when it is set — otherwise the percentage and the dollar
+// figures beside it silently stop reconciling. A trusted cycle always writes
+// the exact measurement and clears the marker.
 // WarningSent is retained for persisted status visibility and is true while
 // either drawdown signal is in the warning band; notifications are emitted on
 // every cycle in that band.
 type PortfolioRiskState struct {
-	PeakValue                float64           `json:"peak_value"`
-	CurrentDrawdownPct       float64           `json:"current_drawdown_pct"`
-	CurrentMarginDrawdownPct float64           `json:"current_margin_drawdown_pct,omitempty"`
-	KillSwitchActive         bool              `json:"kill_switch_active"`
-	KillSwitchAt             time.Time         `json:"kill_switch_at,omitempty"`
-	WarningSent              bool              `json:"warning_sent,omitempty"`
-	WarnBandEnteredAt        time.Time         `json:"warn_band_entered_at,omitempty"`
-	LastWarningEquityDDPct   float64           `json:"last_warning_equity_dd_pct,omitempty"`
-	LastWarningMarginDDPct   float64           `json:"last_warning_margin_dd_pct,omitempty"`
-	WarningEquityDeltaPct    float64           `json:"warning_equity_delta_pct,omitempty"`
-	WarningMarginDeltaPct    float64           `json:"warning_margin_delta_pct,omitempty"`
-	Events                   []KillSwitchEvent `json:"events,omitempty"`
+	PeakValue                float64 `json:"peak_value"`
+	CurrentDrawdownPct       float64 `json:"current_drawdown_pct"`
+	CurrentMarginDrawdownPct float64 `json:"current_margin_drawdown_pct,omitempty"`
+	// DrawdownReadingSubstituted marks CurrentDrawdownPct as the floored
+	// decision value of an untrusted cycle instead of a direct measurement.
+	DrawdownReadingSubstituted bool `json:"drawdown_reading_substituted,omitempty"`
+	// UntrustedOverLimitSince stamps the start of an unbroken run of cycles on
+	// which an UNTRUSTED equity total (substituted or one-generation-stale)
+	// measured a drawdown above MaxDrawdownPct. While it is set the portfolio
+	// equity latch is DEFERRED, not disarmed: an untrusted measurement must
+	// not flatten the whole book on its own, but it also must not disarm the
+	// only full-book protection indefinitely, so the latch escalates once the
+	// run exceeds untrustedEquityLatchDeferral. Any cycle that does not
+	// qualify — trusted, at or below the limit, or equity guard unarmed —
+	// clears it, and so does the firing latch and every reset path. Persisted
+	// so a crash-restart loop cannot keep restarting the window.
+	UntrustedOverLimitSince time.Time         `json:"untrusted_over_limit_since,omitempty"`
+	KillSwitchActive        bool              `json:"kill_switch_active"`
+	KillSwitchAt            time.Time         `json:"kill_switch_at,omitempty"`
+	WarningSent             bool              `json:"warning_sent,omitempty"`
+	WarnBandEnteredAt       time.Time         `json:"warn_band_entered_at,omitempty"`
+	LastWarningEquityDDPct  float64           `json:"last_warning_equity_dd_pct,omitempty"`
+	LastWarningMarginDDPct  float64           `json:"last_warning_margin_dd_pct,omitempty"`
+	WarningEquityDeltaPct   float64           `json:"warning_equity_delta_pct,omitempty"`
+	WarningMarginDeltaPct   float64           `json:"warning_margin_delta_pct,omitempty"`
+	Events                  []KillSwitchEvent `json:"events,omitempty"`
 
 	// ManualMarkBasisRebaselined latches the one-shot #1444 valuation-basis
 	// peak migration (see manualMarkBasisPeakAdjustment). Persisted, so a
@@ -748,6 +785,8 @@ func ClearLatchedKillSwitchSharedWallet(state *AppState, strategies []StrategyCo
 	state.PortfolioRisk.PeakValue = totalBalance
 	state.PortfolioRisk.CurrentDrawdownPct = 0
 	state.PortfolioRisk.CurrentMarginDrawdownPct = 0
+	state.PortfolioRisk.DrawdownReadingSubstituted = false
+	state.PortfolioRisk.UntrustedOverLimitSince = time.Time{}
 	addKillSwitchEvent(&state.PortfolioRisk, "auto_reset", "",
 		0, totalBalance, totalBalance,
 		fmt.Sprintf("startup auto-clear: shared wallets %v reachable, total balance=$%.2f (peak re-baselined)",
@@ -815,8 +854,45 @@ func AutoResetConfirmedFlatKillSwitch(
 	}
 	prs.CurrentDrawdownPct = 0
 	prs.CurrentMarginDrawdownPct = 0
+	prs.DrawdownReadingSubstituted = false
+	prs.UntrustedOverLimitSince = time.Time{}
 	addKillSwitchEvent(prs, "auto_reset", "", 0, rebaselineValue, prs.PeakValue, details)
 	return true
+}
+
+// ResetPortfolioKillSwitchManual clears a portfolio kill-switch latch on the
+// operator's explicit instruction (the #1368 owner-DM reset). It returns the
+// drawdown reading recorded at the moment of the reset so the caller can put it
+// on the audit event before it is cleared.
+//
+// #1449 review: this exists so the manual reset clears the same drawdown
+// readings both auto-reset paths clear (ClearLatchedKillSwitchSharedWallet,
+// AutoResetConfirmedFlatKillSwitch). It previously cleared only the latch
+// flags, which left CurrentDrawdownPct holding the OVER-LIMIT measurement the
+// latching cycle persists before the latch check. That stale reading then fed
+// the untrusted-cycle floor and could re-latch the whole book off a number
+// nothing measured this cycle. The floor is clamped in the risk check as the
+// structural guard; this removes the stale value at the source, so the warn
+// band and the operator surfaces also stop reporting a pre-reset drawdown.
+//
+// Unlike the auto-reset paths this does NOT re-baseline PeakValue: a manual
+// reset makes no claim about the portfolio being flat or the total being
+// verified, so the real high-water mark is retained and the next cycle
+// re-measures against it.
+//
+// CONCURRENCY: lock-free body — the caller must hold mu.
+func ResetPortfolioKillSwitchManual(prs *PortfolioRiskState) float64 {
+	if prs == nil {
+		return 0
+	}
+	priorDrawdownPct := prs.CurrentDrawdownPct
+	prs.KillSwitchActive = false
+	prs.KillSwitchAt = time.Time{}
+	prs.CurrentDrawdownPct = 0
+	prs.CurrentMarginDrawdownPct = 0
+	prs.DrawdownReadingSubstituted = false
+	prs.UntrustedOverLimitSince = time.Time{}
+	return priorDrawdownPct
 }
 
 // addKillSwitchEvent appends an event and trims to maxKillSwitchEvents.
@@ -887,43 +963,133 @@ func AggregatePerpsMarginInputs(strategies map[string]*StrategyState, configs []
 // while closes/reductions and SL/TP maintenance keep running; warning=true
 // means drawdown is approaching the kill switch threshold.
 //
-// Two independent drawdown signals feed the kill switch:
+// Two independent drawdown signals are computed:
 //
 //  1. Equity drawdown — (peak - totalValue) / peak. Captures spot/options
 //     PnL and overall cash erosion. Persisted as CurrentDrawdownPct.
 //  2. Perps margin drawdown (#296) — perpsUnrealizedLoss / perpsMargin.
 //     Captures leveraged-position losses against deployed margin, which a
-//     pure equity view understates dramatically for all-perps accounts: a
-//     50% loss on 10x margin shows up as ~5% of total account value, so the
-//     equity-only kill switch fires far too late (or not at all before
-//     liquidation). Persisted as CurrentMarginDrawdownPct.
+//     pure equity view understates for all-perps accounts: a 50% loss on 10x
+//     margin shows up as ~5% of total account value. Persisted as
+//     CurrentMarginDrawdownPct.
 //
 // The two signals live on separate fields so (PeakValue, CurrentDrawdownPct)
 // remains an arithmetically consistent equity tuple for post-incident review.
-// The kill switch fires on whichever signal breaches cfg.MaxDrawdownPct
-// first, so a mixed portfolio is guarded on both fronts. For all-perps
-// accounts, the margin signal dominates; for all-spot/options, the margin
-// inputs are zero and behavior is identical to the pre-#296 baseline.
+//
+// #1448 — which signal owns the PORTFOLIO latch:
+//
+// The portfolio latch force-closes every position and blocks the whole book
+// until an operator resets it, so its cost is the entire book. The margin
+// signal and the equity signal shared one limit before #1448, and they
+// diverge exactly when deployed margin is a SMALL share of the book. In that
+// regime the loss a margin trip can avert is bounded by that small margin,
+// while the latch still costs the full book, including manual and spot
+// positions that contribute nothing to the margin ratio. A live incident
+// (2026-08-22) latched the fleet at 65.3% margin drawdown on $48.42 of
+// deployed margin while equity drawdown was 9.8% against a 30% limit.
+//
+// So the latch is owned by the signal that measures real book loss whenever
+// that signal can measure at all:
+//
+//   - equity guard armed (equityAvailable && PeakValue > 0): the latch trips
+//     on equity drawdown ONLY. Margin drawdown stays a warning lens.
+//   - equity guard NOT armed (pooled shared wallet with no trustworthy
+//     balance, or no positive valuation has EVER been recorded): margin
+//     drawdown trips the latch, because it is then the only signal that can
+//     protect the account.
+//
+// equityTrusted (#1449 review) is a THIRD state, distinct from both: the
+// equity total exists but this cycle substituted or aged it —
+// computeSubsetPortfolioValue replaced a failed shared-wallet balance fetch
+// with sum(member PV), or resolveSharedWalletRiskBalances reused a
+// one-generation-old balance. Both leave equityAvailable true. The latch
+// STAYS with equity on those cycles on purpose: sum(member PV) prices every
+// position at the same live marks, and a one-generation-old balance is a real
+// balance, so the equity signal still measures real book loss — and handing
+// the whole book to the margin signal over a transient balance-fetch blip is
+// exactly the failure #1448 exists to remove. What an untrusted total must
+// never do is make a drawdown DISAPPEAR, so two things are gated on
+// equityTrusted instead: the peak ratchet does not run (the caller also rolls
+// the peak back, so the two agree instead of leaving CurrentDrawdownPct
+// written off a peak that was undone), and the measured equity drawdown is
+// floored at the last recorded reading. The floor can never itself latch —
+// any stored reading came from a cycle that did not latch, so it is at or
+// below the limit — it can only stop an overstated substitute total from
+// masking a loss that was already visible.
+//
+// Per-POSITION margin protection is unaffected and lives where it belongs:
+// the #292 per-strategy circuit breaker measures the same margin-drawdown
+// ratio and force-closes that one strategy on a cooldown, without latching
+// the book (see CheckRisk).
+//
+// CAVEAT — circuit_breaker:false (#1449 review): that per-strategy breaker is
+// opt-outable (#1048), and an explicit false suppresses BOTH of its firing
+// arms. A perps strategy with the breaker disabled therefore has no automatic
+// margin protection at any level once the portfolio latch belongs to equity,
+// and where the breaker IS enabled its perps max_drawdown_pct default is 50
+// against the portfolio default of 25, so the handover is to a LOOSER limit.
+// That gap is made loud rather than silent: recordCircuitBreakerSuppression
+// raises a throttled owner DM (not only a log line) on the cycle a disabled
+// breaker crosses a halt threshold.
 //
 // The emitted KillSwitchEvent.Source records whether equity or margin drove
 // the fire/warning so operators can tell at a glance which lever tripped.
 func CheckPortfolioRisk(prs *PortfolioRiskState, cfg *PortfolioRiskConfig, totalValue, totalNotional, perpsUnrealizedLoss, perpsMargin float64) (allowed, notionalBlocked, warning bool, reason string) {
-	return checkPortfolioRiskWithEquityAvailability(prs, cfg, totalValue, totalNotional, perpsUnrealizedLoss, perpsMargin, true)
+	return checkPortfolioRiskWithEquityAvailability(prs, cfg, totalValue, totalNotional, perpsUnrealizedLoss, perpsMargin, true, true)
 }
 
 // checkPortfolioRiskWithEquityAvailability allows the shared-wallet risk path
-// to suppress only the equity-drawdown signal when a pooled wallet has neither
-// a current nor one-generation-old real balance. The perps margin signal and
-// notional cap remain active. Existing callers use CheckPortfolioRisk and
-// therefore retain the historical equity-available behavior.
-func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *PortfolioRiskConfig, totalValue, totalNotional, perpsUnrealizedLoss, perpsMargin float64, equityAvailable bool) (allowed, notionalBlocked, warning bool, reason string) {
+// to suppress the equity-drawdown signal when a pooled wallet has neither a
+// current nor one-generation-old real balance. On that path the equity guard
+// is not armed, so the perps margin signal remains the TRIP for the portfolio
+// latch (#1448) rather than only a warning; the notional cap is unaffected.
+// Existing callers use CheckPortfolioRisk and therefore retain the historical
+// equity-available behavior.
+//
+// equityTrusted (#1449 review) is a separate, weaker signal: totalValue is
+// usable but this cycle SUBSTITUTED or AGED it (sum(member PV) after a failed
+// shared-wallet balance fetch, or a one-generation-old cached balance). The
+// equity guard stays armed and keeps the latch; the peak ratchet is skipped
+// and the measured drawdown is floored at the last recorded reading so an
+// overstated substitute cannot mask a loss. See the #1448 block above for why
+// the latch does not fall back to margin here. Pass equityTrusted=false
+// whenever equityAvailable is false — an unavailable total is never trusted.
+func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *PortfolioRiskConfig, totalValue, totalNotional, perpsUnrealizedLoss, perpsMargin float64, equityAvailable, equityTrusted bool) (allowed, notionalBlocked, warning bool, reason string) {
 	if prs.KillSwitchActive {
 		return false, false, false, fmt.Sprintf("portfolio kill switch is latched (triggered at %s, manual reset required)",
 			prs.KillSwitchAt.Format("2006-01-02 15:04:05 UTC"))
 	}
 
-	// Ratchet peak high-water mark upward only.
-	if equityAvailable && totalValue > prs.PeakValue {
+	// #1449 review: the last recorded equity drawdown, read BEFORE anything
+	// this cycle overwrites it. It is the floor applied on an untrusted cycle.
+	//
+	// It is clamped to cfg.MaxDrawdownPct because the stored reading is NOT
+	// guaranteed to be below the limit: the latching cycle writes its
+	// over-limit measurement to CurrentDrawdownPct before the latch check, and
+	// the owner-DM reset path clears only KillSwitchActive/KillSwitchAt. An
+	// unclamped floor would therefore re-latch the whole book on the first
+	// untrusted cycle after that reset, off a reading nothing measured this
+	// cycle. The clamp keeps the floor at or below the limit while the latch
+	// test is a strict >, so a carried value can raise the reported reading
+	// but can never fire the kill switch on its own. A genuine this-cycle
+	// measurement above the limit is unaffected — it is not clamped.
+	//
+	// The clamp is applied at READ time, not stored, so a later
+	// MaxDrawdownPct change (SIGHUP) re-derives it instead of permanently
+	// truncating the recorded reading. When MaxDrawdownPct is non-positive the
+	// clamp yields a non-positive floor, which cannot raise a drawdown that is
+	// already floored at 0 — the degenerate config keeps its existing meaning.
+	priorEquityDD := prs.CurrentDrawdownPct
+	if priorEquityDD > cfg.MaxDrawdownPct {
+		priorEquityDD = cfg.MaxDrawdownPct
+	}
+
+	// Ratchet peak high-water mark upward only. equityTrusted gates it so a
+	// substituted or one-generation-stale total cannot move the high-water
+	// mark. The caller also rolls an untrusted ratchet back; doing it here too
+	// means equityDD below is computed against the peak that actually
+	// survives, instead of against one the caller is about to undo.
+	if equityAvailable && equityTrusted && totalValue > prs.PeakValue {
 		prs.PeakValue = totalValue
 	}
 
@@ -936,22 +1102,115 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 		if equityDD < 0 {
 			equityDD = 0
 		}
+		// #1449 review: an untrusted total may raise the measured drawdown but
+		// never lower it. Monotone across a run of untrusted cycles; the first
+		// trusted cycle overwrites it with a real measurement. This closes the
+		// fail-open direction (a substitute that overstates equity understates
+		// the drawdown), while the clamp on priorEquityDD above keeps the floor
+		// from firing the latch by itself.
+		//
+		// The floored value — not the raw quotient — is what gets persisted,
+		// so CurrentDrawdownPct always equals the number this cycle's latch and
+		// warn band decided on. DrawdownReadingSubstituted marks it as such for
+		// the operator surfaces (see the PortfolioRiskState doc comment).
+		substituted := false
+		if !equityTrusted && equityDD < priorEquityDD {
+			equityDD = priorEquityDD
+			substituted = true
+		}
 		prs.CurrentDrawdownPct = equityDD
+		prs.DrawdownReadingSubstituted = substituted
 	}
 	if perpsMargin > 0 && perpsUnrealizedLoss > 0 {
 		marginDD = perpsUnrealizedLoss / perpsMargin * 100
 	}
 	prs.CurrentMarginDrawdownPct = marginDD
 
-	// Kill switch: fire if either signal breaches the limit. The reason names
-	// the breaching signal so operators know whether to investigate spot /
-	// options equity or perps margin.
+	// Kill switch (#1448): the equity guard owns the portfolio latch whenever
+	// it can measure; the margin signal trips only when it cannot. The two
+	// arms are mutually exclusive, so exactly one signal can latch the book on
+	// any given cycle and the reason always names it.
 	//
-	// Note: this branch runs even when PeakValue == 0, so a cold-start
-	// account that blows up margin on bar 1 (before any equity snapshot) is
-	// still protected — equityDD is zero in that case and only the margin
-	// signal can fire.
-	if (equityAvailable && equityDD > cfg.MaxDrawdownPct) || marginDD > cfg.MaxDrawdownPct {
+	// PeakValue == 0 is treated as "cannot measure" rather than as a separate
+	// case. The peak ratchet above runs BEFORE this check, so any cycle with a
+	// positive totalValue arms the guard in the same call. PeakValue == 0 here
+	// therefore means no equity snapshot has ever been recorded (totalValue
+	// has been non-positive on every cycle so far), which is the same
+	// condition as equityAvailable == false: the equity guard is not
+	// operative, and margin is the only signal that can protect the account.
+	//
+	// #1449 review — the exact reach of that clause: it is NOT "a cold-start
+	// account that blows up margin on bar 1". A first cycle carrying any
+	// positive total arms the guard through the ratchet above, so from that
+	// cycle on the latch belongs to equity and margin can no longer fire it.
+	// The margin arm on the equityAvailable path is reachable only while
+	// totalValue has been non-positive on EVERY cycle, which is what
+	// TestCheckPortfolioRisk_PeakZero_MarginCanStillFire pins with
+	// totalValue = 0. Margin's real standing backstop is the equityAvailable
+	// == false path (pooled wallet with no trustworthy balance), plus the #292
+	// per-strategy circuit breaker on every path.
+	equityGuardArmed := equityAvailable && prs.PeakValue > 0
+
+	// #1449 review round 3 — the UPWARD direction of the untrusted reading.
+	//
+	// The floor above closes the fail-open direction: an untrusted total that
+	// OVERSTATES equity can no longer mask a loss. The opposite direction was
+	// still open. An untrusted total that UNDERSTATES equity inflates equityDD,
+	// and nothing stopped that inflated number from tripping the latch and
+	// flattening the whole book — manual and spot included — off a total the
+	// same cycle already flagged as substituted or aged. That is the mirror of
+	// the guarantee the floor already gives ("the floor can never itself
+	// latch"), and the equity arm now gets it too: an untrusted measurement
+	// alone does not flatten the book on the cycle it appears.
+	//
+	// It is a DEFERRAL, not a veto, and the difference is load-bearing. A
+	// straight "only a trusted measurement may latch" rule opens a worse hole
+	// than it closes, because the two untrusted sources have different
+	// lifetimes:
+	//
+	//   - usedStaleRiskBalance is structurally one cycle. The stale branch in
+	//     resolveSharedWalletRiskBalances requires Generation == generation-1
+	//     and does NOT refresh the cache, so a second consecutive miss fails
+	//     that test, equityComplete goes false, and the cycle lands on the
+	//     equityAvailable == false path where margin owns the latch.
+	//   - usedPVFallback has no such bound. computeTotalPortfolioValue
+	//     substitutes sum(member PV) for as long as the balance fetch keeps
+	//     failing, and equityAvailable stays true throughout. A pure veto would
+	//     therefore leave the portfolio latch disarmed indefinitely during a
+	//     balance-endpoint outage — and an outage is exactly when a genuine
+	//     crash is least likely to be noticed. The loss that hole permits is
+	//     unbounded; the loss a spurious flatten costs is slippage, fees and a
+	//     manual reset. The unbounded error governs.
+	//
+	// So the latch waits out untrustedEquityLatchDeferral of CONTINUOUS
+	// over-limit untrusted cycles and then fires. A transient blip never
+	// reaches it; a persistent substituted total that keeps reading over the
+	// limit is no longer credible as an artifact and is treated as the loss it
+	// reports. UntrustedOverLimitSince is persisted so a restart loop cannot
+	// keep resetting the window, and every non-qualifying cycle clears it, so
+	// the window only ever measures an unbroken run.
+	//
+	// A trusted measurement over the limit is untouched and latches at once.
+	//
+	// cfg.MaxDrawdownPct <= 0 is excluded, matching the priorEquityDD clamp
+	// above: a non-positive limit already means "latch on any drawdown", and
+	// deferring that would silently redefine the degenerate config instead of
+	// leaving its existing meaning alone.
+	equityLatchDeferred := false
+	if equityGuardArmed && !equityTrusted && cfg.MaxDrawdownPct > 0 && equityDD > cfg.MaxDrawdownPct {
+		now := time.Now().UTC()
+		if prs.UntrustedOverLimitSince.IsZero() {
+			prs.UntrustedOverLimitSince = now
+			addKillSwitchEvent(prs, "latch_deferred", "equity", equityDD, totalValue, prs.PeakValue,
+				fmt.Sprintf("equity drawdown %.1f%% exceeds limit %.1f%% on an untrusted total (substituted or one-generation-stale); portfolio latch deferred up to %s pending a trusted measurement",
+					equityDD, cfg.MaxDrawdownPct, formatWarningDuration(untrustedEquityLatchDeferral)))
+		}
+		equityLatchDeferred = now.Sub(prs.UntrustedOverLimitSince) < untrustedEquityLatchDeferral
+	} else {
+		prs.UntrustedOverLimitSince = time.Time{}
+	}
+
+	if (equityGuardArmed && !equityLatchDeferred && equityDD > cfg.MaxDrawdownPct) || (!equityGuardArmed && marginDD > cfg.MaxDrawdownPct) {
 		prs.KillSwitchActive = true
 		prs.KillSwitchAt = time.Now().UTC()
 		prs.WarningSent = false
@@ -962,10 +1221,9 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 		prs.WarningMarginDeltaPct = 0
 		var r, source string
 		var dd float64
-		// Tie-break to margin when the two signals are equal: the margin
-		// signal is the newer, more sensitive lens (#296) and surfacing it
-		// preferentially helps operators notice leveraged blow-ups.
-		if !equityAvailable || marginDD >= equityDD {
+		// #1448: the arms above are mutually exclusive, so the source falls
+		// out of which guard is armed. No tie-break is possible or needed.
+		if !equityGuardArmed {
 			source = "margin"
 			dd = marginDD
 			if equityAvailable {
@@ -978,9 +1236,25 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 		} else {
 			source = "equity"
 			dd = equityDD
-			r = fmt.Sprintf("portfolio drawdown %.1f%% exceeds limit %.1f%% (value=$%.2f, peak=$%.2f)",
-				equityDD, cfg.MaxDrawdownPct, totalValue, prs.PeakValue)
+			// An escalated latch (the deferral window ran out while every
+			// cycle in it read over the limit on an untrusted total) says so
+			// in the reason. The operator's first question on a flattened book
+			// is which number did it, and "substituted for N minutes" is a
+			// different post-mortem from a clean measurement.
+			if !prs.UntrustedOverLimitSince.IsZero() {
+				r = fmt.Sprintf("portfolio drawdown %.1f%% exceeds limit %.1f%% (value=$%.2f, peak=$%.2f); measurement is UNTRUSTED (substituted or stale total) and has read over the limit continuously since %s — latch escalated after %s",
+					equityDD, cfg.MaxDrawdownPct, totalValue, prs.PeakValue,
+					prs.UntrustedOverLimitSince.Format("2006-01-02 15:04 UTC"),
+					formatWarningDuration(untrustedEquityLatchDeferral))
+			} else {
+				r = fmt.Sprintf("portfolio drawdown %.1f%% exceeds limit %.1f%% (value=$%.2f, peak=$%.2f)",
+					equityDD, cfg.MaxDrawdownPct, totalValue, prs.PeakValue)
+			}
 		}
+		// The window has done its job once the latch fires; leaving it set
+		// would make the reading look deferred to every surface that reads it
+		// while the book is already flat.
+		prs.UntrustedOverLimitSince = time.Time{}
 		addKillSwitchEvent(prs, "triggered", source, dd, totalValue, prs.PeakValue, r)
 		return false, false, false, r
 	}
@@ -988,8 +1262,12 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 	// Warning check: approaching kill switch threshold on either signal.
 	if cfg.MaxDrawdownPct > 0 {
 		warnDrawdownPct := cfg.MaxDrawdownPct * cfg.WarnThresholdPct / 100
-		equityWarn := equityAvailable && equityDD > warnDrawdownPct
-		marginWarn := marginDD > warnDrawdownPct
+		// Both persisted fields are already written above, so the shared
+		// helper sees exactly the values this cycle measured. The caller reads
+		// the same helper for the #1449 warn-DM throttle — one implementation,
+		// so the throttle's idea of "which signal is in band" can never drift
+		// from the one that produced the warning.
+		equityWarn, marginWarn := portfolioWarnBandSignals(cfg, prs, equityAvailable)
 		if equityWarn || marginWarn {
 			now := time.Now().UTC()
 			if !prs.WarningSent {
@@ -1010,13 +1288,41 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 			prs.LastWarningMarginDDPct = marginDD
 			prs.WarningSent = true
 			warning = true
+			// #1448: margin drawdown can now sit ABOVE cfg.MaxDrawdownPct
+			// without latching (only reachable with the equity guard armed —
+			// otherwise the margin arm above already tripped). Saying it is
+			// "approaching" the limit would be false, so that case gets its
+			// own wording naming who actually owns the latch and where
+			// per-position margin protection lives.
+			marginOverLimit := marginDD > cfg.MaxDrawdownPct
 			switch {
+			case equityLatchDeferred:
+				// #1449 review round 3: equity is already OVER the limit, so
+				// "approaching" would be false — and unlike the margin
+				// over-limit cases the latch is not owned by another arm, it
+				// is being held back deliberately. Say so, name the deadline,
+				// and name what is protecting the book in the meantime, so an
+				// operator reading this during a balance outage knows whether
+				// to intervene by hand.
+				reason = fmt.Sprintf("portfolio equity drawdown %.1f%% exceeds limit %.1f%% (value=$%.2f, peak=$%.2f) but the total is UNTRUSTED (substituted or one-generation-stale) — full-book latch DEFERRED since %s, escalates at %s unless a trusted measurement lands first; per-strategy circuit breakers (#292) remain active",
+					equityDD, cfg.MaxDrawdownPct, totalValue, prs.PeakValue,
+					prs.UntrustedOverLimitSince.Format("2006-01-02 15:04 UTC"),
+					prs.UntrustedOverLimitSince.Add(untrustedEquityLatchDeferral).Format("2006-01-02 15:04 UTC"))
+				if marginWarn {
+					reason += fmt.Sprintf("; perps margin=%.1f%% (unrealized loss=$%.2f, margin=$%.2f)",
+						marginDD, perpsUnrealizedLoss, perpsMargin)
+				}
+			case equityWarn && marginWarn && marginOverLimit:
+				reason = fmt.Sprintf("portfolio drawdown warning: equity=%.1f%% (value=$%.2f, peak=$%.2f); perps margin=%.1f%% exceeds limit %.1f%% (unrealized loss=$%.2f, margin=$%.2f); portfolio latch governed by equity drawdown (limit %.1f%%); per-strategy circuit breakers own margin protection (#1448)",
+					equityDD, totalValue, prs.PeakValue, marginDD, cfg.MaxDrawdownPct, perpsUnrealizedLoss, perpsMargin, cfg.MaxDrawdownPct)
 			case equityWarn && marginWarn:
 				// Both breached — surface both in the reason so a
-				// correlated move is visible to the operator. Ties go
-				// to margin (see kill-switch branch above).
+				// correlated move is visible to the operator.
 				reason = fmt.Sprintf("portfolio drawdown approaching kill switch limit %.1f%% (warn at %.1f%%): equity=%.1f%% (value=$%.2f, peak=$%.2f); perps margin=%.1f%% (unrealized loss=$%.2f, margin=$%.2f)",
 					cfg.MaxDrawdownPct, warnDrawdownPct, equityDD, totalValue, prs.PeakValue, marginDD, perpsUnrealizedLoss, perpsMargin)
+			case marginWarn && marginOverLimit:
+				reason = fmt.Sprintf("portfolio perps margin drawdown %.1f%% exceeds limit %.1f%% (unrealized loss=$%.2f, margin=$%.2f); portfolio latch governed by equity drawdown %.1f%% (limit %.1f%%); per-strategy circuit breakers own margin protection (#1448)",
+					marginDD, cfg.MaxDrawdownPct, perpsUnrealizedLoss, perpsMargin, equityDD, cfg.MaxDrawdownPct)
 			case marginWarn:
 				reason = fmt.Sprintf("portfolio perps margin drawdown %.1f%% approaching kill switch limit %.1f%% (warn at %.1f%%, unrealized loss=$%.2f, margin=$%.2f)",
 					marginDD, cfg.MaxDrawdownPct, warnDrawdownPct, perpsUnrealizedLoss, perpsMargin)
@@ -1042,6 +1348,26 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 	}
 
 	return true, false, warning, reason
+}
+
+// portfolioWarnBandSignals reports which drawdown lenses sit in the portfolio
+// warn band, reading the same persisted fields the kill-switch path just wrote.
+//
+// It is the SINGLE definition of warn-band membership: the warn-reason switch
+// inside checkPortfolioRiskWithEquityAvailability and the #1449 warn-DM
+// throttle in the main loop both call it, so a signal that "newly entered the
+// band" means the same thing on both sides. equityAvailable must be the same
+// value passed to the risk check for the cycle; the PeakValue > 0 guard
+// mirrors the drawdown computation, which leaves CurrentDrawdownPct untouched
+// (possibly holding a stale non-zero reading) when no peak exists.
+func portfolioWarnBandSignals(cfg *PortfolioRiskConfig, prs *PortfolioRiskState, equityAvailable bool) (equityInBand, marginInBand bool) {
+	if cfg == nil || prs == nil || cfg.MaxDrawdownPct <= 0 {
+		return false, false
+	}
+	warnDrawdownPct := cfg.MaxDrawdownPct * cfg.WarnThresholdPct / 100
+	equityInBand = equityAvailable && prs.PeakValue > 0 && prs.CurrentDrawdownPct > warnDrawdownPct
+	marginInBand = prs.CurrentMarginDrawdownPct > warnDrawdownPct
+	return equityInBand, marginInBand
 }
 
 // PortfolioNotional computes gross market exposure across all strategies.
@@ -2064,6 +2390,13 @@ func recordCircuitBreakerSuppression(s *StrategyState, cbEnabled bool, lossStrea
 		logger.Warn("WARNING: circuit breaker is DISABLED (circuit_breaker:false) and a halt threshold was crossed (%s) — NO circuit breaker fired. This strategy is trading WITHOUT the drawdown/consecutive-loss auto-halt and positions are NOT being auto-closed on this condition. This is a warning only (nothing was closed); re-enable circuit_breaker to restore protection.",
 			strings.Join(reasons, "; "))
 	}
+	// #1449 review: escalate to the owner, not only to the strategy log. Since
+	// #1448 this breaker owns margin protection whenever the portfolio latch
+	// belongs to equity, so a disabled one crossing a halt threshold is an
+	// absent auto-protective mechanism. Queued rather than sent because
+	// CheckRisk holds mu (#880); the main loop drains it after mu.Unlock().
+	// The LoadOrStore above already made this once per suppression episode.
+	queueCircuitBreakerSuppressionAlert(s.ID, reasons)
 }
 
 // RecordTradeResult updates risk state with realized PnL for daily limits and
