@@ -3622,3 +3622,511 @@ func TestCheckRisk_CircuitBreakerDisabled_ThrottleClearsWhenBreachClears(t *test
 		t.Fatal("throttle should clear once the breach clears")
 	}
 }
+
+// TestCollectPerpsMarkSymbols_IncludesManualHyperliquid verifies #1444: a
+// type=manual strategy donates its coin to the Hyperliquid mark rail so the
+// trailing stop-loss walker and the TP ratchet see a live mark every cycle.
+// The coin is read from sc.Symbol — the key the manual dispatch, the position
+// map and the walker all use — never from Args[1], which a hand-written args
+// list may disagree with. Manual on any other platform contributes nothing.
+func TestCollectPerpsMarkSymbols_IncludesManualHyperliquid(t *testing.T) {
+	strategies := []StrategyConfig{
+		// Manual HL, live — Args[1] deliberately disagrees with Symbol to prove
+		// the collector keys off Symbol.
+		{ID: "manual-hl-eth", Type: "manual", Platform: "hyperliquid", Symbol: "ETH",
+			Args: []string{"hold", "WRONGCOIN", "1h", "--mode=live"}},
+		// Manual HL, record-only — still needs a mark for portfolio valuation.
+		{ID: "manual-hl-hype", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=paper"}},
+		// Manual dedup against a perps donor on the same coin.
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+		{ID: "manual-hl-btc", Type: "manual", Platform: "hyperliquid", Symbol: "BTC",
+			Args: []string{"hold", "BTC", "1h", "--mode=live"}},
+		// Manual on a non-hyperliquid platform must contribute nothing — it must
+		// never leak into the OKX rail via the platform switch.
+		{ID: "manual-okx-sol", Type: "manual", Platform: "okx", Symbol: "SOL",
+			Args: []string{"hold", "SOL", "1h", "--mode=live"}},
+		// Manual with an empty symbol must be ignored.
+		{ID: "manual-hl-empty", Type: "manual", Platform: "hyperliquid", Symbol: "",
+			Args: []string{"hold", "DOGE", "1h", "--mode=live"}},
+	}
+
+	hlCoins, okxCoins := collectPerpsMarkSymbols(strategies)
+
+	wantHL := []string{"BTC", "ETH", "HYPE"}
+	if len(hlCoins) != len(wantHL) {
+		t.Fatalf("hlCoins = %v, want %v", hlCoins, wantHL)
+	}
+	for i, c := range wantHL {
+		if hlCoins[i] != c {
+			t.Errorf("hlCoins[%d] = %q, want %q", i, hlCoins[i], c)
+		}
+	}
+	if len(okxCoins) != 0 {
+		t.Errorf("okxCoins = %v, want empty (manual is hyperliquid-only)", okxCoins)
+	}
+}
+
+// TestCollectFuturesMarkSymbols_IgnoresManual pins the #1444 decision not to
+// relax the futures collector: type=manual is hyperliquid-only at load, and
+// that collector also filters on platform=topstep, so a manual strategy must
+// stay out of the CME rail.
+func TestCollectFuturesMarkSymbols_IgnoresManual(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-eth", Type: "manual", Platform: "hyperliquid", Symbol: "ETH",
+			Args: []string{"hold", "ETH", "1h", "--mode=live"}},
+		{ID: "ts-trend-es", Type: "futures", Platform: "topstep", Args: []string{"trend", "ES", "1h"}},
+	}
+	syms := collectFuturesMarkSymbols(strategies)
+	if len(syms) != 1 || syms[0] != "ES" {
+		t.Errorf("collectFuturesMarkSymbols = %v, want [ES]", syms)
+	}
+}
+
+// TestCollectMissingMarkPositions covers the #1444 regression guard: an open
+// position on a symbol the cycle produced no live mark for must be surfaced,
+// while a flat strategy, a strategy whose mark was published during the cycle
+// and an options strategy stay silent.
+//
+// PR-review update: a record-only manual config is NO LONGER silent. Its value
+// still reaches totalPV through PortfolioValue (computeSubsetPortfolioValue
+// virtual-sums it; sameAccountLiveManualMembers folds in LIVE manual only), so
+// a missing mark there silently reverts it to AvgCost inside the portfolio
+// kill switch's drawdown input. It is reported with Live=false, which is what
+// keeps it out of the live-protection owner DM.
+func TestCollectMissingMarkPositions(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-eth", Type: "manual", Platform: "hyperliquid", Symbol: "ETH",
+			Args: []string{"hold", "ETH", "1h", "--mode=live"}},
+		{ID: "manual-hl-record", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=paper"}},
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+		{ID: "hl-trend-sol", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "SOL", "1h"}},
+		{ID: "sma-btc", Type: "spot", Platform: "binanceus", Args: []string{"sma", "BTC/USDT", "1h"}},
+		{ID: "deribit-vol-btc", Type: "options", Platform: "deribit", Args: []string{"vol", "BTC"}},
+		{ID: "flat-strategy", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "DOGE", "1h"}},
+		{ID: "not-in-state", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "AVAX", "1h"}},
+	}
+	openSymbols := map[string][]string{
+		"manual-hl-eth":    {"ETH"},      // live manual, no mark → warn
+		"manual-hl-record": {"HYPE"},     // record-only manual, no mark → warn, Live=false
+		"hl-trend-btc":     {"BTC"},      // mark published this cycle → silent
+		"hl-trend-sol":     {"SOL"},      // no mark → warn
+		"sma-btc":          {"BTC/USDT"}, // spot with a price → silent
+		"deribit-vol-btc":  {"BTC-PERP"}, // options leg → out of scope, silent
+		"flat-strategy":    {},           // flat → silent
+	}
+	prices := map[string]float64{
+		"BTC":      67500.0,
+		"BTC/USDT": 67510.0,
+		"ETH":      0, // present but non-positive → still a miss
+	}
+
+	got := collectMissingMarkPositions(strategies, openSymbols, prices)
+	want := []missingMarkPosition{
+		{StrategyID: "manual-hl-eth", Symbol: "ETH", Live: true},
+		{StrategyID: "manual-hl-record", Symbol: "HYPE", Live: false},
+		{StrategyID: "hl-trend-sol", Symbol: "SOL", Live: false},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("collectMissingMarkPositions = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].StrategyID != want[i].StrategyID || got[i].Symbol != want[i].Symbol || got[i].Live != want[i].Live {
+			t.Errorf("[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestCollectMissingMarkPositions_SortsSymbolsPerStrategy pins deterministic
+// operator output (CLAUDE.md map-iteration rule) when one strategy holds a
+// primary and a hedge leg and both lost their mark.
+func TestCollectMissingMarkPositions_SortsSymbolsPerStrategy(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+	}
+	openSymbols := map[string][]string{"hl-trend-btc": {"SOL", "BTC", "ETH"}}
+	got := collectMissingMarkPositions(strategies, openSymbols, map[string]float64{})
+	want := []string{"BTC", "ETH", "SOL"}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %d entries", got, len(want))
+	}
+	for i, sym := range want {
+		if got[i].Symbol != sym {
+			t.Errorf("[%d].Symbol = %q, want %q", i, got[i].Symbol, sym)
+		}
+	}
+}
+
+// TestCollectMissingMarkPositions_NoOpenPositions verifies the guard allocates
+// nothing on the common all-flat cycle.
+func TestCollectMissingMarkPositions_NoOpenPositions(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+	}
+	if got := collectMissingMarkPositions(strategies, nil, nil); len(got) != 0 {
+		t.Errorf("collectMissingMarkPositions = %+v, want empty", got)
+	}
+}
+
+// TestCollectMissingMarkPositions_LiveFlagDrivesEscalation pins the split the
+// PR review asked for: the live/record-only distinction decides the operator
+// channel, not whether the miss is reported at all. A live miss disables the
+// trailing SL walker and the TP ratchet (owner DM); a record-only miss only
+// distorts the portfolio drawdown input (log line).
+func TestCollectMissingMarkPositions_LiveFlagDrivesEscalation(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "hl-live", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h", "--mode=live"}},
+		{ID: "hl-paper", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "SOL", "1h", "--mode=paper"}},
+	}
+	openSymbols := map[string][]string{"hl-live": {"BTC"}, "hl-paper": {"SOL"}}
+	got := collectMissingMarkPositions(strategies, openSymbols, map[string]float64{})
+	if len(got) != 2 {
+		t.Fatalf("collectMissingMarkPositions = %+v, want 2 entries", got)
+	}
+	if !got[0].Live {
+		t.Errorf("live strategy entry %+v: Live = false, want true", got[0])
+	}
+	if got[1].Live {
+		t.Errorf("paper strategy entry %+v: Live = true, want false", got[1])
+	}
+}
+
+// TestCollectMissingMarkPositions_RecordOnlyManualUnderNonSCSymbol covers the
+// review's must-survive case: the mark rail only donates sc.Symbol, so a
+// position parked under a DIFFERENT key in the position map has no donor and
+// must still be reported.
+func TestCollectMissingMarkPositions_RecordOnlyManualUnderNonSCSymbol(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl", Type: "manual", Platform: "hyperliquid", Symbol: "ETH",
+			Args: []string{"hold", "ETH", "1h", "--mode=live"}},
+	}
+	openSymbols := map[string][]string{"manual-hl": {"HYPE"}}
+	got := collectMissingMarkPositions(strategies, openSymbols, map[string]float64{"ETH": 3400})
+	if len(got) != 1 || got[0].Symbol != "HYPE" {
+		t.Fatalf("collectMissingMarkPositions = %+v, want one HYPE miss", got)
+	}
+	if !got[0].Live {
+		t.Errorf("live manual miss %+v: Live = false, want true", got[0])
+	}
+}
+
+// TestCollectMissingMarkPositions_FlatRecordOnlyManualSilent pins the review's
+// third must-survive case: a flat record-only manual strategy allocates
+// nothing and says nothing.
+func TestCollectMissingMarkPositions_FlatRecordOnlyManualSilent(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-record", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=paper"}},
+	}
+	if got := collectMissingMarkPositions(strategies, map[string][]string{"manual-hl-record": {}}, nil); len(got) != 0 {
+		t.Errorf("collectMissingMarkPositions = %+v, want empty", got)
+	}
+}
+
+// TestManualOnlyMarkSymbols_ExcludesPreExistingDonors pins the basis-migration
+// input set: only manual coins that NO pre-#1444 rail already donated moved
+// valuation basis. A manual coin shared with a perps strategy, a hedge leg, a
+// spot symbol or a futures contract was live-marked before #1444 too.
+func TestManualOnlyMarkSymbols_ExcludesPreExistingDonors(t *testing.T) {
+	strategies := []StrategyConfig{
+		// Moved basis: no other rail donates HYPE.
+		{ID: "manual-hype", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=live"}},
+		// Did NOT move: a perps strategy already donated BTC.
+		{ID: "manual-btc", Type: "manual", Platform: "hyperliquid", Symbol: "BTC",
+			Args: []string{"hold", "BTC", "1h", "--mode=live"}},
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+		// Did NOT move: an OKX perps strategy writes the same bare key.
+		{ID: "manual-sol", Type: "manual", Platform: "hyperliquid", Symbol: "SOL",
+			Args: []string{"hold", "SOL", "1h", "--mode=live"}},
+		{ID: "okx-trend-sol", Type: "perps", Platform: "okx", Args: []string{"trend", "SOL", "1h"}},
+		// Non-hyperliquid manual is rejected at load; never contribute it.
+		{ID: "manual-okx", Type: "manual", Platform: "okx", Symbol: "DOGE",
+			Args: []string{"hold", "DOGE", "1h", "--mode=live"}},
+	}
+	got := manualOnlyMarkSymbols(strategies)
+	want := []string{"HYPE"}
+	if len(got) != len(want) {
+		t.Fatalf("manualOnlyMarkSymbols = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestManualOnlyMarkSymbols_NoManualStrategies keeps the migration inert on a
+// fleet with no manual strategy at all.
+func TestManualOnlyMarkSymbols_NoManualStrategies(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+	}
+	if got := manualOnlyMarkSymbols(strategies); len(got) != 0 {
+		t.Errorf("manualOnlyMarkSymbols = %v, want empty", got)
+	}
+}
+
+// TestPricesWithoutSymbols_DeletesRatherThanZeroes pins the mechanism the
+// legacy-basis recompute depends on: PortfolioValue falls back to AvgCost on a
+// MISSING key and values a position at zero on a present-but-zero one, so the
+// pre-#1444 basis is reproduced by deletion only.
+func TestPricesWithoutSymbols_DeletesRatherThanZeroes(t *testing.T) {
+	prices := map[string]float64{"BTC": 67500, "HYPE": 24.5}
+	got := pricesWithoutSymbols(prices, []string{"HYPE"})
+	if _, ok := got["HYPE"]; ok {
+		t.Errorf("HYPE still present in %v, want deleted", got)
+	}
+	if got["BTC"] != 67500 {
+		t.Errorf("BTC = %v, want 67500", got["BTC"])
+	}
+	if _, ok := prices["HYPE"]; !ok {
+		t.Errorf("source map was mutated: %v", prices)
+	}
+	same := pricesWithoutSymbols(prices, nil)
+	if len(same) != len(prices) {
+		t.Errorf("empty drop list changed the map: %v", same)
+	}
+}
+
+// TestManualMarkBasisPeakAdjustment covers the one-shot peak migration: it
+// moves the peak by the measured basis delta and nothing else, so a real
+// drawdown accumulated under the old basis survives.
+func TestManualMarkBasisPeakAdjustment(t *testing.T) {
+	tests := []struct {
+		name                            string
+		oldPeak, liveTotal, legacyTotal float64
+		wantPeak                        float64
+		wantApply                       bool
+	}{
+		{
+			name: "underwater manual lowers the peak by exactly the delta",
+			// Manual position bought at $10k now worth $6k: the live total is
+			// $4k below the same book on the old basis, so the peak moves down
+			// $4k. A pre-existing real drawdown is preserved, not erased.
+			oldPeak: 60000, liveTotal: 56000, legacyTotal: 60000,
+			wantPeak: 56000, wantApply: true,
+		},
+		{
+			name:    "profitable manual raises the peak by the delta",
+			oldPeak: 60000, liveTotal: 63000, legacyTotal: 60000,
+			wantPeak: 63000, wantApply: true,
+		},
+		{
+			name: "real drawdown under the old basis survives the migration",
+			// Book already 10% down on the old basis ($54k vs $60k peak) and
+			// the manual leg adds a further $4k of newly-visible loss. The peak
+			// moves only by the $4k basis delta, so the $6k real drawdown
+			// remains armed.
+			oldPeak: 60000, liveTotal: 50000, legacyTotal: 54000,
+			wantPeak: 56000, wantApply: true,
+		},
+		{
+			name:    "no manual position moved: zero delta, no change",
+			oldPeak: 60000, liveTotal: 58000, legacyTotal: 58000,
+			wantPeak: 60000, wantApply: false,
+		},
+		{
+			name:    "cold-start peak has no legacy basis to correct",
+			oldPeak: 0, liveTotal: 56000, legacyTotal: 60000,
+			wantPeak: 0, wantApply: false,
+		},
+		{
+			name:    "negative peak is never written",
+			oldPeak: 1000, liveTotal: 100, legacyTotal: 5000,
+			wantPeak: 1000, wantApply: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotPeak, gotApply := manualMarkBasisPeakAdjustment(tc.oldPeak, tc.liveTotal, tc.legacyTotal)
+			if gotApply != tc.wantApply {
+				t.Errorf("apply = %v, want %v", gotApply, tc.wantApply)
+			}
+			if gotPeak != tc.wantPeak {
+				t.Errorf("peak = %v, want %v", gotPeak, tc.wantPeak)
+			}
+		})
+	}
+}
+
+// TestSnapshotOpenSymbolsByStrategy skips flat strategies and the #1009
+// corrupt-position shape (qty <= 0), which the force-close path owns.
+func TestSnapshotOpenSymbolsByStrategy(t *testing.T) {
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"open":    {Positions: map[string]*Position{"BTC": {Quantity: 0.5}}},
+		"flat":    {Positions: map[string]*Position{}},
+		"corrupt": {Positions: map[string]*Position{"SOL": {Quantity: 0}}},
+		"nil":     nil,
+	}}
+	got := snapshotOpenSymbolsByStrategy(state)
+	if len(got) != 1 {
+		t.Fatalf("snapshotOpenSymbolsByStrategy = %+v, want one entry", got)
+	}
+	if len(got["open"]) != 1 || got["open"][0] != "BTC" {
+		t.Errorf(`got["open"] = %v, want ["BTC"]`, got["open"])
+	}
+	if snapshotOpenSymbolsByStrategy(nil) != nil {
+		t.Error("nil state should snapshot nil")
+	}
+}
+
+// --- #1445 review, Recommended Optional 1: the basis-migration gate -------
+//
+// The one-shot peak migration measures
+// totalPV(prices) - totalPV(pricesWithoutSymbols(prices, manualOnly)), and
+// only manual-only coins can move that difference. Gating it on a COMPLETE
+// mark set across every position type deferred the migration during an
+// unrelated mark outage, leaving an underwater manual position live-priced in
+// totalPV against a cost-basis peak — the spurious first-cycle kill-switch
+// fire the migration exists to prevent.
+
+// TestMissingManualOnlyMarks_IgnoresNonManualOutage is must-survive (a): a
+// manual mark present but a futures/OKX/spot mark missing must NOT defer.
+func TestMissingManualOnlyMarks_IgnoresNonManualOutage(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-hype", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=live"}},
+		{ID: "ts-es", Type: "futures", Platform: "topstep", Args: []string{"trend", "ES", "1h"}},
+		{ID: "okx-sol", Type: "perps", Platform: "okx", Args: []string{"trend", "SOL", "1h"}},
+		{ID: "sma-btc", Type: "spot", Platform: "binanceus", Args: []string{"sma", "BTC/USDT", "1h"}},
+	}
+	openSymbols := map[string][]string{
+		"manual-hl-hype": {"HYPE"},
+		"ts-es":          {"ES"},
+		"okx-sol":        {"SOL"},
+		"sma-btc":        {"BTC/USDT"},
+	}
+	// Only the manual coin is marked; every other open coin lost its mark.
+	prices := map[string]float64{"HYPE": 42.0}
+	if got := missingManualOnlyMarks(strategies, openSymbols, prices); len(got) != 0 {
+		t.Errorf("missingManualOnlyMarks = %v, want empty — non-manual misses cancel out of the delta and must not defer the migration", got)
+	}
+}
+
+// TestMissingManualOnlyMarks_DefersOnManualOutage is must-survive (b): the
+// manual coin's OWN mark missing must still defer, because measuring the delta
+// then would under-migrate the peak.
+func TestMissingManualOnlyMarks_DefersOnManualOutage(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-hype", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=live"}},
+		{ID: "manual-hl-eth", Type: "manual", Platform: "hyperliquid", Symbol: "ETH",
+			Args: []string{"hold", "ETH", "1h", "--mode=live"}},
+	}
+	openSymbols := map[string][]string{"manual-hl-hype": {"HYPE"}, "manual-hl-eth": {"ETH"}}
+	// ETH present-but-zero is a miss too; HYPE absent entirely.
+	got := missingManualOnlyMarks(strategies, openSymbols, map[string]float64{"ETH": 0})
+	want := []string{"ETH", "HYPE"} // sorted, per the CLAUDE.md map-iteration rule
+	if len(got) != len(want) {
+		t.Fatalf("missingManualOnlyMarks = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestMissingManualOnlyMarks_NoManualOnlyCoinsRunsImmediately is must-survive
+// (c): with no manual-only coins the delta is zero by construction, so the
+// migration must run (and stamp its latch) on the first cycle rather than wait
+// on anyone else's mark.
+func TestMissingManualOnlyMarks_NoManualOnlyCoinsRunsImmediately(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+		{ID: "sma-eth", Type: "spot", Platform: "binanceus", Args: []string{"sma", "ETH", "1h"}},
+	}
+	openSymbols := map[string][]string{"hl-trend-btc": {"BTC"}, "sma-eth": {"ETH"}}
+	if got := missingManualOnlyMarks(strategies, openSymbols, map[string]float64{}); len(got) != 0 {
+		t.Errorf("missingManualOnlyMarks = %v, want empty — no manual-only coin exists, so nothing gates the migration", got)
+	}
+}
+
+// TestMissingManualOnlyMarks_DonorCoinNeverGates pins the interaction with
+// manualOnlyMarkSymbols: a manual coin a perps strategy already donated was
+// live-marked before #1444, so its basis never moved and a miss on it cannot
+// change the delta.
+func TestMissingManualOnlyMarks_DonorCoinNeverGates(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-btc", Type: "manual", Platform: "hyperliquid", Symbol: "BTC",
+			Args: []string{"hold", "BTC", "1h", "--mode=live"}},
+		{ID: "hl-trend-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h"}},
+	}
+	openSymbols := map[string][]string{"manual-hl-btc": {"BTC"}}
+	if got := missingManualOnlyMarks(strategies, openSymbols, map[string]float64{}); len(got) != 0 {
+		t.Errorf("missingManualOnlyMarks = %v, want empty — BTC is donated by the perps rail, so it is not a manual-only coin", got)
+	}
+}
+
+// TestMissingManualOnlyMarks_UnheldManualCoinNeverGates pins that the gate
+// walks OPEN positions, not the config: a configured manual coin the book does
+// not hold contributes nothing to the delta, so losing its mark must not stall
+// the migration indefinitely.
+func TestMissingManualOnlyMarks_UnheldManualCoinNeverGates(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "manual-hl-hype", Type: "manual", Platform: "hyperliquid", Symbol: "HYPE",
+			Args: []string{"hold", "HYPE", "1h", "--mode=live"}},
+	}
+	if got := missingManualOnlyMarks(strategies, map[string][]string{"manual-hl-hype": {}}, nil); len(got) != 0 {
+		t.Errorf("missingManualOnlyMarks = %v, want empty — the strategy is flat, so its coin cannot move the delta", got)
+	}
+}
+
+// --- #1445 review, Recommended Optional 2: venue-scoped DM mechanisms -----
+
+// TestMarkGatedManagers_ScopedToHyperliquidPerpsAndManual pins the whole
+// matrix. The trailing walker and the TP ratchet are dispatched only on the HL
+// perps and manual paths; the OKX perps branch runs runOKXCheck /
+// runOKXExecuteOrder and neither of them, and spot / TopStep futures run
+// neither either.
+func TestMarkGatedManagers_ScopedToHyperliquidPerpsAndManual(t *testing.T) {
+	cases := []struct {
+		name    string
+		sc      StrategyConfig
+		wantAny bool
+	}{
+		{"hl perps", StrategyConfig{Type: "perps", Platform: "hyperliquid"}, true},
+		{"hl manual", StrategyConfig{Type: "manual", Platform: "hyperliquid"}, true},
+		{"okx perps", StrategyConfig{Type: "perps", Platform: "okx"}, false},
+		{"binanceus spot", StrategyConfig{Type: "spot", Platform: "binanceus"}, false},
+		{"topstep futures", StrategyConfig{Type: "futures", Platform: "topstep"}, false},
+		{"hl spot", StrategyConfig{Type: "spot", Platform: "hyperliquid"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := markGatedManagers(tc.sc)
+			if tc.wantAny {
+				if len(got) != 2 {
+					t.Fatalf("markGatedManagers = %v, want the walker and the ratchet", got)
+				}
+				return
+			}
+			if len(got) != 0 {
+				t.Errorf("markGatedManagers = %v, want empty — this venue runs no mark-gated manager", got)
+			}
+		})
+	}
+}
+
+// TestCollectMissingMarkPositions_CarriesVenueManagementSurface pins that the
+// collector stamps each miss with the venue facts the operator alert needs, so
+// a live BinanceUS spot miss cannot inherit Hyperliquid's mechanisms.
+func TestCollectMissingMarkPositions_CarriesVenueManagementSurface(t *testing.T) {
+	strategies := []StrategyConfig{
+		{ID: "hl-live-btc", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "BTC", "1h", "--mode=live"}},
+		{ID: "sma-eth", Type: "spot", Platform: "binanceus", Args: []string{"sma", "ETH", "1h", "--mode=live"}},
+	}
+	openSymbols := map[string][]string{"hl-live-btc": {"BTC"}, "sma-eth": {"ETH"}}
+	got := collectMissingMarkPositions(strategies, openSymbols, map[string]float64{})
+	if len(got) != 2 {
+		t.Fatalf("collectMissingMarkPositions = %+v, want 2 entries", got)
+	}
+	if got[0].Platform != "hyperliquid" || got[0].Type != "perps" || len(got[0].DisabledManagers) != 2 {
+		t.Errorf("HL perps miss = %+v, want platform/type stamped and 2 disabled managers", got[0])
+	}
+	if got[1].Platform != "binanceus" || got[1].Type != "spot" || len(got[1].DisabledManagers) != 0 {
+		t.Errorf("spot miss = %+v, want platform/type stamped and NO disabled managers", got[1])
+	}
+}

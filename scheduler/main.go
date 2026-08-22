@@ -1318,6 +1318,14 @@ func main() {
 				cfg.Strategies, state.Strategies, sharedWallets, walletBalances,
 				sharedWalletRiskBalances, sharedWalletRiskGeneration)
 			totalPV, usedPVFallback = computeTotalPortfolioValue(cfg.Strategies, state, prices, riskWalletBalances, sharedWallets)
+			// #1444 (PR review): snapshot the open book here, under the same
+			// RLock as totalPV, so the one-shot valuation-basis peak migration
+			// below can require a COMPLETE mark set before it measures the
+			// basis shift. A separate snapshot from the end-of-cycle tripwire
+			// on purpose: that one runs after the strategy loop (perps publish
+			// their own marks inside it), this one has to agree with the
+			// prices map totalPV was just computed from.
+			riskOpenSymbols := snapshotOpenSymbolsByStrategy(state)
 			totalNotional := PortfolioNotional(state.Strategies, prices)
 			// #296: aggregate perps margin drawdown inputs alongside the
 			// equity total so the portfolio kill switch can fire on a
@@ -1336,6 +1344,9 @@ func main() {
 			exposureCapStatus = evaluateExposureCap(cfg.PortfolioRisk, state.Strategies, cfg.Strategies, prices, totalPV)
 			mu.RUnlock()
 
+			// #1444 (PR review): carries the one-shot basis-migration DM out of
+			// the write lock — notifier I/O never runs under mu (#880).
+			var manualBasisRebaselineDM string
 			mu.Lock()
 			// #243: Freeze peak during fallback cycles so a transient HL API
 			// blip cannot ratchet the high-water mark (peak is sticky, so a
@@ -1346,6 +1357,55 @@ func main() {
 			// bounded pooled snapshot still evaluate equity against the frozen
 			// peak; a pooled wallet with no trustworthy snapshot suppresses
 			// only the equity arm inside checkPortfolioRiskWithEquityAvailability.
+			// #1444 (PR review): one-shot valuation-basis peak migration.
+			// #1444 moved manual positions off a frozen AvgCost valuation onto
+			// the live mark rail. PeakValue is sticky and ratchet-up-only, so
+			// the first post-upgrade cycle would otherwise compare a
+			// live-priced total against a cost-priced peak and could latch the
+			// kill switch — which force-closes the fleet before it latches
+			// (planKillSwitchClose below) — on an accounting change rather
+			// than a loss.
+			//
+			// The shift is measured, never assumed: recompute the SAME total
+			// against a prices map with the manual-only marks removed
+			// (PortfolioValue falls back to AvgCost on a missing key, which is
+			// exactly the pre-#1444 basis) and move the peak by that delta
+			// alone. Any real drawdown already accumulated survives untouched.
+			//
+			// Gated on the MANUAL-ONLY marks alone, not on a complete mark set
+			// across every position type (#1445 review). A missing mark on a
+			// manual-only coin would make the legacy total and the live total
+			// agree for the wrong reason and migrate the peak by too little, so
+			// that case still defers. A missing spot / OKX-perps / futures mark
+			// does not: it is absent from both prices and legacyPrices, falls
+			// back to pos.AvgCost in both, and cancels out of the delta exactly.
+			// Deferring on one would leave an underwater manual position
+			// live-priced in totalPV against a cost-basis peak for the whole
+			// outage — the exact spurious first-cycle fire this migration
+			// exists to prevent. The latch is only stamped once the measurement
+			// actually happened, so a deferred cycle simply retries next cycle.
+			if !state.PortfolioRisk.ManualMarkBasisRebaselined {
+				if unmarked := missingManualOnlyMarks(cfg.Strategies, riskOpenSymbols, prices); len(unmarked) > 0 {
+					fmt.Printf("[INFO] manual mark valuation-basis peak migration deferred: no live mark this cycle for open manual-only coin(s) %s\n", strings.Join(unmarked, ", "))
+				} else {
+					legacyPrices := pricesWithoutSymbols(prices, manualOnlyMarkSymbols(cfg.Strategies))
+					legacyPV, _ := computeTotalPortfolioValue(cfg.Strategies, state, legacyPrices, riskWalletBalances, sharedWallets)
+					priorPeak := state.PortfolioRisk.PeakValue
+					if newPeak, apply := manualMarkBasisPeakAdjustment(priorPeak, totalPV, legacyPV); apply {
+						state.PortfolioRisk.PeakValue = newPeak
+						details := fmt.Sprintf("#1444 manual valuation-basis migration: peak $%.2f -> $%.2f (live total $%.2f vs pre-#1444 basis $%.2f, delta $%.2f); drawdown untouched",
+							priorPeak, newPeak, totalPV, legacyPV, totalPV-legacyPV)
+						addKillSwitchEvent(&state.PortfolioRisk, "basis_rebaseline", "equity", state.PortfolioRisk.CurrentDrawdownPct, totalPV, newPeak, details)
+						fmt.Printf("[CRITICAL] %s\n", details)
+						manualBasisRebaselineDM = formatManualMarkBasisRebaselineDM(priorPeak, newPeak, totalPV, legacyPV)
+					} else {
+						fmt.Printf("[INFO] #1444 manual valuation-basis migration: no peak change (peak $%.2f, live total $%.2f, pre-#1444 basis $%.2f)\n",
+							priorPeak, totalPV, legacyPV)
+					}
+					state.PortfolioRisk.ManualMarkBasisRebaselined = true
+				}
+			}
+
 			origPeak := state.PortfolioRisk.PeakValue
 			prevWarningSent := state.PortfolioRisk.WarningSent
 			portfolioAllowed, nb, portfolioWarning, portfolioReason := checkPortfolioRiskWithEquityAvailability(
@@ -1417,6 +1477,12 @@ func main() {
 			driftResults := reconcileSharedWalletDisplayValues(cfg.Strategies, state, stateDB, sharedWallets, walletBalances, hlPositions, okxPositions, okxStateFetched)
 			mu.Unlock()
 
+			// #1444 (PR review): the valuation-basis peak migration is a
+			// one-shot, irreversible move of an auto-protective threshold —
+			// the operator hears about it on the channel they watch, once.
+			if manualBasisRebaselineDM != "" {
+				notifier.SendOwnerDM(manualBasisRebaselineDM)
+			}
 			// #1269: once-per-UTC-day owner DM on a tripped daily loss limit.
 			// Outside mu (notifier I/O never runs under the state lock, #880).
 			if dailyLossEntriesHeld {
@@ -3330,6 +3396,54 @@ func main() {
 					lastRun[sc.ID] = time.Now()
 				}
 			} // end if !killSwitchFired
+		}
+
+		// #1444: missing-mark regression guard. A mark miss is silent by
+		// construction — prices[sym] reads 0.0, PortfolioValue falls back to
+		// pos.AvgCost, and every mark-gated manager (the HL trailing stop-loss
+		// walker, the TP ratchet) returns early behind its own `mark > 0` gate.
+		// Runs here, after the strategy loop, because perps strategies publish
+		// their own mark during the loop; an init-time guard would warn for them
+		// spuriously. The decision itself is the pure collectMissingMarkPositions
+		// so it stays testable without spawning Python.
+		mu.RLock()
+		openSymbolsByStrategy := snapshotOpenSymbolsByStrategy(state)
+		mu.RUnlock()
+		misses := collectMissingMarkPositions(cfg.Strategies, openSymbolsByStrategy, prices)
+		// #1444 (PR review): a stdout [WARN] is the same silent channel as the
+		// bug it was added to catch. A LIVE miss degrades an auto-protective
+		// mechanism — on HL perps/manual it stops the trailing stop-loss walker
+		// and the TP ratchet outright, and on every venue it reverts the
+		// position to AvgCost inside the portfolio kill switch's drawdown input
+		// — so it escalates to a throttled owner DM. A record-only miss breaks
+		// no management path — it only reverts
+		// that position to AvgCost inside the portfolio drawdown input — so it
+		// stays a log line and raises no live-protection alarm.
+		//
+		// Retain() drops slots for positions that are no longer missing, so a
+		// mark that comes back re-arms the alert immediately, with no restart.
+		missingMarkAlerts.Retain(misses)
+		alertNow := time.Now().UTC()
+		var missingMarkDMs []string
+		for _, miss := range misses {
+			if miss.Live {
+				// #1445 review: name only the managers this venue actually
+				// runs (markGatedManagers); the valuation fallback is the one
+				// consequence that holds everywhere.
+				disabled := "no mark-gated manager runs on this venue"
+				if len(miss.DisabledManagers) > 0 {
+					disabled = strings.Join(miss.DisabledManagers, ", ") + " cannot run this cycle"
+				}
+				fmt.Printf("[WARN] No live mark for %s/%s while a LIVE %s position on %s is open — portfolio value falls back to entry cost and %s\n", miss.StrategyID, miss.Symbol, miss.Type, miss.Platform, disabled)
+				if missingMarkAlerts.Record(miss, alertNow) {
+					missingMarkDMs = append(missingMarkDMs, formatMissingMarkDM(miss))
+				}
+				continue
+			}
+			fmt.Printf("[WARN] No live mark for %s/%s while a record-only position is open — its value falls back to entry cost inside the portfolio drawdown input (no management path is affected)\n", miss.StrategyID, miss.Symbol)
+		}
+		for _, dm := range missingMarkDMs {
+			notifier.SendOwnerDM(dm)
 		}
 
 		// #1394/#1400: emit a throttled reminder for every strategy still
