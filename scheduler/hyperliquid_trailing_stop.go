@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 )
 
 const defaultTrailingStopMinMovePct = 0.5
@@ -505,6 +506,19 @@ type trailingReplacePolicy struct {
 	// Direction is still gated: only a FAVORABLE candidate replaces, so a
 	// forced tighten can never widen the stop on either side.
 	ratchetTightened bool
+
+	// liquidationPx (#1450) is the exchange-reported liquidation price for this
+	// coin from the CURRENT cycle's clearinghouseState snapshot, or 0 when
+	// unknown. When positive, the walker clamps a candidate (or an unchanged
+	// resting) trigger that sits past liquidation to just inside it, and
+	// bypasses the min-move debounce so the tighten actually lands — the same
+	// rationale as ratchetTightened. Direction is favorable-only, so the clamp
+	// can never widen a stop.
+	//
+	// LIVE ONLY. The paper walker ignores this field: paper has no real account
+	// and no liquidation price, so every live call site threads the map value
+	// while paper call sites leave it 0.
+	liquidationPx float64
 }
 
 func computeTrailingStopUpdate(side string, mark, highWater, trailingPct, minMovePct, currentTrigger float64) (float64, float64, bool) {
@@ -663,7 +677,20 @@ func runHyperliquidTrailingStopPaper(sc StrategyConfig, side string, pos *Positi
 // expectedSide guards against a side flip between snapshot and lock; prevSLOID
 // is the OID captured before the update (used to confirm the cancel applies to
 // the OID we expected to replace).
-func applyTrailingStopUpdateResult(s *StrategyState, symbol, expectedSide string, prevSLOID int64, newHighWater float64, updateConfirmed bool, slUpdate *HyperliquidStopLossUpdateResult, logger *StrategyLogger) (immediateFill bool, fillPx float64) {
+//
+// closeReason is the persisted Trade.CloseReason for an immediate fill. The
+// persisted reason must name the mechanism that PLACED the order that filled —
+// the #1456 review caught the liquidation-guard audit booking its closes as
+// "trailing_stop_loss_immediate" while its operator DM said LIQUIDATION-CLAMP,
+// so a stop_loss_pct owner re-armed by the audit read back in history as a
+// trailing-stop exit. Walker callers pass "trailing_stop_loss_immediate"; the
+// audit passes "liquidation_clamp_sl_immediate".
+//
+// placedQty (#1456 review round 19 Optional 2) is the quantity the placement
+// was actually SIZED to (hlSLEffectiveQty's on-chain cap) so a submit fill
+// books the quantity the exchange clipped to, never more; 0 means unknown and
+// keeps the legacy full-quantity booking.
+func applyTrailingStopUpdateResult(s *StrategyState, symbol, expectedSide string, prevSLOID int64, newHighWater float64, updateConfirmed bool, slUpdate *HyperliquidStopLossUpdateResult, closeReason string, logger *StrategyLogger, placedQty float64) (immediateFill bool, fillPx float64) {
 	if s == nil {
 		return false, 0
 	}
@@ -680,10 +707,23 @@ func applyTrailingStopUpdateResult(s *StrategyState, symbol, expectedSide string
 	if slUpdate == nil {
 		return false, 0
 	}
+	if closeReason == "" {
+		closeReason = "trailing_stop_loss_immediate"
+	}
 	switch {
 	case slUpdate.StopLossFilledImmediately && slUpdate.StopLossTriggerPx > 0:
 		pos.RatchetFallbackNormalizePending = false
-		if recordPerpsStopLossClose(s, symbol, slUpdate.StopLossTriggerPx, "trailing_stop_loss_immediate", logger) {
+		if recordPerpsStopLossCloseQty(s, symbol, placedQty, slUpdate.StopLossTriggerPx, closeReason, logger) {
+			// A partial booking (placedQty below the recorded quantity, the
+			// round-19 shape) leaves a residue position whose protection
+			// fields point at the order that just FIRED. Clear them so the
+			// residue re-arms from the empty-OID path on its next cycle; a
+			// full booking deletes the position and finds nothing here.
+			if residue, ok := s.Positions[symbol]; ok && residue != nil && residue.Quantity > 0 {
+				residue.StopLossOID = 0
+				residue.StopLossTriggerPx = 0
+				residue.RatchetFallbackNormalizePending = false
+			}
 			return true, slUpdate.StopLossTriggerPx
 		}
 	case slUpdate.StopLossOID > 0:
@@ -692,6 +732,47 @@ func applyTrailingStopUpdateResult(s *StrategyState, symbol, expectedSide string
 		pos.RatchetFallbackNormalizePending = false
 		if logger != nil {
 			logger.Info("Trailing SL trigger updated oid=%d @ $%.4f", slUpdate.StopLossOID, slUpdate.StopLossTriggerPx)
+		}
+	case slUpdate.StopLossOutcomeUnknown:
+		// #1456 review round 16: the cancel landed but the replacement's
+		// OUTCOME could not be read (unreadable status entry / post-submit
+		// exception, unresolvable by the open-order diff). The order may be
+		// resting untracked.
+		//
+		// Clearing everything here was the original compound hazard: the
+		// position then read as Unprotected (StopLossOID == 0 &&
+		// StopLossTriggerPx <= 0), so the next audit re-armed a static-scalar
+		// owner and the walker re-armed a trailing owner from currentTrigger
+		// <= 0 — placing a SECOND reduce-only stop while the first one's OID
+		// had never been recorded.
+		//
+		// Rounds 18/19 settled the shape for BOTH fresh placements AND
+		// tightens: record the REQUESTED trigger with the OID left at 0.
+		// Keeping a tightened position's OLD OID instead (round 16's "keep")
+		// pointed it at an order this very call had CANCELLED, with the old
+		// past-liquidation trigger — so every later cycle re-cancelled the
+		// dead OID and placed again, stacking one more untracked stop per
+		// unreadable outcome. With {OID: 0, trigger: requested} every placement
+		// queue closes: the audit reads the candidate armed-at-a-reachable-
+		// trigger and reports it without acting, buildHyperliquidProtectionPlan
+		// suppresses its SL leg, and the fixed-ATR arm site requires a clean
+		// slate. A trailing owner still heals on its own next legitimate
+		// min-move replace, which places ONE order at a readable outcome and
+		// records it. A duplicate reduce-only stop clips to the netted
+		// position and no-ops once flat (#621 cap), so the worst case of the
+		// residue is bounded — mirroring the accepted protection-sync
+		// semantics (hlProtectionStopOutcomeUnknown).
+		if pos.StopLossOID == prevSLOID {
+			pos.StopLossOID = 0
+		}
+		if slUpdate.StopLossTriggerPx > 0 {
+			pos.StopLossTriggerPx = slUpdate.StopLossTriggerPx
+			if logger != nil {
+				logger.Info("Unreadable placement outcome for %s: requested trigger $%.4f recorded (oid unknown)", symbol, slUpdate.StopLossTriggerPx)
+			}
+		}
+		if logger != nil && prevSLOID > 0 {
+			logger.Warn("Trailing SL old OID=%d was cancelled and the replacement's outcome could NOT be read — recorded trigger kept, oid unknown; no re-place is licensed until a readable attempt", prevSLOID)
 		}
 	case slUpdate.CancelStopLossSucceeded && prevSLOID > 0 && pos.StopLossOID == prevSLOID:
 		pos.StopLossOID = 0
@@ -750,6 +831,49 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 			}
 		}
 	}
+	// #1450: a stop past the exchange liquidation price can never fill — HL
+	// force-closes first. Clamp it to just INSIDE liquidation and place it,
+	// bypassing the min-move debounce so the tighten actually reaches the
+	// exchange. Two cases are covered:
+	//
+	//   - replace==true: the walker's own candidate is past liquidation.
+	//   - replace==false: the walker sees no reason to move, but the RESTING
+	//     trigger is itself past liquidation (e.g. armed on the open cycle,
+	//     before the exchange reported a liquidation price). This is the heal.
+	//
+	// The clamp is strictly tightening in both cases, so it can never widen a
+	// stop, and it never returns 0 for a positive input — protection is never
+	// removed by this path.
+	// clampOutcome is what the deferred alert reports. It starts at "deferred"
+	// (nothing was cancelled, the ORIGINAL stop is still resting) and is only
+	// moved to "clamped" by a placement that actually RESTS or FILLS, or to
+	// "protection lost" by a cancel that landed with nothing behind it. A
+	// cancel-succeeded-placement-rejected cycle must never read as a clamp: the
+	// operator would be told the stop was tightened while the position has no
+	// exchange-side stop at all. Same invariant hlLiquidationClampReplace
+	// enforces for the audit.
+	clampOutcome := hlLiquidationActionReplaceDeferred
+	// #1456 review round 7: set only when the LIQUIDATION clamp forced this
+	// cancel+replace. An ordinary trailing move keeps today's no-retry behavior.
+	clampTriggered := false
+	if policy.liquidationPx > 0 {
+		offending := newTrigger
+		if !replace {
+			offending = currentTrigger
+		}
+		if clamped, clampedOK := clampStopInsideLiquidation(side, offending, policy.liquidationPx); clampedOK {
+			newTrigger = clamped
+			replace = true
+			clampTriggered = true
+			// The alert is deferred so it reports what ACTUALLY happened, and so
+			// it drains after lockHyperliquidTrailingUpdate releases — defers run
+			// LIFO and that lock is taken below.
+			defer func() {
+				notifyHLStopPastLiquidation(sc, symbol, side, offending, clamped, policy.liquidationPx, clampOutcome, notifier, logger, time.Now().UTC())
+			}()
+		}
+	}
+
 	if !replace {
 		return newHighWater, nil, true
 	}
@@ -770,9 +894,19 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 		logger.Error("Trailing SL update returned no result")
 		return highWater, nil, false
 	}
-	if result.Error != "" {
+	if result.Error != "" && !result.CancelStopLossSucceeded {
 		logger.Error("Trailing SL update returned error: %s", result.Error)
 		return highWater, result, false
+	}
+	if result.Error != "" {
+		// #1456 review round 10: the subprocess raised AFTER the old trigger was
+		// cancelled (e.g. trigger rounding outside the placement try) — the
+		// payload still carries CancelStopLossSucceeded. Reading this as "replace
+		// deferred" told the operator the ORIGINAL stop was still resting while
+		// nothing was, and skipped the in-cycle retry. Fall through to the normal
+		// interpretation: state clears via applyTrailingStopUpdateResult, the
+		// clamp retry below runs, and the alert names protection lost.
+		logger.Error("Trailing SL update returned error AFTER the old trigger was cancelled (%s) — treating as cancel-landed", result.Error)
 	}
 	if result.OpenOrderCheckError != "" {
 		logger.Warn("Trailing SL open-order check failed; replacement deferred: %s", result.OpenOrderCheckError)
@@ -786,6 +920,9 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 	}
 	if result.StopLossFilledExternally {
 		logger.Warn("Trailing SL OID=%d already filled on-chain for %s — reconciler will book the close", currentOID, symbol)
+		// The old order just FILLED — the deferred alert must not claim it is
+		// still resting (#1456 review).
+		clampOutcome = hlLiquidationActionFilledOnChain
 		return highWater, result, false
 	}
 	if result.CancelStopLossError != "" {
@@ -815,11 +952,69 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 	if result.StopLossFilledImmediately {
 		logger.Warn("Trailing SL trigger filled at submit for %s — position is flat on-chain", symbol)
 	}
-	updateConfirmed := (result.StopLossOID > 0) ||
-		(result.StopLossFilledImmediately && result.StopLossTriggerPx > 0) ||
-		result.CancelStopLossSucceeded
+	// A REPLACEMENT is resting (or filled at submit) only on these two shapes.
+	// CancelStopLossSucceeded alone means the old trigger was deleted and
+	// nothing took its place — the position is naked.
+	restingConfirmed := (result.StopLossOID > 0) ||
+		(result.StopLossFilledImmediately && result.StopLossTriggerPx > 0)
+	// A fill at submit ended the cycle FLAT — the alert must say the position
+	// exited, never that a stop was tightened onto an order no position needs
+	// (#1456 review).
+	filledAtSubmit := result.StopLossFilledImmediately && result.StopLossTriggerPx > 0
+	// updateConfirmed still includes the cancel-without-rest shape: state must
+	// stop pointing at an OID that no longer exists (applyTrailingStopUpdateResult
+	// zeroes it), which is also what makes the walker re-arm from nothing on its
+	// next run. It is a STATE signal, never an operator-facing success signal.
+	updateConfirmed := restingConfirmed || result.CancelStopLossSucceeded
 	if !updateConfirmed {
 		return highWater, result, false
+	}
+	// #1456 review round 7: the clamp branch CANCELLED a resting stop; if the
+	// replacement did not rest, retry ONCE in the same cycle — the same
+	// guarantee the audit enforces for its own strips. Recovery otherwise waits
+	// for this strategy's next due Signal == 0 cycle. Nothing rests on the book
+	// in this shape (that is what CancelStopLossSucceeded-without-rest means),
+	// so the fresh placement cannot duplicate an order. We already hold this
+	// coin's trailing-update lock, so the lock-free place primitive is used.
+	// StopLossOutcomeUnknown excludes the unreadable-placement shapes: the
+	// first submission may be resting, so a fresh placement here could stack a
+	// second untracked reduce-only stop (#1456 review round 11). Only a
+	// positively rejected placement retries.
+	retryOutcomeUnknown := false
+	if result.CancelStopLossSucceeded && !restingConfirmed && clampTriggered && !result.StopLossOutcomeUnknown {
+		retryResult, retryOutcome := hlLiquidationPlaceFresh(sc.Script, symbol, side, qty, newTrigger, logger)
+		switch retryOutcome {
+		case hlReplacePlaced, hlReplaceFilled:
+			result = retryResult
+			filledAtSubmit = result.StopLossFilledImmediately && result.StopLossTriggerPx > 0
+			restingConfirmed = !filledAtSubmit && result.StopLossOID > 0
+		case hlReplaceOutcomeUnknown:
+			// #1456 review round 17 (Needs Fixing 1): the RETRY's own outcome
+			// is unreadable — it may be resting. Adopt the retry payload so
+			// applyTrailingStopUpdateResult KEEPS recorded stop state (never a
+			// next-cycle re-arm while an untracked order may exist), and report
+			// outcome-unknown instead of "NO exchange-side stop".
+			result = retryResult
+			retryOutcomeUnknown = true
+		}
+	}
+	switch {
+	case filledAtSubmit:
+		clampOutcome = hlLiquidationActionExited
+	case restingConfirmed:
+		clampOutcome = hlLiquidationActionClamped
+	case retryOutcomeUnknown:
+		// #1456 review round 19 (Optional 3): the RETRY was a fresh placement —
+		// nothing was cancelled by it, so the "old trigger was CANCELLED"
+		// wording would describe an action never performed.
+		clampOutcome = hlLiquidationActionPlacementUnknown
+	case result.CancelStopLossSucceeded && result.StopLossOutcomeUnknown:
+		// #1456 review round 16: the replacement may be resting. Reporting
+		// "protection lost" here asserts a fact nobody measured, and its
+		// recovery sentence promises a re-place that must not happen.
+		clampOutcome = hlLiquidationActionOutcomeUnknown
+	case result.CancelStopLossSucceeded:
+		clampOutcome = hlLiquidationActionProtectionLost
 	}
 	return newHighWater, result, true
 }

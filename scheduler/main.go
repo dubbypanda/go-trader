@@ -755,6 +755,19 @@ func main() {
 	// If you ever split writes across goroutines, add explicit locking —
 	// the existing `mu` lock guards `state`, not `lastRun`.
 	lastRun := make(map[string]time.Time)
+	// #1456 review round 13: last time ANY #1450 liquidation audit pass ran
+	// (dispatch or off-cycle). Bounds the open-cycle blind spot's healing
+	// guarantee to the audit's own cadence instead of the fleet's slowest
+	// strategy interval — see the empty-branch clamp below.
+	var lastLiquidationAudit time.Time
+	// offCycleAuditSaveDirty latches when the #1450 off-cycle audit booked a
+	// realized close but its inline SaveStateWithDB failed. The close only
+	// lives in memory at that point, and the branch that produced it books
+	// nothing further, so without a retry the flush would wait for the next
+	// strategy to come due — the exact unbounded quiet window the inline save
+	// exists to close. The next quiet wake retries the flush even when that
+	// pass booked nothing (#1456 review round 14, Needs Fixing 1).
+	offCycleAuditSaveDirty := false
 	// Same single-writer invariant as lastRun; copied into AppState only during
 	// the save phase so restart throttling survives without widening state locks.
 	lastSummaryPost := cloneTimeMap(state.LastSummaryPost)
@@ -926,7 +939,98 @@ func main() {
 		}
 
 		if len(dueStrategies) == 0 {
-			// Nothing due, wait for next tick
+			// Nothing due, wait for next tick — but the #1450 audit must not
+			// inherit that sleep wholesale. Its "next cycle heals it" guarantee
+			// for a same-cycle-armed stop (#1456 review round 13, Optional 4)
+			// is bound by the fleet's minimum due interval; a single-strategy
+			// live HL perps fleet on a long interval would leave a fresh
+			// position's clamp window open for hours. When the audit's own
+			// cadence (the fastest live-HL-perps interval) has elapsed, run a
+			// dedicated audit cycle instead of sleeping past it; otherwise
+			// clamp the sleep so the loop wakes no later than that deadline.
+			if audSec := liquidationAuditIntervalSeconds(cfg.Strategies, intervals); audSec > 0 && os.Getenv("HYPERLIQUID_ACCOUNT_ADDRESS") != "" {
+				now := time.Now().UTC()
+				if lastLiquidationAudit.IsZero() || now.Sub(lastLiquidationAudit) >= time.Duration(audSec)*time.Second {
+					// #1456 review round 17 (Needs Fixing 2): this pass cancels
+					// and places LIVE reduce-only stops, re-arms static-scalar
+					// owners, books realized closes and converges on-chain hedge
+					// legs. The dispatch phase below refuses exactly that class
+					// of work once saveFailures hits 3; this branch sits BEFORE
+					// that gate and stays reachable while dueStrategies remains
+					// empty, so on a quiet fleet whose SQLite writes are failing
+					// it would move live orders every cadence while every booked
+					// close existed only in memory. Halt identically: place
+					// nothing, book nothing, until a save succeeds. The probe
+					// save is what lets a fleet that never comes due recover —
+					// the dispatch halt heals through its own end-of-cycle save
+					// attempt, and without a probe this branch has none — and
+					// the clock stamp keeps it to one attempt per cadence.
+					if saveFailures >= 3 {
+						fmt.Println("[CRITICAL] State save failed 3x, skipping off-cycle liquidation audit this pass")
+						offCycleAuditSaveDirty, saveFailures = flushOffCycleLiquidationAuditState(state, cfg, stateDB, &mu, 0, offCycleAuditSaveDirty, saveFailures, true)
+						lastLiquidationAudit = time.Now().UTC()
+						continue
+					}
+					mutations := runOffCycleLiquidationAudit(cfg.Strategies, state, &mu, notifier, logMgr)
+					// Stamp unconditionally — including fetch failure — so a
+					// failing endpoint can never turn this branch into a hot
+					// retry loop; the next attempt waits out the full cadence.
+					//
+					// #1456 review round 16 (Optional 1): stamp COMPLETION time,
+					// not the pre-run `now`. This branch continues to the top of
+					// the loop without sleeping, so the next iteration re-tests
+					// time.Now().Sub(lastLiquidationAudit) >= audSec — already
+					// true whenever the pass itself took at least audSec. A pass
+					// that fetches clearinghouseState plus mids and spawns a
+					// placement subprocess per candidate can reach that on a slow
+					// API, and a persistently failing re-arm produces an action
+					// every pass, so the pre-run stamp would drive back-to-back
+					// exchange fetches and live placements with no pacing — the
+					// very hot loop the unconditional stamp exists to prevent.
+					// Re-eligibility is now a full cadence after COMPLETION.
+					lastLiquidationAudit = time.Now().UTC()
+					// #1456 review rounds 14 and 15 (Needs Fixing 1): the audit
+					// rewrites pos.StopLossOID / pos.StopLossTriggerPx on every
+					// clamp and re-arm, books realized closes through
+					// recordPerpsStopLossClose, and converges real on-chain
+					// hedge legs — all in memory until SaveState commits — then
+					// this branch CONTINUES past the
+					// loop body's only SaveStateWithDB. Because the branch is
+					// re-entered on every wake while dueStrategies stays empty,
+					// a quiet fleet could run pass after pass without ever
+					// reaching that save — the unsaved window is the whole
+					// quiet period, not one tick. After an unclean exit the
+					// position reloads open with cash unchanged while the
+					// exchange is flat, and the next reconcile re-books it as
+					// hl_sync_external at a later mark, after the operator was
+					// already DM'd the original close. Flush inline before
+					// sleeping, exactly as reconcilePendingLimitOrders does
+					// before its own continue. Nothing changed → no extra write.
+					offCycleAuditSaveDirty, saveFailures = flushOffCycleLiquidationAuditState(state, cfg, stateDB, &mu, mutations, offCycleAuditSaveDirty, saveFailures, false)
+					continue
+				}
+				delay := schedulerDelay(cfg.Strategies, intervals, lastRun, cfg.IntervalSeconds, time.Now(), tickSeconds)
+				if wait := time.Until(lastLiquidationAudit.Add(time.Duration(audSec) * time.Second)); wait < delay {
+					delay = wait
+				}
+				if minTick := time.Duration(tickSeconds) * time.Second; delay < minTick {
+					delay = minTick
+				}
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+					continue
+				case <-reloadCh:
+					timer.Stop()
+					reloadConfig()
+					processConfigReloads()
+					continue
+				case <-stopCh:
+					timer.Stop()
+					fmt.Println("[shutdown] exiting trading loop.")
+					return
+				}
+			}
 			delay := schedulerDelay(cfg.Strategies, intervals, lastRun, cfg.IntervalSeconds, time.Now(), tickSeconds)
 			timer := time.NewTimer(delay)
 			select {
@@ -1986,17 +2090,73 @@ func main() {
 					reportHLReconcileGaps(notifier, collectHLReconcileGapResults(state, &mu))
 				}
 
-				// #621: Build a coin→|on-chain qty| map from the pre-fetched positions
-				// so SL placement can cap its size when virtual qty > on-chain qty
-				// (e.g. after a manual TP reduced the position without the bot's knowledge).
-				hlOnChainAbsQty := make(map[string]float64, len(hlPositions))
-				for _, p := range hlPositions {
-					sz := p.Size
-					if sz < 0 {
-						sz = -sz
+				// #621/#1450: build the three coin-keyed views from the
+				// pre-fetched positions — on-chain |qty| for the SL size cap,
+				// exchange-reported liquidation prices, and the on-chain net
+				// side per coin. Single source of truth shared with the
+				// off-cycle audit pass (buildHLLiquidationMaps doc).
+				hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin := buildHLLiquidationMaps(hlPositions)
+
+				// #1450 audit: heal stops that sit past the liquidation price
+				// for the STATIC SCALAR owners (stop_loss_pct,
+				// stop_loss_margin_pct, the max_drawdown_pct fallback), which
+				// have no re-place mechanism of their own, and report the
+				// self-healing owners. Runs here — post-reconcile, pre-dispatch
+				// — so it cannot interleave with a walker cancel+replace on the
+				// same OID. This is also what catches a stop armed on the OPEN
+				// cycle, where the snapshot predated the position.
+				// hlStateFetched is threaded in rather than wrapping the call:
+				// without this cycle's snapshot both maps are empty, and an
+				// empty snapshot must never read as "every position is a
+				// phantom" (see runHyperliquidLiquidationAudit).
+				auditRes := runHyperliquidLiquidationAudit(cfg.Strategies, state, hlLiquidationPx, hlNetSideByCoin, hlOnChainAbsQty, hlStateFetched, &mu, notifier, time.Now().UTC())
+				// Stamp the audit clock whenever the audit RAN (fills or not) —
+				// the off-cycle pass keys off this and must not re-run a fresh
+				// dispatch-path audit immediately.
+				//
+				// #1456 review round 15 (Optional 2): "RAN" means it inspected
+				// THIS cycle's snapshot. runHyperliquidLiquidationAudit returns
+				// immediately when hlStateFetched is false — it examined no
+				// candidate and touched no order — so stamping there recorded an
+				// audit that never happened and suppressed the off-cycle pass
+				// for a full cadence. That pass performs its OWN independent
+				// fetch and may well succeed, so on the long-interval fleet it
+				// serves, one transient HL API failure handed back the healing
+				// window. The off-cycle pass's own unconditional stamp is
+				// separate and stays: it exists to stop a failing endpoint
+				// becoming a hot retry loop.
+				if hlStateFetched {
+					lastLiquidationAudit = time.Now().UTC()
+				}
+				if auditRes.ImmediateFills > 0 {
+					fmt.Printf("[WARN] #1450 liquidation audit: %d position(s) exited on a clamped stop this cycle\n", auditRes.ImmediateFills)
+					// A close booked here is a realized close like any other, so
+					// it gets the SAME operator notification the walker path
+					// produces — the channel trade line plus the per-strategy DM
+					// alert. Without this the only signal was the stdout line
+					// above and a throttled "tightened to $X" DM that does not
+					// say the position is now flat (and can be suppressed).
+					for _, cd := range auditRes.CloseDetails {
+						if chKey := notifier.resolveChannelKey(cd.SC.Platform, cd.SC.Type); chKey != "" {
+							channelTrades[chKey]++
+							channelTradeDetails[chKey+"|"+extractAsset(cd.SC)] = append(channelTradeDetails[chKey+"|"+extractAsset(cd.SC)], cd.Detail)
+						}
 					}
-					if sz > 1e-9 {
-						hlOnChainAbsQty[p.Coin] = sz
+					// Grouped per strategy (#1456 review round 17, Optional 1):
+					// sendTradeAlerts emits the LAST n rows per call, so one
+					// call per detail re-emitted the newest close twice and
+					// never reported the older one when a single strategy booked
+					// two closes this pass.
+					sendAuditCloseAlerts(auditRes.CloseDetails, state.Strategies, &mu, notifier)
+					totalTrades += len(auditRes.CloseDetails)
+					// #1456 review round 10 (Optional 3): an audit-booked close
+					// is a primary lifecycle event. Converge the correlated
+					// hedge leg through the ONE reconciler NOW — the audit
+					// closes strategies that are not due this cycle, and a
+					// hedge leg carries no stop by design, so without this it
+					// sits unmanaged until the owner's next due cycle.
+					if n := convergeHedgesAfterAuditClose(auditRes.CloseDetails, state.Strategies, &mu, prices, notifier, logMgr.GetStrategyLogger); n > 0 {
+						fmt.Printf("[WARN] #1450 liquidation audit: converged %d hedge leg(s) post-close\n", n)
 					}
 				}
 
@@ -2784,9 +2944,9 @@ func main() {
 								// on-chain size (!capped) so the trailing SL covers the
 								// new total without waiting for a trailing trigger move.
 								forceResize := hlScaleInResizePending && !capped
-								newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, result.Symbol, hlPosSide, slEffectiveQty, hlPosSnapshot, price, hlStopLossHighWaterPx, hlStopLossTriggerPx, hlStopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manageRatchetTightened}, notifier, logger)
+								newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, result.Symbol, hlPosSide, slEffectiveQty, hlPosSnapshot, price, hlStopLossHighWaterPx, hlStopLossTriggerPx, hlStopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manageRatchetTightened, liquidationPx: hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, result.Symbol, hlPosSide)}, notifier, logger)
 								mu.Lock()
-								if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, result.Symbol, hlPosSide, hlStopLossOID, newHighWater, updateConfirmed, slUpdate, logger); immediateFill {
+								if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, result.Symbol, hlPosSide, hlStopLossOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, 0); immediateFill {
 									trades++
 									detail = fmt.Sprintf("[%s] LIVE TRAILING SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
 								}
@@ -2829,14 +2989,45 @@ func main() {
 								}
 								mu.Unlock()
 							}
-							if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 && hlStopLossOID == 0 {
+							// #1456 review round 18 (Needs Fixing 1): also requires a
+							// CLEAN slate (no recorded trigger). A recorded trigger
+							// with no OID is the unreadable-placement residue — an
+							// order may rest under an unknown OID, so re-arming here
+							// would stack a second reduce-only stop.
+							if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 && hlStopLossOID == 0 && hlStopLossTriggerPx == 0 {
 								triggerPx := fixedStopLossATRTriggerPx(sc, hlPosSide, hlPosSnapshot)
+								// #1450: a one-shot fixed-ATR arm has no
+								// re-place path of its own, so clamp BEFORE
+								// placement rather than healing it later.
+								// Tighten-only; 0 (unknown) leaves it alone.
+								//
+								// The alert is held until the placement has been
+								// ATTEMPTED (below, after the state apply releases
+								// mu): an arm whose order never rests leaves the
+								// position with no exchange-side stop, and calling
+								// that "tightened to $X" tells the operator the
+								// opposite of what happened. No defer here — this
+								// dispatch body runs directly inside main(), so a
+								// deferred call would not run until the process
+								// exits.
+								clampOffendingPx := 0.0
+								clampedTriggerPx := 0.0
+								clampArmAction := hlLiquidationActionRearmFailed
+								armLiqPx := hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, result.Symbol, hlPosSide)
+								if clamped, wasClamped := clampStopInsideLiquidation(hlPosSide, triggerPx, armLiqPx); wasClamped {
+									logger.Warn("#1450 fixed ATR SL for %s would rest past liquidation $%.4f; tightening $%.4f -> $%.4f",
+										result.Symbol, armLiqPx, triggerPx, clamped)
+									clampOffendingPx = triggerPx
+									clampedTriggerPx = clamped
+									triggerPx = clamped
+								}
 								if triggerPx > 0 {
 									slEffectiveQty, capped := hlSLEffectiveQty(result.Symbol, hlPosQty, hlOnChainAbsQty)
 									if capped {
 										logger.Warn("fixed ATR SL arm: virtual qty %.6f > on-chain %.6f for %s; capping SL size to on-chain qty (#621)", hlPosQty, slEffectiveQty, result.Symbol)
 									}
 									slResult, ok2 := hyperliquidArmFixedATRStopLossLive(sc, result.Symbol, hlPosSide, slEffectiveQty, triggerPx, notifier, logger)
+									clampArmAction = hlLiquidationArmClampAction(slResult, ok2)
 									if ok2 && slResult != nil {
 										mu.Lock()
 										if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos.Quantity > 0 && pos.Side == hlPosSide && pos.StopLossOID == 0 {
@@ -2850,14 +3041,37 @@ func main() {
 												pos.StopLossTriggerPx = slResult.StopLossTriggerPx
 												stampOpenTradeWithProtectionSnapshot(stratState, stateDB, sc, result.Symbol, pos)
 												logger.Info("Fixed ATR SL armed oid=%d @ $%.4f", slResult.StopLossOID, slResult.StopLossTriggerPx)
+											} else if slResult.StopLossOutcomeUnknown && slResult.StopLossTriggerPx > 0 {
+												// #1456 review round 18 (Needs Fixing 1): the
+												// arm's outcome is unreadable — the order may be
+												// resting under an OID nobody recorded. Record the
+												// REQUESTED trigger (OID stays 0) so this site's own
+												// `StopLossOID == 0` guard plus the audit's armed-at-
+												// reachable-trigger read submit no second placement,
+												// instead of re-placing on every Signal == 0 cycle.
+												pos.StopLossTriggerPx = slResult.StopLossTriggerPx
+												stampOpenTradeWithProtectionSnapshot(stratState, stateDB, sc, result.Symbol, pos)
+												logger.Warn("Fixed ATR SL outcome unreadable for %s: requested trigger $%.4f recorded (oid unknown)", result.Symbol, slResult.StopLossTriggerPx)
 											}
 										}
 										mu.Unlock()
 									}
 								}
+								// #1450: report what ACTUALLY happened, with no
+								// lock held. "clamped" is claimed only when a stop
+								// is on the book; otherwise the position has no
+								// exchange-side stop and the operator is told so.
+								if clampedTriggerPx > 0 {
+									notifyHLStopPastLiquidation(sc, result.Symbol, hlPosSide, clampOffendingPx, clampedTriggerPx, armLiqPx, clampArmAction, notifier, logger, time.Now().UTC())
+								}
 							}
 							if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 {
-								runHyperliquidProtectionSync(sc, stratState, stateDB, result.Symbol, &mu, notifier, logger, "HL protection synced", hlReconcileFillHintsJSON)
+								if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stateDB, result.Symbol, &mu, notifier, logger, "HL protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin); fillPx > 0 {
+									// #1456 review round 11: a submit-fill SL close booked by the
+									// sync gets the same trade line any other exit produces.
+									trades++
+									detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
+								}
 								runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
 							}
 							// #873 scale-in: a same-direction signal on an open HL
@@ -2939,6 +3153,23 @@ func main() {
 								} else {
 									trades, detail, openTrade, ratchetAlert = executeHyperliquidResultDeferredOpen(sc, stratState, result, execResult, signalStr, price, cfg.Regime, cfg, hurstDecision, logger)
 								}
+								// #1456 review round 12: journal the open/scale_in trade +
+								// replay decision BEFORE any same-cycle closer can run — the
+								// post-trade protection sync, the ratchet-tighten walker,
+								// and the #885 inline arm can all book a submit-fill SL close
+								// that DELETES the position. Recorded any later, the open
+								// decision was skipped (pos already nil) while the close side
+								// still journaled full_close, leaving the #1431 paper mirror
+								// a close with no matching open. Protection-snapshot fields
+								// stamped later are backfilled by the sync's
+								// stampOpenTradeWithProtectionSnapshot (#625/#669).
+								if openTrade != nil {
+									var pos *Position
+									if p, ok := stratState.Positions[result.Symbol]; ok {
+										pos = p
+									}
+									recordPositionOpen(stratState, sc, openTrade, pos)
+								}
 								mu.Unlock()
 								// #1110: deliver any ratchet-tighten DM after releasing the lock
 								// (Discord/Telegram HTTP must not run under mu). Nil-safe no-op
@@ -2957,13 +3188,16 @@ func main() {
 								//     since paper has a nil execResult.
 								ratchetWalkerOwnedByScaleIn := scaleInAddQty > 0 && execResult != nil && trades > 0
 								if ratchetAlert != nil && !ratchetWalkerOwnedByScaleIn {
-									if extraTrades, slDetail := runTrailingStopUpdateAfterRatchetTighten(sc, stratState, result.Symbol, price, hlOnChainAbsQty, &mu, notifier, logger); extraTrades > 0 {
+									if extraTrades, slDetail := runTrailingStopUpdateAfterRatchetTighten(sc, stratState, result.Symbol, price, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin, &mu, notifier, logger); extraTrades > 0 {
 										trades += extraTrades
 										detail = slDetail
 									}
 								}
 								if execResult != nil && trades > 0 {
-									runHyperliquidProtectionSync(sc, stratState, stateDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON)
+									if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stateDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin); fillPx > 0 {
+										trades++
+										detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
+									}
 									runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
 									// #873/#882: for a trailing-SL owner the post-trade sync
 									// re-sized only the on-chain TPs (the walker owns the SL).
@@ -2986,7 +3220,7 @@ func main() {
 										// #1416: when this add also cleared a ratchet tier, the same
 										// single pass must place the grown size at the NEW tighter
 										// trigger instead of re-placing the old wider one.
-										if extraTrades, slDetail := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlOnChainAbsQty, filledAddQty, ratchetAlert != nil, &mu, notifier, logger); extraTrades > 0 {
+										if extraTrades, slDetail := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin, filledAddQty, ratchetAlert != nil, &mu, notifier, logger); extraTrades > 0 {
 											trades += extraTrades
 											detail = slDetail
 										}
@@ -3009,13 +3243,37 @@ func main() {
 											detail = slDetail
 										}
 									}
-									mu.Lock()
-									var pos *Position
-									if p, ok := stratState.Positions[result.Symbol]; ok {
-										pos = p
+									// #1456 review round 14 (Needs Fixing 2): the open /
+									// scale_in trade row is recorded up front (round 12) so
+									// the #1431 decision log always carries its open leg
+									// before any same-cycle closer can delete the position.
+									// copyPositionOpenSnapshotToTrade therefore reads the
+									// stop fields BEFORE the #885 inline arm and the
+									// scale-in re-size above set them, and a PURE TRAILING
+									// owner never reaches the protection sync's own
+									// stampOpenTradeWithProtectionSnapshot backfill —
+									// buildHyperliquidProtectionPlan returns syncOK=false
+									// for it (slMult is 0 and trailing_tp_ratchet places no
+									// on-chain tiers), on this cycle and every later one.
+									// The open row then carried StopLossOID=0 /
+									// StopLossTriggerPx=0 permanently and the open DM
+									// omitted its "SL: $…" line for a position that DOES
+									// have a stop armed — the exact gap #625 added the
+									// stamp to close. Stamp from the position now, after
+									// whichever path armed it. stampOpenTradeFromPosition
+									// only fills fields that are still zero, so an OID
+									// already stamped (fixed-ATR / tiered owners, a
+									// scale-in onto an armed position) is never overwritten
+									// with a blank. Skipped when a submit-fill flattened
+									// the position this cycle — there is no open row left
+									// to backfill.
+									if openTrade != nil {
+										mu.Lock()
+										if pos, okPos := stratState.Positions[result.Symbol]; okPos && pos != nil && pos.Quantity > 0 {
+											stampOpenTradeWithProtectionSnapshot(stratState, stateDB, sc, result.Symbol, pos)
+										}
+										mu.Unlock()
 									}
-									recordPositionOpen(stratState, sc, openTrade, pos)
-									mu.Unlock()
 									// #1159: a fresh open (not an add — that branch set the
 									// quantity above) is the whole unhedged increment.
 									if scaleInAddQty <= 0 && openTrade != nil && openTrade.Quantity > 0 {
@@ -3206,7 +3464,10 @@ func main() {
 							// the latter sees on-chain-reconciled qty. Post-TP SL
 							// adjustment is deferred to the post-stamp block below so
 							// regime-keyed *_atr_regime SL sees pos.Regime (#878 review).
-							runHyperliquidProtectionSync(sc, stratState, stateDB, sc.Symbol, &mu, notifier, logger, "HL manual protection synced", hlReconcileFillHintsJSON)
+							if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stateDB, sc.Symbol, &mu, notifier, logger, "HL manual protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin); fillPx > 0 {
+								trades++
+								detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, sc.Symbol, fillPx)
+							}
 						}
 						// #872: run the close evaluator and stamp the regime BEFORE
 						// arming the post-TP SL / ratchet / trailing walker below. The
@@ -3299,12 +3560,12 @@ func main() {
 								// position (the trailing SL otherwise covers only the
 								// pre-add size until the next trigger move).
 								forceResize := pos.ScaleInResizePending && !capped
-								newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, sc.Symbol, pos.Side, slEffectiveQty, pos, mark, pos.StopLossHighWaterPx, pos.StopLossTriggerPx, pos.StopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manualRatchetTightened}, notifier, logger)
+								newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, sc.Symbol, pos.Side, slEffectiveQty, pos, mark, pos.StopLossHighWaterPx, pos.StopLossTriggerPx, pos.StopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manualRatchetTightened, liquidationPx: hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, sc.Symbol, pos.Side)}, notifier, logger)
 								mu.Lock()
 								// Shared handler with the perps path — books an immediate fill,
 								// updates a resting replacement, or clears a cancelled-without-rest
 								// OID. Previously this only handled the resting-replacement case.
-								if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, sc.Symbol, pos.Side, prevSLOID, newHighWater, updateConfirmed, slUpdate, logger); immediateFill {
+								if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, sc.Symbol, pos.Side, prevSLOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, 0); immediateFill {
 									logger.Info("[%s] manual trailing SL filled immediately %s @ $%.2f", sc.ID, sc.Symbol, fillPx)
 								}
 								// The manual trailing walker owns the SL re-size when it fires
@@ -3668,6 +3929,9 @@ func main() {
 			fmt.Printf("[CRITICAL] Save state failed (%d/3): %v\n", saveFailures, err)
 		} else {
 			saveFailures = 0
+			// This save commits everything the off-cycle audit left in memory
+			// too, so its retry latch is discharged here as well.
+			offCycleAuditSaveDirty = false
 		}
 
 		// #175: Decide whether to auto-post daily leaderboard (check inside lock).

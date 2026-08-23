@@ -31,7 +31,20 @@ type hlProtectionPlan struct {
 	CancelTPOIDs []int64
 }
 
-func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtectionPlan, bool) {
+// buildHyperliquidProtectionPlan resolves the per-cycle reduce-only SL/TP plan.
+//
+// liquidationPx (#1450) is the CURRENT-cycle exchange-reported liquidation
+// price for this coin, or 0 when unknown (paper, no snapshot, HL reported
+// null). When positive it does two things, both one-way tightening:
+//
+//   - clamps the resolved SL ATR multiple so the derived trigger lands just
+//     inside liquidation instead of past it; and
+//   - sets ForceSLReplace when the RESTING trigger is past liquidation, which
+//     is what heals a stop armed on the OPEN cycle (inline scalar SL at order
+//     time, manual open) where no liquidation price existed yet.
+//
+// liquidationPx == 0 leaves the plan byte-identical to the pre-#1450 behavior.
+func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position, liquidationPx float64) (hlProtectionPlan, bool) {
 	if (sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid" || pos == nil {
 		return hlProtectionPlan{}, false
 	}
@@ -65,11 +78,55 @@ func buildHyperliquidProtectionPlan(sc StrategyConfig, pos *Position) (hlProtect
 	if slMult <= 0 && len(tiers) == 0 {
 		return hlProtectionPlan{}, false
 	}
+	// #1450: keep the derived SL trigger reachable. Both effects are one-way
+	// tightening — a clamp never widens a stop, and ForceSLReplace only causes
+	// a cancel+replace at an already-safe trigger.
+	forceSLPastLiquidation := false
+	if liquidationPx > 0 {
+		if clampedMult, clamped := hlClampProtectionSLMult(pos.Side, pos.riskAnchorPrice(), pos.EntryATR, slMult, liquidationPx); clamped {
+			slMult = clampedMult
+			// Force the replace only when the clamped trigger is strictly
+			// TIGHTER than what is already resting. A clamp that merely
+			// reproduces the resting trigger (the audit tightened it earlier in
+			// this same cycle) needs no order churn, and forcing on the clamp
+			// alone is what made an unclampable geometry cancel+replace forever.
+			if clampedPx := hlProtectionSLTriggerPx(pos.Side, pos.riskAnchorPrice(), pos.EntryATR, slMult); hlTriggerStrictlyTighter(pos.Side, clampedPx, pos.StopLossTriggerPx) {
+				forceSLPastLiquidation = true
+			}
+		}
+		// A resting trigger past liquidation must be replaced — that is the
+		// open-cycle heal. Gate it on the trigger this plan would actually rest
+		// at being REACHABLE: when the clamp had to refuse (a far-side
+		// liquidation price that no positive multiple can express), forcing the
+		// replace would cancel and re-place the same unfillable order every
+		// cycle forever. The per-cycle audit tightens the resting trigger
+		// directly in that case.
+		if stopPastLiquidation(pos.Side, pos.StopLossTriggerPx, liquidationPx) &&
+			hlProtectionSLTriggerReachable(pos.Side, pos.riskAnchorPrice(), pos.EntryATR, slMult, liquidationPx) {
+			forceSLPastLiquidation = true
+		}
+	}
+	// #1456 review round 18 (Needs Fixing 1): an UNREADABLE fresh placement
+	// records its REQUESTED trigger with the OID left at 0
+	// (applyTrailingStopUpdateResult / the fixed-ATR arm site) — the order may
+	// be resting under an OID nobody recorded. Re-placing from the empty-OID
+	// path here would stack a second reduce-only stop (round 11's exact
+	// hazard), so suppress this plan's SL leg for the shape and let the TPs
+	// still sync. The recorded trigger keeps the audit's re-arm queue closed;
+	// a positively rejected placement clears both fields instead, so genuine
+	// retries are unaffected. After an external fill this shape exists only on
+	// a position the reconciler is about to delete — suppressing the placement
+	// is correct there too.
+	if pos.StopLossOID == 0 && pos.StopLossTriggerPx > 0 {
+		slMult = 0
+		forceSLPastLiquidation = false
+	}
 	tierCount := len(tiers)
 	return hlProtectionPlan{
-		Symbol: pos.Symbol,
-		Side:   pos.Side,
-		Size:   pos.Quantity,
+		ForceSLReplace: forceSLPastLiquidation,
+		Symbol:         pos.Symbol,
+		Side:           pos.Side,
+		Size:           pos.Quantity,
 		// #873: SL/TP triggers anchor to the FROZEN entry (riskAnchorPrice), not
 		// the blended AvgCost — so a scale-in re-sizes protection to the new
 		// total at the unchanged trigger geometry. Equals AvgCost for a position
@@ -382,7 +439,68 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 		}
 		notifyHLProtectionFailure(notifier, sc, plan.Symbol, msg)
 	}
+	// #1456 review round 9: cancel-landed + place-failed is qualitatively
+	// different from a TP-only hiccup — the position now has NO exchange-side
+	// stop. The generic "protection partially failed" wording above does not
+	// say that, so name it. Recovery is automatic: applyHyperliquidProtectionSync
+	// cleared the dead OID and the next sync re-places from the empty-OID path.
+	if hlProtectionLostExchangeStop(result) {
+		msg := fmt.Sprintf("**HL PROTECTION CRITICAL** [%s] %s force-replace cancelled the resting stop-loss but the replacement did NOT rest — the position has NO exchange-side stop; recorded state cleared, next sync re-places", sc.ID, plan.Symbol)
+		if logger != nil {
+			logger.Error("%s", msg)
+		}
+		if notifier != nil && notifier.HasBackends() {
+			notifier.SendToAllChannels(msg)
+			notifier.SendOwnerDM(msg)
+		}
+	}
+	// #1456 review round 15: distinct from the lost-stop CRITICAL above. The
+	// replacement's outcome is genuinely unknown, so the operator is told what
+	// to check rather than told a falsehood in either direction.
+	if hlProtectionStopOutcomeUnknown(result) {
+		msg := fmt.Sprintf("**HL PROTECTION CRITICAL** [%s] %s force-replace cancelled the resting stop-loss and the replacement's outcome could NOT be read (open-order diff inconclusive) — a reduce-only stop may be resting untracked; recorded state kept, verify the order book on Hyperliquid", sc.ID, plan.Symbol)
+		if logger != nil {
+			logger.Error("%s", msg)
+		}
+		if notifier != nil && notifier.HasBackends() {
+			notifier.SendToAllChannels(msg)
+			notifier.SendOwnerDM(msg)
+		}
+	}
 	return result, true
+}
+
+// hlProtectionLostExchangeStop reports the one protection-sync shape that must
+// never read as an ordinary partial failure (#1456 review round 9): the
+// resting SL was cancelled and nothing replaced it. A placement that landed
+// (StopLossOID > 0) or exited the position at submit (filled immediately)
+// is protection working, never a loss.
+func hlProtectionLostExchangeStop(result *HyperliquidProtectionSyncResult) bool {
+	// #1456 review round 15: an outcome-unknown placement is excluded. Its
+	// order may be resting, so "the position has NO exchange-side stop" would
+	// be a false CRITICAL — and the state it claims was cleared is deliberately
+	// kept. hlProtectionStopOutcomeUnknown raises its own alert instead.
+	return result != nil &&
+		result.CancelStopLossSucceeded &&
+		result.StopLossOID <= 0 &&
+		!result.StopLossFilledImmediately &&
+		!result.StopLossOutcomeUnknown
+}
+
+// hlProtectionStopOutcomeUnknown reports the force-replace shape where the
+// cancel landed but the replacement's outcome could not be read even after the
+// open-order diff (#1456 review round 15). It is neither "protection lost" nor
+// "protection working": a reduce-only stop may be resting on the book that the
+// scheduler does not track. Recorded state is kept untouched, and the next sync
+// is deliberately still allowed to place — a duplicate reduce-only stop clips
+// to the position and no-ops once flat, while suppressing the placement could
+// leave the position genuinely naked, which is the worse failure.
+func hlProtectionStopOutcomeUnknown(result *HyperliquidProtectionSyncResult) bool {
+	return result != nil &&
+		result.CancelStopLossSucceeded &&
+		result.StopLossOID <= 0 &&
+		!result.StopLossFilledImmediately &&
+		result.StopLossOutcomeUnknown
 }
 
 func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtectionSyncResult, cancelTPOIDs []int64) {
@@ -394,7 +512,32 @@ func applyHyperliquidProtectionSync(pos *Position, result *HyperliquidProtection
 	}
 	if result.StopLossOID > 0 {
 		pos.StopLossOID = result.StopLossOID
+	} else if result.CancelStopLossSucceeded && !result.StopLossOutcomeUnknown {
+		// #1456 review round 9: the force-replace cancel LANDED but the
+		// replacement did not rest — the recorded OID points at a dead order
+		// and the trigger at a price nothing rests at. Clear both, mirroring
+		// the trailing walker's CancelStopLossSucceeded case, so state matches
+		// the book and the next sync re-places from the empty-OID path. A
+		// FAILED cancel never sets this flag, so a still-resting order is
+		// never unrecorded.
+		//
+		// #1456 review round 15: an OUTCOME-UNKNOWN placement is excluded from
+		// this clear. An unreadable response is not a rejection — the order may
+		// be resting — and zeroing the OID here is exactly what let the next
+		// sync's _resolve_missing_oid(0) place a second untracked full-size
+		// reduce-only stop. Keep what is recorded and defer, mirroring how an
+		// unconfirmed CANCEL already defers.
+		pos.StopLossOID = 0
+		pos.StopLossTriggerPx = 0
 	}
+	// #1450: StopLossTriggerPx is present ONLY when this sync actually put an
+	// order on the book (check_hyperliquid.py run_protection_sync). A cycle that
+	// merely echoes the resting OID omits it, so the recorded trigger keeps
+	// matching the order that is really there — including after the per-cycle
+	// audit tightened a stop this plan could not express as a positive ATR
+	// multiple. Rewriting it from a derived price would record a trigger no
+	// order rests at, and the audit would then cancel and re-place that healthy
+	// order every cycle.
 	if result.StopLossTriggerPx > 0 {
 		pos.StopLossTriggerPx = result.StopLossTriggerPx
 	}
@@ -556,9 +699,17 @@ func runHyperliquidProtectionSync(
 	logger *StrategyLogger,
 	logTag string,
 	reconcileFillHintsJSON []byte,
-) bool {
+	// liqPxByCoin (#1450) maps coin -> this cycle's exchange-reported
+	// liquidation price, and netSideByCoin (#1456 review) coin -> the side of
+	// the on-chain NET position that price describes. The plan for each
+	// position reads its liquidation price through hlLiquidationPxForSide — a
+	// position whose own side disagrees with the on-chain net gets 0 (unknown)
+	// and the plan stays byte-identical to pre-#1450 behavior.
+	liqPxByCoin map[string]float64,
+	netSideByCoin map[string]string,
+) (bool, float64) {
 	if stratState == nil || symbol == "" {
-		return false
+		return false, 0
 	}
 	var plan hlProtectionPlan
 	var syncOK bool
@@ -569,13 +720,16 @@ func runHyperliquidProtectionSync(
 		if pos, ok := stratState.Positions[symbol]; ok {
 			oldAppliedRegime := pos.RegimeAppliedLabel
 			regimeChanged := advanceDynamicCloseRegime(pos, stratState, sc)
-			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos, hlLiquidationPxForSide(liqPxByCoin, netSideByCoin, symbol, pos.Side))
 			if syncOK {
 				plan.CancelTPOIDs = dynamicProtectionSurplusTPOIDs(pos.TPOIDs, len(plan.Tiers))
 				if regimeChanged {
 					forceSL, forceTP := dynamicProtectionForceReplace(sc, pos, plan, oldAppliedRegime, true)
-					plan.ForceSLReplace = forceSL
-					plan.ForceTPReplace = forceTP
+					// OR, never assign: the plan may already carry the #1450
+					// past-liquidation force-replace, and dropping it would
+					// leave an unreachable stop resting.
+					plan.ForceSLReplace = plan.ForceSLReplace || forceSL
+					plan.ForceTPReplace = orForceReplace(plan.ForceTPReplace, forceTP)
 				}
 				if pos.ScaleInResizePending {
 					// #873: a scale-in grew the size at the frozen triggers —
@@ -591,27 +745,41 @@ func runHyperliquidProtectionSync(
 	} else {
 		mu.RLock()
 		if pos, ok := stratState.Positions[symbol]; ok {
-			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos)
+			plan, syncOK = buildHyperliquidProtectionPlan(sc, pos, hlLiquidationPxForSide(liqPxByCoin, netSideByCoin, symbol, pos.Side))
 			if syncOK && pos.ScaleInResizePending {
 				// #873: re-size SL + un-cleared TP tiers to the grown total at
 				// the frozen trigger geometry; the watermark is not reset.
-				plan.ForceSLReplace, plan.ForceTPReplace = scaleInProtectionForceReplace(pos, plan)
+				// OR, never assign — the plan may already carry the #1450
+				// past-liquidation force-replace.
+				fSL, fTP := scaleInProtectionForceReplace(pos, plan)
+				plan.ForceSLReplace = plan.ForceSLReplace || fSL
+				plan.ForceTPReplace = orForceReplace(plan.ForceTPReplace, fTP)
 			}
 		}
 		mu.RUnlock()
 	}
 	if !syncOK {
-		return false
+		return false, 0
 	}
 	protection, ok := syncHyperliquidProtection(sc, plan, notifier, logger, reconcileFillHintsJSON)
 	if !ok || protection == nil {
-		return false
+		return false, 0
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	pos, ok := stratState.Positions[symbol]
 	if !ok || pos == nil || pos.Quantity <= 0 || pos.Side != plan.Side {
-		return false
+		return false, 0
+	}
+	// #1456 review round 11 (Optional 2): a placement whose trigger filled at
+	// submit has FLATTENED the position on-chain. Booking nothing left virtual
+	// state open with a trigger no order rests at, and the realized close only
+	// surfaced later as hl_sync_external at that cycle's mark. Book NOW at the
+	// trigger price — same as the walker, audit, and execute siblings.
+	if protection.StopLossFilledImmediately && protection.StopLossTriggerPx > 0 {
+		if recordPerpsStopLossClose(stratState, symbol, protection.StopLossTriggerPx, "protection_sync_sl_immediate", logger) {
+			return true, protection.StopLossTriggerPx
+		}
 	}
 	applyHyperliquidProtectionSync(pos, protection, plan.CancelTPOIDs)
 	// #873: the scale-in re-size has been applied on-chain; clear the one-shot
@@ -638,7 +806,7 @@ func runHyperliquidProtectionSync(
 	if logger != nil {
 		logger.Info("%s (sl_oid=%d tp_oids=%v)", logTag, pos.StopLossOID, pos.TPOIDs)
 	}
-	return true
+	return true, 0
 }
 
 // hyperliquidPlacesOnChainTPs reports whether sc is configured to place

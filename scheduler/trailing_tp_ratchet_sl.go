@@ -43,6 +43,12 @@ func runTrailingStopUpdateAfterRatchetTighten(
 	symbol string,
 	mark float64,
 	hlOnChainAbsQty map[string]float64,
+	// #1450: coin -> current-cycle exchange liquidation price; a missing or
+	// non-positive entry means "unknown" and the walker skips the clamp. The
+	// companion net-side map (#1456 review) gates the read on this position's
+	// side matching the on-chain NET side.
+	hlLiquidationPx map[string]float64,
+	hlNetSideByCoin map[string]string,
 	mu *sync.RWMutex,
 	notifier *MultiNotifier,
 	logger *StrategyLogger,
@@ -73,11 +79,16 @@ func runTrailingStopUpdateAfterRatchetTighten(
 		if capped && logger != nil {
 			logger.Warn("ratchet same-cycle trailing SL: virtual qty %.6f > on-chain %.6f for %s; capping (#621)", qty, slEffectiveQty, symbol)
 		}
+		// #1450: the shared ratchetTightenReplacePolicy is a package-level var;
+		// copy it per call so the coin's liquidation price never leaks across
+		// strategies.
+		livePolicy := ratchetTightenReplacePolicy
+		livePolicy.liquidationPx = hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, symbol, side)
 		newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(
-			sc, symbol, side, slEffectiveQty, &posSnap, mark, highWater, triggerPx, slOID, ratchetTightenReplacePolicy, notifier, logger)
+			sc, symbol, side, slEffectiveQty, &posSnap, mark, highWater, triggerPx, slOID, livePolicy, notifier, logger)
 		mu.Lock()
 		defer mu.Unlock()
-		if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, slOID, newHighWater, updateConfirmed, slUpdate, logger); immediateFill {
+		if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, slOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, 0); immediateFill {
 			return 1, fmt.Sprintf("[%s] LIVE TRAILING SL %s @ $%.2f", sc.ID, symbol, fillPx)
 		}
 		return 0, ""

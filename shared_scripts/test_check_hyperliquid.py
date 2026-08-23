@@ -500,6 +500,50 @@ class TestClassifySLResponse:
         assert payload is None
 
 
+# #1456 review round 10: a CONFIRMED HL cancel lands as {"status":"ok"} with a
+# per-order success entry; rejections arrive inside a normal body instead of
+# raising.
+_CANCEL_OK_RESPONSE = {
+    "status": "ok",
+    "response": {"type": "cancel", "data": {"statuses": ["success"]}},
+}
+_CANCEL_REJECTED_RESPONSE = {
+    "status": "err",
+    "response": {"type": "cancel", "data": {"statuses": [{"error": "order already filled"}]}},
+}
+
+
+class TestClassifyCancelResponse:
+    """Only an exchange-confirmed landing may report a cancel as succeeded."""
+
+    def _load(self):
+        mod, spec = _load_check_module()
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_confirmed_string_status_is_ok(self):
+        assert self._load()._classify_cancel_response(_CANCEL_OK_RESPONSE) == ("ok", "")
+
+    def test_confirmed_dict_status_without_error_is_ok(self):
+        resp = {"status": "ok", "response": {"data": {"statuses": [{}]}}}
+        assert self._load()._classify_cancel_response(resp) == ("ok", "")
+
+    def test_top_level_err_rejects(self):
+        kind, payload = self._load()._classify_cancel_response({"status": "err"})
+        assert kind == "error"
+        assert "err" in payload
+
+    def test_per_order_error_rejects(self):
+        resp = {"status": "ok", "response": {"data": {"statuses": [{"error": "no such order"}]}}}
+        assert self._load()._classify_cancel_response(resp)[0] == "error"
+
+    def test_missing_statuses_fails_closed(self):
+        assert self._load()._classify_cancel_response({})[0] == "error"
+
+    def test_non_dict_fails_closed(self):
+        assert self._load()._classify_cancel_response(None)[0] == "error"
+
+
 class TestUpdateStopLoss:
     """#501: trailing stops reuse cancel_trigger_order + place_stop_loss without
     submitting a market order."""
@@ -509,10 +553,13 @@ class TestUpdateStopLoss:
         side="long",
         place_response=None,
         cancel_side_effect=None,
+        cancel_response=_UNSET,
+        place_side_effect=None,
         open_oids=None,
         open_oids_side_effect=None,
         lookup_result=_UNSET,
         cancel_oid=11111,
+        post_place_oids=_UNSET,
     ):
         mod, spec = _load_check_module()
         spec.loader.exec_module(mod)
@@ -521,10 +568,30 @@ class TestUpdateStopLoss:
         mock_adapter = MagicMock()
         mock_adapter_cls.return_value = mock_adapter
         mock_adapter.round_perps_trigger_px.side_effect = lambda _symbol, px: round(px, 2)
+        mock_adapter.cancel_trigger_order.return_value = (
+            _CANCEL_OK_RESPONSE if cancel_response is _UNSET else cancel_response
+        )
+        base_oids = {11111} if open_oids is None else open_oids
         if open_oids_side_effect is not None:
             mock_adapter.open_order_oids.side_effect = open_oids_side_effect
+        elif post_place_oids is not _UNSET:
+            # #1456 review round 16: the book-diff resolver re-reads the book
+            # AFTER submitting, so the harness must be able to answer
+            # differently on that second read. The first read is the pre-submit
+            # snapshot; every read after it reports post_place_oids.
+            reads = {"n": 0}
+
+            def _oids(_symbol):
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    return base_oids
+                if isinstance(post_place_oids, Exception):
+                    raise post_place_oids
+                return post_place_oids
+
+            mock_adapter.open_order_oids.side_effect = _oids
         else:
-            mock_adapter.open_order_oids.return_value = {11111} if open_oids is None else open_oids
+            mock_adapter.open_order_oids.return_value = base_oids
         if cancel_side_effect is not None:
             mock_adapter.cancel_trigger_order.side_effect = cancel_side_effect
         if lookup_result is not _UNSET:
@@ -534,6 +601,8 @@ class TestUpdateStopLoss:
                 {"resting": {"oid": 22222}}
             ]}}
         }
+        if place_side_effect is not None:
+            mock_adapter.place_stop_loss.side_effect = place_side_effect
 
         captured = StringIO()
         import builtins
@@ -566,11 +635,80 @@ class TestUpdateStopLoss:
         adapter.place_stop_loss.assert_called_once_with("ETH", 0.5, 3104.12, True)
         assert out["stop_loss_oid"] == 22222
 
+    def test_unreadable_placement_resolves_to_the_resting_oid(self):
+        """#1456 review round 16 (Optional 2), must-survive (a): the response
+        could not be read but the order DID rest. The book diff finds the one
+        fresh oid and reports a normal resting placement, so Go sees no
+        ambiguity, keeps no stale state, and never places a duplicate."""
+        out, _ = self._run_update(
+            place_response={"status": "weird"},
+            post_place_oids={22222},
+        )
+        assert out["stop_loss_oid"] == 22222
+        assert "stop_loss_outcome_unknown" not in out
+
+    def test_placement_exception_resolves_to_the_resting_oid(self):
+        def _boom(*_a, **_k):
+            raise RuntimeError("connection reset after submit")
+
+        out, _ = self._run_update(place_side_effect=_boom, post_place_oids={22222})
+        assert out["stop_loss_oid"] == 22222
+        assert "stop_loss_outcome_unknown" not in out
+
+    def test_unreadable_placement_with_nothing_resting_is_a_genuine_failure(self):
+        """Must-survive (b): the diff shows no new order, so the submission
+        really did not land. Reported as a plain failure — NOT outcome-unknown —
+        so Go clears the dead OID and re-places, as before."""
+        out, _ = self._run_update(
+            place_response={"status": "weird"},
+            post_place_oids=set(),
+        )
+        assert "stop_loss_outcome_unknown" not in out
+        assert "stop_loss_oid" not in out
+        assert "no usable status" in out["stop_loss_error"]
+
+    def test_unresolvable_diff_marks_outcome_unknown(self):
+        """The residue round 11 introduced the flag for: the book cannot be
+        re-read, so the order may be resting untracked. Go must KEEP the
+        recorded stop state and license no re-place."""
+        out, _ = self._run_update(
+            place_response={"status": "weird"},
+            post_place_oids=RuntimeError("indexer down"),
+        )
+        assert out.get("stop_loss_outcome_unknown") is True
+        assert "stop_loss_oid" not in out
+
+    def test_ambiguous_diff_marks_outcome_unknown(self):
+        """More than one fresh oid cannot be attributed to this stop-loss."""
+        out, _ = self._run_update(
+            place_response={"status": "weird"},
+            post_place_oids={22222, 33333},
+        )
+        assert out.get("stop_loss_outcome_unknown") is True
+        assert "stop_loss_oid" not in out
+
+    def test_rejected_placement_does_not_mark_outcome_unknown(self):
+        """A positively rejected placement (open-order cap) is retryable."""
+        out, _ = self._run_update(
+            place_response={"status": "err", "response": "open order limit"},
+        )
+        assert "stop_loss_outcome_unknown" not in out
+
     def test_cancel_failure_defers_replacement(self):
         out, adapter = self._run_update(cancel_side_effect=RuntimeError("cancel down"))
         adapter.cancel_trigger_order.assert_called_once_with("ETH", 11111)
         adapter.place_stop_loss.assert_not_called()
         assert "cancel down" in out["cancel_stop_loss_error"]
+        assert "stop_loss_oid" not in out
+
+    def test_cancel_rejected_defers_replacement(self):
+        """#1456 review round 10: HL reports a REJECTED cancel inside a normal
+        response body. The old order may still rest — no replacement may be
+        stacked on top of it."""
+        out, adapter = self._run_update(cancel_response=_CANCEL_REJECTED_RESPONSE)
+        adapter.place_stop_loss.assert_not_called()
+        assert "cancel_stop_loss_succeeded" not in out
+        assert "already filled" in out["cancel_stop_loss_error"]
         assert "stop_loss_oid" not in out
 
     def test_open_order_lookup_failure_defers_replacement(self):
@@ -595,8 +733,14 @@ class TestUpdateStopLoss:
         assert out["stop_loss_oid"] == 22222
 
     def test_initial_placement_without_cancel_oid(self):
+        """#1456 review round 16: a fresh arm now takes ONE pre-submit
+        open-order read so an unreadable placement outcome is resolvable here
+        too. This is the entry point the static-scalar re-arm and the #885
+        one-shot arm use, and it is exactly where an unresolved ambiguity would
+        force a choice between duplicating an order and leaving the position
+        naked. No cancel is attempted."""
         out, adapter = self._run_update(cancel_oid=0)
-        adapter.open_order_oids.assert_not_called()
+        adapter.open_order_oids.assert_called_once_with("ETH")
         adapter.cancel_trigger_order.assert_not_called()
         adapter.place_stop_loss.assert_called_once_with("ETH", 0.5, 3104.12, False)
         assert out["stop_loss_oid"] == 22222
@@ -863,6 +1007,34 @@ class TestSyncProtection:
             open_oids={303},
         )
         adapter.cancel_order_by_oid.assert_called_once_with("ETH", 303)
+
+    def test_sl_filled_at_submit_skips_tp_placement(self):
+        """#1456 review round 18 (Optional 1): a submit-filled SL has flattened
+        the position on-chain. The TP tier walk below would place reduce-only
+        limits against nothing, sized off the virtual quantity — and Go books
+        the close BEFORE applyHyperliquidProtectionSync, so any TP OIDs placed
+        here were dropped from tracking for good. None may be placed."""
+        out, adapter = self._run_sync(
+            tp_tiers=[(1.0, 0.5), (2.0, 1.0)],
+            place_responses={"sl": {
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [
+                    {"filled": {"oid": 67890, "avgPx": "1980"}}
+                ]}},
+            }},
+        )
+        assert out.get("stop_loss_filled_immediately") is True
+        adapter.place_take_profit_limit.assert_not_called()
+        assert not out.get("tp_oids")
+
+    def test_resting_still_places_and_records_tps(self):
+        """#1456 review round 18 (Optional 1) must-survive: a normal resting
+        placement still walks the tiers and records both TP OIDs."""
+        out, adapter = self._run_sync(
+            tp_tiers=[(1.0, 0.5), (2.0, 1.0)],
+        )
+        assert adapter.place_take_profit_limit.call_count == 2
+        assert len(out.get("tp_oids") or []) == 2
 
     def test_existing_oid_still_open_returns_same_oid(self):
         """OID still in open_orders → echo it back, do NOT call place_take_profit_limit."""
@@ -1248,3 +1420,205 @@ class TestComputeTPTierSizes:
         assert sum(sizes) == pytest.approx(0.5)
         assert sizes[0] == pytest.approx(0.25)
         assert sizes[1] == pytest.approx(0.25)
+
+
+class TestProtectionSyncStopLossTriggerContract:
+    """#1450 review round 2: ``stop_loss_trigger_px`` reports the trigger of the
+    order THIS sync put on the book — never a price the plan merely derived.
+
+    Go writes the field straight into ``pos.StopLossTriggerPx``. Emitting it on a
+    branch that places nothing records a stop price no order rests at, which the
+    per-cycle #1450 audit then reads and "heals" by cancelling and re-placing a
+    perfectly healthy order, once per due cycle for the life of the position.
+    """
+
+    def _run_sync(self, *, open_oids, stop_loss_oid, force_sl_replace, place_response):
+        mod, spec = _load_check_module()
+        spec.loader.exec_module(mod)
+
+        mock_adapter_cls = MagicMock()
+        adapter = MagicMock()
+        mock_adapter_cls.return_value = adapter
+        adapter.open_order_oids.return_value = set(open_oids)
+        adapter.round_perps_trigger_px.side_effect = lambda _sym, px: round(px, 2)
+        adapter.round_size.side_effect = lambda _sym, sz: sz
+        adapter.place_stop_loss.return_value = place_response
+        adapter.cancel_order_by_oid.return_value = _CANCEL_OK_RESPONSE
+
+        captured = StringIO()
+        import builtins
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "adapter":
+                fake_mod = MagicMock()
+                fake_mod.HyperliquidExchangeAdapter = mock_adapter_cls
+                return fake_mod
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            with patch("sys.stdout", captured):
+                mod.run_sync_protection(
+                    "ETH", "long", 1.0, 2400.0, 30.0, "live",
+                    stop_loss_atr_mult=2.5,
+                    stop_loss_oid=stop_loss_oid,
+                    force_sl_replace=force_sl_replace,
+                )
+        return json.loads(captured.getvalue()), adapter
+
+    @staticmethod
+    def _resting(oid):
+        return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}
+
+    def test_echoed_oid_reports_no_trigger_price(self):
+        """The order keeps resting where it was placed; the sync knows nothing new."""
+        out, adapter = self._run_sync(
+            open_oids=[4242], stop_loss_oid=4242, force_sl_replace=False,
+            place_response=self._resting(9001),
+        )
+        assert out.get("stop_loss_oid") == 4242
+        assert "stop_loss_trigger_px" not in out
+        adapter.place_stop_loss.assert_not_called()
+
+    def test_force_replace_that_rests_reports_the_placed_trigger(self):
+        out, adapter = self._run_sync(
+            open_oids=[4242], stop_loss_oid=4242, force_sl_replace=True,
+            place_response=self._resting(9002),
+        )
+        assert out.get("stop_loss_oid") == 9002
+        # 2400 - 2.5 * 30
+        assert out.get("stop_loss_trigger_px") == pytest.approx(2325.0)
+        adapter.place_stop_loss.assert_called_once()
+
+    def test_force_replace_whose_placement_fails_reports_no_trigger_price(self):
+        """Cancel landed, placement rejected: nothing rests, so nothing is claimed."""
+        out, _ = self._run_sync(
+            open_oids=[4242], stop_loss_oid=4242, force_sl_replace=True,
+            place_response={"status": "err", "response": "open order limit"},
+        )
+        assert "stop_loss_trigger_px" not in out
+        assert out.get("stop_loss_error")
+
+    def test_force_replace_cancel_rejected_defers_replacement(self):
+        """#1456 review round 10: a REJECTED cancel (normal body, no raise)
+        leaves the old stop possibly resting — nothing placed on top of it."""
+        out, adapter = self._run_sync_cancel_response(_CANCEL_REJECTED_RESPONSE)
+        adapter.place_stop_loss.assert_not_called()
+        assert out.get("cancel_stop_loss_succeeded") is False
+        assert "already filled" in out["stop_loss_error"]
+        assert "stop_loss_oid" not in out
+
+    def _run_sync_cancel_response(self, cancel_response):
+        import builtins
+        mod, spec = _load_check_module()
+        spec.loader.exec_module(mod)
+
+        mock_adapter_cls = MagicMock()
+        adapter = MagicMock()
+        mock_adapter_cls.return_value = adapter
+        adapter.open_order_oids.return_value = {4242}
+        adapter.round_perps_trigger_px.side_effect = lambda _sym, px: round(px, 2)
+        adapter.round_size.side_effect = lambda _sym, sz: sz
+        adapter.place_stop_loss.return_value = self._resting(9002)
+        adapter.cancel_order_by_oid.return_value = cancel_response
+
+        captured = StringIO()
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "adapter":
+                fake_mod = MagicMock()
+                fake_mod.HyperliquidExchangeAdapter = mock_adapter_cls
+                return fake_mod
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            with patch("sys.stdout", captured):
+                mod.run_sync_protection(
+                    "ETH", "long", 1.0, 2400.0, 30.0, "live",
+                    stop_loss_atr_mult=2.5,
+                    stop_loss_oid=4242,
+                    force_sl_replace=True,
+                )
+        return json.loads(captured.getvalue()), adapter
+
+    def test_fresh_placement_reports_the_placed_trigger(self):
+        out, adapter = self._run_sync(
+            open_oids=[], stop_loss_oid=0, force_sl_replace=False,
+            place_response=self._resting(9003),
+        )
+        assert out.get("stop_loss_oid") == 9003
+        assert out.get("stop_loss_trigger_px") == pytest.approx(2325.0)
+        adapter.place_stop_loss.assert_called_once()
+
+    def _run_sync_dynamic_oids(self, *, oid_reads, place_response):
+        """Like _run_sync but open_order_oids returns a SEQUENCE of reads:
+        the top-of-call fetch, then the re-read inside the book diff."""
+        import builtins
+        mod, spec = _load_check_module()
+        spec.loader.exec_module(mod)
+
+        mock_adapter_cls = MagicMock()
+        adapter = MagicMock()
+        mock_adapter_cls.return_value = adapter
+        adapter.open_order_oids.side_effect = [set(s) for s in oid_reads]
+        adapter.round_perps_trigger_px.side_effect = lambda _sym, px: round(px, 2)
+        adapter.round_size.side_effect = lambda _sym, sz: sz
+        adapter.place_stop_loss.return_value = place_response
+        adapter.cancel_order_by_oid.return_value = _CANCEL_OK_RESPONSE
+
+        captured = StringIO()
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "adapter":
+                fake_mod = MagicMock()
+                fake_mod.HyperliquidExchangeAdapter = mock_adapter_cls
+                return fake_mod
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            with patch("sys.stdout", captured):
+                mod.run_sync_protection(
+                    "ETH", "long", 1.0, 2400.0, 30.0, "live",
+                    stop_loss_atr_mult=2.5,
+                    stop_loss_oid=4242,
+                    force_sl_replace=True,
+                )
+        return json.loads(captured.getvalue()), adapter
+
+    def test_unreadable_placement_resolved_to_resting_reports_no_error(self):
+        """#1456 review round 19 (Optional 1), must-survive (a): the response
+        was unreadable but the book diff resolves one fresh oid. Go records a
+        normal resting placement — a success — so NO stop_loss_error may ride
+        alongside the OID, or formatProtectionSyncWarnings fires a false
+        "protection partially failed" DM for a protected position."""
+        out, _ = self._run_sync_dynamic_oids(
+            oid_reads=[{4242}, {9004}],
+            place_response={"status": "weird"},
+        )
+        assert out.get("stop_loss_oid") == 9004
+        assert "stop_loss_error" not in out
+
+    def test_unreadable_placement_ambiguous_diff_reports_no_warning_error(self):
+        """Must-survive (c): an ambiguous diff is the single accurate
+        outcome-unknown CRITICAL — the generic partial-failure WARNING must
+        not stack on top of it via a stray error field."""
+        out, _ = self._run_sync_dynamic_oids(
+            oid_reads=[{4242}, {9004, 9005}],
+            place_response={"status": "weird"},
+        )
+        assert out.get("stop_loss_outcome_unknown") is True
+        assert "stop_loss_error" not in out
+
+    def test_unreadable_placement_nothing_resting_keeps_the_error(self):
+        """Must-survive (b): the diff shows nothing rested — a genuine
+        failure whose error text must survive so Go clears and re-places."""
+        out, _ = self._run_sync_dynamic_oids(
+            oid_reads=[{4242}, set()],
+            place_response={"status": "weird"},
+        )
+        assert "stop_loss_oid" not in out
+        assert "stop_loss_outcome_unknown" not in out
+        assert "no usable status" in out.get("stop_loss_error", "")
+

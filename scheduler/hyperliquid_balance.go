@@ -29,6 +29,20 @@ type HLPosition struct {
 	// real position P&L to the owning strategy instead of modeling it from a
 	// fetched mark. Zero when the field is absent or unparseable.
 	UnrealizedPnL float64
+	// LiquidationPx is the exchange-reported per-coin liquidation price for
+	// this position (clearinghouseState assetPositions.position.liquidationPx),
+	// i.e. the price at which Hyperliquid force-closes it through the
+	// maintenance-margin engine. 0 when the field is absent, JSON null (HL
+	// reports null when the engine cannot name a liquidation price), or
+	// unparseable — #1450 consumers MUST treat 0 as "unknown" and skip the
+	// comparison rather than deriving a band from 1/leverage.
+	//
+	// Deliberately never persisted: the isolated-margin liquidation price
+	// moves with funding and margin changes, and the cross-margin one moves
+	// with total account equity, so a stored snapshot would have no defined
+	// writer, refresh cadence, or staleness policy. Every consumer reads the
+	// current-cycle value from the Phase 1 clearinghouseState fetch.
+	LiquidationPx float64
 }
 
 // hlExecuteSnapshotForCoin extracts the cycle-local on-chain leverage + margin
@@ -261,6 +275,12 @@ func fetchHyperliquidState(accountAddress string) (float64, []HLPosition, error)
 					Value json.Number `json:"value"`
 				} `json:"leverage"`
 				UnrealizedPnl string `json:"unrealizedPnl"`
+				// #1450: HL sends a JSON string, or null when it cannot name a
+				// liquidation price. RawMessage decodes ANY single JSON value —
+				// string, number, null, garbage text — so no shape of this
+				// advisory field can ever fail the parse of the fields the
+				// reconciler and the size cap depend on (#1456 review).
+				LiquidationPx json.RawMessage `json:"liquidationPx"`
 			} `json:"position"`
 		} `json:"assetPositions"`
 	}
@@ -310,6 +330,11 @@ func fetchHyperliquidState(accountAddress string) (float64, []HLPosition, error)
 				uPnL = parsed
 			}
 		}
+		// #1450: exchange-reported liquidation price. Absent, JSON null, or
+		// unparseable → 0, which every consumer treats as "unknown" and skips.
+		// Never fall back to a derived 1/leverage band: HL maintenance margin
+		// is per-asset and such a band would falsely reject valid geometry.
+		liqPx := parseHLLiquidationPx(ap.Position.LiquidationPx)
 		positions = append(positions, HLPosition{
 			Coin:          ap.Position.Coin,
 			Size:          szi,
@@ -317,10 +342,28 @@ func fetchHyperliquidState(accountAddress string) (float64, []HLPosition, error)
 			Leverage:      lev,
 			MarginMode:    mode,
 			UnrealizedPnL: uPnL,
+			LiquidationPx: liqPx,
 		})
 	}
 
 	return balance, positions, nil
+}
+
+// parseHLLiquidationPx decodes one raw liquidationPx JSON value into the
+// float64 every #1450 consumer reads. It accepts a bare number and a quoted
+// number, and lands on 0 ("unknown" — every consumer skips) for null, an
+// empty payload, or anything unparseable. A malformed advisory field must
+// never be able to fail the snapshot it rode in on.
+func parseHLLiquidationPx(raw json.RawMessage) float64 {
+	s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if s == "" || s == "null" {
+		return 0
+	}
+	parsed, err := strconv.ParseFloat(s, 64)
+	if err != nil || parsed <= 0 {
+		return 0
+	}
+	return parsed
 }
 
 // reconcileHyperliquidPositionsForStrategy is the production entry point with
@@ -718,7 +761,7 @@ func reconcileHyperliquidPositionsWithResolver(stratState *StrategyState, sym st
 		if !recordPerpsExternalCloseWithFillFee(stratState, sym, closePx, lookupExt.Fee, useFillFeeExt, "", "hl_sync_external", logger) {
 			recordClosedPosition(stratState, statePos, 0, 0, "hl_sync_external", time.Now().UTC())
 			delete(stratState.Positions, sym)
-			clearATRMultMissingEntryATRWarningOnHLPerpsClose(stratState, sym)
+			clearHLPerpsPositionAlertThrottles(stratState, sym)
 		}
 		changed = true
 	}
@@ -1894,7 +1937,7 @@ func hlAttemptCloseFromTPFills(s *StrategyState, sym string, pos *Position, reso
 		recordClosedPosition(s, residual, 0, 0, "hl_sync_external", time.Now().UTC())
 		delete(s.Positions, sym)
 	}
-	clearATRMultMissingEntryATRWarningOnHLPerpsClose(s, sym)
+	clearHLPerpsPositionAlertThrottles(s, sym)
 	return true
 }
 
@@ -2853,7 +2896,7 @@ func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, f
 		// right amount. delete() runs after the snapshot.
 		recordClosedPosition(s, pos, fillPx, pnl, closeReason, now)
 		delete(s.Positions, symbol)
-		clearATRMultMissingEntryATRWarningOnHLPerpsClose(s, symbol)
+		clearHLPerpsPositionAlertThrottles(s, symbol)
 	} else {
 		pos.Quantity = remaining
 	}

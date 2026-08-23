@@ -26,7 +26,7 @@ func TestBuildHyperliquidProtectionPlanUsesDefaultTieredATR(t *testing.T) {
 		Side:     "long",
 		TPOIDs:   []int64{101, 202},
 	}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("buildHyperliquidProtectionPlan returned ok=false")
 	}
@@ -62,7 +62,7 @@ func TestBuildHyperliquidProtectionPlanManualStrategy(t *testing.T) {
 		StopLossOID: 123,
 		TPOIDs:      []int64{456, 789},
 	}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("buildHyperliquidProtectionPlan returned ok=false for manual strategy")
 	}
@@ -380,7 +380,7 @@ func TestBuildHyperliquidProtectionPlanCustomTiers(t *testing.T) {
 		}},
 	}
 	pos := &Position{Symbol: "ETH", Quantity: 1, AvgCost: 2500, EntryATR: 25, Side: "short"}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("buildHyperliquidProtectionPlan returned ok=false")
 	}
@@ -412,7 +412,7 @@ func TestBuildHyperliquidProtectionPlanThreeTiers(t *testing.T) {
 		Side:     "long",
 		TPOIDs:   []int64{101, 202, 303},
 	}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("buildHyperliquidProtectionPlan returned ok=false")
 	}
@@ -520,7 +520,8 @@ func TestRunHyperliquidProtectionSyncManualAppliesOIDs(t *testing.T) {
 	})
 
 	var mu sync.RWMutex
-	if !runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil) {
+	synced, fillPx := runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil, nil, nil)
+	if !synced || fillPx != 0 {
 		t.Fatal("expected runHyperliquidProtectionSync to apply")
 	}
 	if calls != 1 {
@@ -554,7 +555,7 @@ func TestRunHyperliquidProtectionSyncSkipsWhenNoPlan(t *testing.T) {
 	})
 
 	var mu sync.RWMutex
-	if runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil) {
+	if syncedNeg, _ := runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil, nil, nil); syncedNeg {
 		t.Fatal("expected runHyperliquidProtectionSync to skip when no plan")
 	}
 	if called {
@@ -588,7 +589,7 @@ func TestRunHyperliquidProtectionSyncSkipsApplyAfterExternalClose(t *testing.T) 
 	})
 
 	var mu sync.RWMutex
-	if runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil) {
+	if syncedNeg, _ := runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil, nil, nil); syncedNeg {
 		t.Fatal("expected apply to be skipped after position closed externally")
 	}
 	pos := state.Positions["ETH"]
@@ -637,7 +638,8 @@ func TestRunHyperliquidProtectionSyncStampsTradeInDB(t *testing.T) {
 	})
 
 	var mu sync.RWMutex
-	if !runHyperliquidProtectionSync(sc, state, db, "ETH", &mu, nil, nil, "test", nil) {
+	synced2, _ := runHyperliquidProtectionSync(sc, state, db, "ETH", &mu, nil, nil, "test", nil, nil, nil)
+	if !synced2 {
 		t.Fatal("expected runHyperliquidProtectionSync to apply")
 	}
 
@@ -674,7 +676,7 @@ func TestBuildHyperliquidProtectionPlanPadsTPArmedTiers(t *testing.T) {
 		TPOIDs:       []int64{0, 300},
 		TPArmedTiers: []bool{true, true},
 	}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("expected plan ok=true")
 	}
@@ -687,7 +689,7 @@ func TestBuildHyperliquidProtectionPlanPadsTPArmedTiers(t *testing.T) {
 	}
 	// Shorter TPArmedTiers slice pads with false (#749 / #716 contract).
 	pos.TPArmedTiers = []bool{true}
-	plan, ok = buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok = buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("expected plan ok=true (padded armed tiers)")
 	}
@@ -904,7 +906,7 @@ func TestBuildHyperliquidProtectionPlanAnchorsToRiskAnchorPrice(t *testing.T) {
 		EntryATR:        50,
 		Side:            "long",
 	}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatal("buildHyperliquidProtectionPlan returned ok=false")
 	}
@@ -913,5 +915,191 @@ func TestBuildHyperliquidProtectionPlanAnchorsToRiskAnchorPrice(t *testing.T) {
 	}
 	if plan.Size != 3 {
 		t.Errorf("plan.Size = %g; want re-sized total quantity 3", plan.Size)
+	}
+}
+
+// #1456 review round 9 (Needs Fixing): a force-replace whose cancel LANDED but
+// whose replacement did NOT rest must not leave pos.StopLossOID/TriggerPx
+// pointing at a dead order — state would claim protection that no longer
+// exists, for fixed/regime/unified-ATR owners the #1450 audit cannot re-arm.
+func TestApplyHyperliquidProtectionSyncClearsDeadSLOnCancelLandedPlaceFailed(t *testing.T) {
+	pos := &Position{Symbol: "ETH", StopLossOID: 5150, StopLossTriggerPx: 2325}
+	applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
+		CancelStopLossSucceeded: true,
+		StopLossError:           "place_stop_loss SDK error: open order cap",
+	}, nil)
+	if pos.StopLossOID != 0 || pos.StopLossTriggerPx != 0 {
+		t.Errorf("SL = oid %d @ %g after cancel-landed/place-failed, want both cleared", pos.StopLossOID, pos.StopLossTriggerPx)
+	}
+}
+
+// Must-survive (c): cancel AND placement both succeed keeps working exactly as
+// before — the new OID and its trigger overwrite state; no clearing.
+func TestApplyHyperliquidProtectionSyncForceReplaceSuccessUnchanged(t *testing.T) {
+	pos := &Position{Symbol: "ETH", StopLossOID: 5150, StopLossTriggerPx: 2325}
+	applyHyperliquidProtectionSync(pos, &HyperliquidProtectionSyncResult{
+		CancelStopLossSucceeded: true,
+		StopLossOID:             6000,
+		StopLossTriggerPx:       2300,
+	}, nil)
+	if pos.StopLossOID != 6000 || pos.StopLossTriggerPx != 2300 {
+		t.Errorf("SL = oid %d @ %g, want 6000 @ 2300 from the successful replacement", pos.StopLossOID, pos.StopLossTriggerPx)
+	}
+
+	// A FAILED cancel never sets the flag: the old order may still be resting,
+	// so state must keep it recorded.
+	pos2 := &Position{Symbol: "ETH", StopLossOID: 5150, StopLossTriggerPx: 2325}
+	applyHyperliquidProtectionSync(pos2, &HyperliquidProtectionSyncResult{
+		StopLossError: "force replace cancel: timeout",
+	}, nil)
+	if pos2.StopLossOID != 5150 || pos2.StopLossTriggerPx != 2325 {
+		t.Errorf("failed-cancel result mutated SL to oid %d @ %g, want 5150 @ 2325 kept (order may still rest)", pos2.StopLossOID, pos2.StopLossTriggerPx)
+	}
+}
+
+// The critical-alert predicate: only cancel-landed + nothing-resting reads as
+// lost protection. A landed replacement or an at-submit fill is protection
+// working.
+func TestHLProtectionLostExchangeStop(t *testing.T) {
+	cases := []struct {
+		name   string
+		result *HyperliquidProtectionSyncResult
+		want   bool
+	}{
+		{"cancel landed, place failed", &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true}, true},
+		{"cancel landed, replacement rests", &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true, StopLossOID: 7}, false},
+		{"cancel landed, filled at submit", &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true, StopLossFilledImmediately: true}, false},
+		{"cancel failed", &HyperliquidProtectionSyncResult{}, false},
+		{"nil result", nil, false},
+	}
+	for _, tc := range cases {
+		if got := hlProtectionLostExchangeStop(tc.result); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// #1456 review round 11 (Optional 2): a protection-sync placement that FILLED
+// AT SUBMIT has flattened the position on-chain — it must be booked as a
+// realized close at the trigger price on the same cycle, with no stale
+// StopLossTriggerPx left behind.
+func TestRunHyperliquidProtectionSyncBooksFillAtSubmit(t *testing.T) {
+	mult := 1.5
+	sc := StrategyConfig{
+		ID:              "hl-manual-eth",
+		Type:            "manual",
+		Platform:        "hyperliquid",
+		CloseStrategy:   &StrategyRef{Name: "tiered_tp_atr_live"},
+		StopLossATRMult: &mult,
+	}
+	pos := &Position{Symbol: "ETH", Quantity: 0.4, AvgCost: 3000, EntryATR: 100, Side: "long", StopLossOID: 4242, StopLossTriggerPx: 2325}
+	state := &StrategyState{Positions: map[string]*Position{"ETH": pos}}
+	withStubbedSyncHyperliquidProtection(t, func(_ StrategyConfig, _ hlProtectionPlan, _ *MultiNotifier, _ *StrategyLogger, _ []byte) (*HyperliquidProtectionSyncResult, bool) {
+		return &HyperliquidProtectionSyncResult{
+			CancelStopLossSucceeded:   true,
+			StopLossFilledImmediately: true,
+			StopLossTriggerPx:         2318.5,
+		}, true
+	})
+	var mu sync.RWMutex
+	synced, fillPx := runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil, nil, nil)
+	if !synced {
+		t.Fatal("expected sync to report success after booking the submit-fill close")
+	}
+	if fillPx != 2318.5 {
+		t.Errorf("fillPx = %g, want 2318.5 (the price that filled)", fillPx)
+	}
+	if _, stillOpen := state.Positions["ETH"]; stillOpen {
+		t.Error("position must be gone after the submit-fill close is booked")
+	}
+}
+
+// Must-survive (c): a placement that simply RESTS books nothing.
+func TestRunHyperliquidProtectionSyncRestingPlacementBooksNoClose(t *testing.T) {
+	mult := 1.5
+	sc := StrategyConfig{
+		ID:              "hl-manual-eth",
+		Type:            "manual",
+		Platform:        "hyperliquid",
+		CloseStrategy:   &StrategyRef{Name: "tiered_tp_atr_live"},
+		StopLossATRMult: &mult,
+	}
+	state := &StrategyState{Positions: map[string]*Position{
+		"ETH": {Symbol: "ETH", Quantity: 0.4, AvgCost: 3000, EntryATR: 100, Side: "long", StopLossTriggerPx: 2325},
+	}}
+	withStubbedSyncHyperliquidProtection(t, func(_ StrategyConfig, _ hlProtectionPlan, _ *MultiNotifier, _ *StrategyLogger, _ []byte) (*HyperliquidProtectionSyncResult, bool) {
+		return &HyperliquidProtectionSyncResult{
+			StopLossOID:       999,
+			StopLossTriggerPx: 2300,
+		}, true
+	})
+	var mu sync.RWMutex
+	synced, fillPx := runHyperliquidProtectionSync(sc, state, nil, "ETH", &mu, nil, nil, "test", nil, nil, nil)
+	if !synced || fillPx != 0 {
+		t.Errorf("synced=%v fillPx=%g, want true/0 for a resting replacement", synced, fillPx)
+	}
+	if pos := state.Positions["ETH"]; pos == nil || pos.StopLossOID != 999 {
+		t.Error("resting placement must keep the position open with the new OID")
+	}
+}
+
+// #1456 review round 15 (Optional 1): an unreadable placement response is
+// OUTCOME UNKNOWN, never a rejection. Clearing recorded state on that shape
+// raised a false "the position has NO exchange-side stop" CRITICAL and let the
+// next sync's empty-OID path rest a second, untracked full-size reduce-only
+// stop on the same position.
+func TestProtectionSyncOutcomeUnknownDefersInsteadOfClearing(t *testing.T) {
+	newPos := func() *Position {
+		return &Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 2000, EntryATR: 25, StopLossOID: 111, StopLossTriggerPx: 1850}
+	}
+
+	// (a) cancel lands, placement outcome unreadable while the order really
+	// rested: recorded OID/trigger untouched, no lost-stop CRITICAL.
+	unknown := &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true, StopLossOutcomeUnknown: true, StopLossError: "place_stop_loss returned no usable status"}
+	if hlProtectionLostExchangeStop(unknown) {
+		t.Errorf("outcome-unknown classified as protection lost — that CRITICAL would be false")
+	}
+	if !hlProtectionStopOutcomeUnknown(unknown) {
+		t.Errorf("outcome-unknown not classified as such — the operator gets no alert at all")
+	}
+	pos := newPos()
+	applyHyperliquidProtectionSync(pos, unknown, nil)
+	if pos.StopLossOID != 111 || pos.StopLossTriggerPx != 1850 {
+		t.Errorf("outcome-unknown cleared recorded state: OID %d trigger %.2f, want 111 / 1850", pos.StopLossOID, pos.StopLossTriggerPx)
+	}
+
+	// (b) cancel lands, placement positively REJECTED: cleared and re-placed
+	// exactly as before this change.
+	rejected := &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true, StopLossError: "place_stop_loss SDK error: insufficient margin"}
+	if !hlProtectionLostExchangeStop(rejected) {
+		t.Errorf("a positively rejected placement must still read as protection lost")
+	}
+	if hlProtectionStopOutcomeUnknown(rejected) {
+		t.Errorf("a positively rejected placement must not read as outcome unknown")
+	}
+	pos = newPos()
+	applyHyperliquidProtectionSync(pos, rejected, nil)
+	if pos.StopLossOID != 0 || pos.StopLossTriggerPx != 0 {
+		t.Errorf("rejected placement left stale state: OID %d trigger %.2f, want 0 / 0", pos.StopLossOID, pos.StopLossTriggerPx)
+	}
+
+	// (c) cancel lands and the replacement rests — unchanged. The Python side
+	// resolves an unreadable response to a resting OID by open-order diff, so
+	// this is the shape that reaches Go in the common case.
+	rested := &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true, StopLossOID: 222, StopLossTriggerPx: 1900}
+	if hlProtectionLostExchangeStop(rested) || hlProtectionStopOutcomeUnknown(rested) {
+		t.Errorf("a resting replacement must raise neither alert")
+	}
+	pos = newPos()
+	applyHyperliquidProtectionSync(pos, rested, nil)
+	if pos.StopLossOID != 222 || pos.StopLossTriggerPx != 1900 {
+		t.Errorf("resting replacement not adopted: OID %d trigger %.2f, want 222 / 1900", pos.StopLossOID, pos.StopLossTriggerPx)
+	}
+
+	// An outcome-unknown result that also carries a resting OID is a normal
+	// placement — the OID wins and neither alert fires.
+	both := &HyperliquidProtectionSyncResult{CancelStopLossSucceeded: true, StopLossOID: 333, StopLossOutcomeUnknown: true}
+	if hlProtectionLostExchangeStop(both) || hlProtectionStopOutcomeUnknown(both) {
+		t.Errorf("a resolved placement must raise neither alert")
 	}
 }

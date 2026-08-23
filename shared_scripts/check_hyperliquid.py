@@ -717,6 +717,92 @@ def _classify_sl_response(sdk_response: dict):
     return ("missing", None)
 
 
+
+def _resolve_sl_placement_by_book_diff(adapter, symbol, pre_oids):
+    """Resolve a stop-loss placement whose OUTCOME could not be read.
+
+    #1456 review rounds 15 and 16. An unreadable status entry and a post-submit
+    exception are *outcome unknown*, never *rejected*: the order may well be
+    resting. Diff the open-order book against ``pre_oids`` — the snapshot taken
+    immediately BEFORE submitting — and resolve the ambiguity at the source:
+
+      ("resting", oid) — exactly one NEW oid appeared: that is the order we just
+                         placed. Report it as a normal resting placement.
+      ("none",    None) — no new oid: nothing rested. A genuine failure, which
+                         the caller reports as before (recorded state cleared,
+                         re-placed next cycle).
+      ("unknown", None) — the book could not be re-read, or the diff is
+                         ambiguous. Only THIS residue is handed to Go as
+                         ``stop_loss_outcome_unknown``, where recorded state is
+                         KEPT and no re-place is licensed.
+
+    Callers must snapshot BEFORE submitting and must not place any other order
+    (e.g. TP tiers) between the snapshot and this call, or the diff cannot
+    attribute a fresh oid to this stop-loss.
+    """
+    if pre_oids is None:
+        return ("unknown", None)
+    try:
+        now_oids = adapter.open_order_oids(symbol)
+    except Exception as oe:
+        print(f"[WARN] outcome-unknown SL placement: open_order_oids({symbol}) re-read failed: {oe}", file=sys.stderr)
+        return ("unknown", None)
+    if now_oids is None:
+        return ("unknown", None)
+    fresh = [int(o) for o in now_oids if int(o) not in pre_oids]
+    if len(fresh) == 1:
+        print(f"[WARN] unreadable SL placement response resolved to resting oid={fresh[0]}", file=sys.stderr)
+        return ("resting", fresh[0])
+    if not fresh:
+        return ("none", None)
+    return ("unknown", None)
+
+
+def _snapshot_open_oids(adapter, symbol):
+    """Pre-submit open-order snapshot for _resolve_sl_placement_by_book_diff.
+
+    Returns a set of oids, or None when the book could not be read (which makes
+    the diff impossible and forces the outcome-unknown residue).
+    """
+    try:
+        oids = adapter.open_order_oids(symbol)
+    except Exception as oe:
+        print(f"[WARN] pre-placement open_order_oids({symbol}) failed: {oe}; an unreadable placement will not be resolvable", file=sys.stderr)
+        return None
+    if oids is None:
+        return None
+    return set(int(o) for o in oids)
+
+
+def _classify_cancel_response(sdk_response):
+    """Classify an order-cancel SDK response into ("ok", "") or ("error", reason).
+
+    HL reports a REJECTED cancel inside a normal-looking response body rather
+    than raising: {"status": "err", ...} at the top level, or a per-order
+    {"error": "..."} entry under response.data.statuses (per-order successes
+    appear there as the string "success" or an empty dict, depending on SDK
+    version). Treating "the call did not raise" as landed can clear a recorded
+    stop OID while the order still rests on the book (#1456 review round 10).
+
+    Fails closed: any shape that does not CONFIRM the landing classifies as
+    ("error", ...), so callers keep the recorded OID tracked.
+    """
+    try:
+        if not isinstance(sdk_response, dict):
+            return ("error", f"unexpected cancel response: {sdk_response}")
+        if sdk_response.get("status") != "ok":
+            return ("error", str(sdk_response))
+        data = sdk_response.get("response", {}).get("data", {})
+        statuses = data.get("statuses") if isinstance(data, dict) else None
+        if not isinstance(statuses, list) or not statuses:
+            return ("error", f"cancel returned no per-order status: {sdk_response}")
+        for st in statuses:
+            if isinstance(st, dict) and "error" in st:
+                return ("error", str(st["error"]))
+        return ("ok", "")
+    except Exception as e:
+        return ("error", f"_classify_cancel_response: {e}")
+
 def _oid_is_open(open_oids: set[int] | None, oid: int) -> bool:
     return oid > 0 and open_oids is not None and int(oid) in open_oids
 
@@ -974,30 +1060,125 @@ def run_sync_protection(
             else:
                 sl_px = avg_cost + stop_loss_atr_mult * entry_atr
             sl_px = adapter.round_perps_trigger_px(symbol, sl_px)
-            out["stop_loss_trigger_px"] = sl_px
+
+            # #1450 contract: ``stop_loss_trigger_px`` reports the trigger of the
+            # order THIS sync put on the book — never the price a plan merely
+            # derived. Go writes it straight into pos.StopLossTriggerPx, so
+            # emitting it on a branch that places nothing records a price no
+            # order rests at. That fiction is not cosmetic: the per-cycle #1450
+            # audit reads the recorded trigger, and a derived-but-unreachable
+            # value makes it cancel and re-place a perfectly healthy order every
+            # cycle for the life of the position. Every branch below that ends
+            # without a placement leaves the field ABSENT, and Go then keeps the
+            # trigger it already had.
+            def _sl_placed(px):
+                out["stop_loss_trigger_px"] = px
+
+            def _resolve_unknown_sl(reason, pre_oids):
+                """Resolve a placement whose OUTCOME could not be read.
+
+                #1456 review round 15 (Optional 1). An unreadable status entry
+                and a post-submit exception are *outcome unknown*, never
+                *rejected*: the order may well be resting. Reporting them as a
+                bare ``stop_loss_error`` made Go clear pos.StopLossOID AND
+                pos.StopLossTriggerPx (cancel_stop_loss_succeeded with no OID),
+                raise a "the position has NO exchange-side stop" CRITICAL that
+                is false, and then let the NEXT sync place a second full-size
+                reduce-only stop that nothing tracks.
+
+                Resolve the ambiguity at the source instead of propagating it:
+                diff the open-order book against the snapshot taken immediately
+                before submitting. Exactly one NEW oid is the order we just
+                placed — adopt it and report a normal resting placement. No new
+                oid means nothing rested, which is a genuine failure and clears
+                as before. Only when the book cannot be re-read, or the diff is
+                ambiguous, does ``stop_loss_outcome_unknown`` go out, and Go
+                then DEFERS (keeps recorded state, no false CRITICAL) exactly
+                as an unconfirmed cancel already does.
+
+                This runs before any TP placement in run_sync_protection, so a
+                fresh oid in the diff can only be this stop-loss.
+                """
+                # #1456 review round 19 (Optional 1): the error text travels
+                # ONLY on the "none" branch. A placement resolved to a resting
+                # order is a SUCCESS — Go records the OID, and emitting
+                # ``stop_loss_error`` alongside it made
+                # formatProtectionSyncWarnings fire a false "SL sync failed"
+                # DM for a position that is protected. The ambiguous-diff
+                # residue reports ``stop_loss_outcome_unknown`` alone too: Go
+                # raises its own accurate CRITICAL for that shape, and the
+                # generic partial-failure WARNING would only stack on top of
+                # it.
+                out["stop_loss_error"] = reason
+                kind, oid = _resolve_sl_placement_by_book_diff(adapter, symbol, pre_oids)
+                if kind == "resting":
+                    del out["stop_loss_error"]
+                    out["stop_loss_oid"] = oid
+                    _sl_placed(sl_px)
+                elif kind == "unknown":
+                    del out["stop_loss_error"]
+                    out["stop_loss_outcome_unknown"] = True
+                # kind == "none": nothing rests, a genuine failure. Keep the
+                # error and leave the outcome-unknown flag off so Go clears
+                # the dead OID and re-places from the empty-OID path, as
+                # before.
+
+            def _place_sl():
+                # Snapshot the book BEFORE submitting so an unreadable response
+                # can be resolved by diff. `open_oids` is the top-of-call fetch;
+                # None means that fetch failed and no diff is possible.
+                pre_oids = set(int(o) for o in open_oids) if open_oids is not None else None
+                try:
+                    resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
+                    kind, payload = _classify_sl_response(resp)
+                    if kind == "resting":
+                        out["stop_loss_oid"] = payload
+                        _sl_placed(sl_px)
+                    elif kind == "filled":
+                        out["stop_loss_filled_immediately"] = True
+                        _sl_placed(sl_px)
+                    elif kind == "error":
+                        # Positively REJECTED by the exchange — nothing rests.
+                        # Clearing recorded state is correct here.
+                        out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
+                    else:
+                        _resolve_unknown_sl(f"place_stop_loss returned no usable status: {resp}", pre_oids)
+                except Exception as se:
+                    _resolve_unknown_sl(str(se), pre_oids)
+
             if _oid_is_open(open_oids, stop_loss_oid) and not force_sl_replace:
+                # Pure echo — the existing order keeps resting at whatever
+                # trigger it was placed at. Nothing to report.
                 out["stop_loss_oid"] = int(stop_loss_oid)
             elif _oid_is_open(open_oids, stop_loss_oid) and force_sl_replace:
                 if size <= 0:
                     out["stop_loss_oid"] = int(stop_loss_oid)
                 else:
+                    # #1456 review round 9: once this cancel lands the resting
+                    # OID is gone from the book. If the replacement below then
+                    # fails, Go must clear pos.StopLossOID/StopLossTriggerPx
+                    # instead of leaving them pointed at a dead order. Emitted
+                    # even when False so an unconfirmed cancel never reads as
+                    # "safe to clear".
+                    #
+                    # #1456 review round 10: "landed" means the exchange
+                    # RESPONSE confirmed it (a rejected cancel arrives without
+                    # raising) AND only then is the replacement placed — a
+                    # failed cancel defers placement to the next sync instead of
+                    # resting two full-size reduce-only stops on one position.
+                    cancel_ok = False
                     try:
-                        adapter.cancel_order_by_oid(symbol, int(stop_loss_oid))
+                        kind, payload = _classify_cancel_response(
+                            adapter.cancel_order_by_oid(symbol, int(stop_loss_oid)))
+                        if kind == "ok":
+                            cancel_ok = True
+                        else:
+                            out["stop_loss_error"] = f"force replace cancel rejected: {payload}"
                     except Exception as ce:
                         out["stop_loss_error"] = f"force replace cancel: {ce}"
-                    try:
-                        resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
-                        kind, payload = _classify_sl_response(resp)
-                        if kind == "resting":
-                            out["stop_loss_oid"] = payload
-                        elif kind == "filled":
-                            out["stop_loss_filled_immediately"] = True
-                        elif kind == "error":
-                            out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
-                        else:
-                            out["stop_loss_error"] = f"place_stop_loss returned no usable status: {resp}"
-                    except Exception as se:
-                        out["stop_loss_error"] = str(se)
+                    out["cancel_stop_loss_succeeded"] = cancel_ok
+                    if cancel_ok:
+                        _place_sl()
             else:
                 action, fill = _resolve_missing_oid(stop_loss_oid)
                 if action == "filled":
@@ -1005,23 +1186,24 @@ def run_sync_protection(
                     out["stop_loss_fill"] = fill
                     print(f"[WARN] stop-loss OID={stop_loss_oid} already filled on-chain; not re-placing — reconciler will book the close", file=sys.stderr)
                 elif action == "place" and size > 0:
-                    try:
-                        resp = adapter.place_stop_loss(symbol, size, sl_px, close_is_buy)
-                        kind, payload = _classify_sl_response(resp)
-                        if kind == "resting":
-                            out["stop_loss_oid"] = payload
-                        elif kind == "filled":
-                            out["stop_loss_filled_immediately"] = True
-                        elif kind == "error":
-                            out["stop_loss_error"] = f"place_stop_loss SDK error: {payload}"
-                        else:
-                            out["stop_loss_error"] = f"place_stop_loss returned no usable status: {resp}"
-                    except Exception as se:
-                        out["stop_loss_error"] = str(se)
+                    _place_sl()
                 # action=="unknown" → leave SL OID untouched, retry next cycle
 
+        # #1456 review round 18 (Optional 1): a submit-filled SL has FLATTENED
+        # the position on-chain. Walking the TP tiers below would place
+        # reduce-only limit orders against a position that no longer exists,
+        # sized off the virtual quantity — and Go books the close and returns
+        # BEFORE applyHyperliquidProtectionSync, so any OID those placements
+        # returned was dropped from tracking for good. Place nothing once the
+        # SL reported an immediate fill.
         tiers = _normalize_tp_tiers(tp_tiers, tp1_atr_mult, tp1_fraction, tp2_atr_mult)
-        if tiers:
+        if out.get("stop_loss_filled_immediately"):
+            print(
+                f"[WARN] TP protection skipped for {symbol}: SL filled at submit — "
+                f"the position is flat on-chain and no TP orders are placed",
+                file=sys.stderr,
+            )
+        elif tiers:
             existing_tp_oids = list(tp_oids or [])
             if not existing_tp_oids and (tp1_oid > 0 or tp2_oid > 0):
                 existing_tp_oids = [tp1_oid, tp2_oid]
@@ -1277,8 +1459,16 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
             try:
                 for oid in cancel_oids:
                     try:
-                        adapter.cancel_trigger_order(symbol, oid)
-                        cancel_succeeded = True
+                        # #1456 review round 10: only a response-confirmed cancel
+                        # may report success — a rejected cancel leaves the stale
+                        # SL tracked so the next sync re-handles it.
+                        kind, payload = _classify_cancel_response(
+                            adapter.cancel_trigger_order(symbol, oid))
+                        if kind == "ok":
+                            cancel_succeeded = True
+                        else:
+                            cancel_errors.append(f"{oid}: {payload}")
+                            print(f"[WARN] cancel_trigger_order({symbol}, {oid}) rejected: {payload}", file=sys.stderr)
                     except Exception as ce:
                         cancel_errors.append(f"{oid}: {ce}")
                         print(f"[WARN] cancel_trigger_order({symbol}, {oid}) failed: {ce}", file=sys.stderr)
@@ -1470,9 +1660,20 @@ def run_update_stop_loss(symbol, side, size, trigger_px, mode, cancel_oid=0):
             if open_oids is None:
                 should_place = False
             elif _oid_is_open(open_oids, cancel_oid):
+                # #1456 review round 10: a cancel counts as landed only when the
+                # exchange RESPONSE confirms it — a rejected cancel arrives as a
+                # normal body, not an exception. An unconfirmed cancel leaves the
+                # old order possibly resting, so the replacement must defer to
+                # the next update instead of stacking a second full-size stop.
                 try:
-                    adapter.cancel_trigger_order(symbol, cancel_oid)
-                    cancel_succeeded = True
+                    kind, payload = _classify_cancel_response(
+                        adapter.cancel_trigger_order(symbol, cancel_oid))
+                    if kind == "ok":
+                        cancel_succeeded = True
+                    else:
+                        cancel_err = payload
+                        should_place = False
+                        print(f"[WARN] cancel_trigger_order({symbol}, {cancel_oid}) rejected: {payload}; not placing replacement", file=sys.stderr)
                 except Exception as ce:
                     cancel_err = str(ce)
                     should_place = False
@@ -1485,8 +1686,23 @@ def run_update_stop_loss(symbol, side, size, trigger_px, mode, cancel_oid=0):
                     print(f"[WARN] stop-loss OID={cancel_oid} already filled on-chain; not re-placing — reconciler will book the close", file=sys.stderr)
 
         sl_is_buy = side == "short"
+        # #1456 review round 11: a placement whose outcome Go cannot READ is not
+        # one Hyperliquid positively rejected — the order may have rested. The
+        # in-cycle retry must stay off this shape (a second full-size reduce-only
+        # stop would rest untracked); only a classified rejection may retry.
+        place_unknown = False
         trigger_px = adapter.round_perps_trigger_px(symbol, trigger_px)
         if should_place:
+            # #1456 review round 16 (Optional 2): snapshot the book immediately
+            # before submitting so an unreadable outcome can be RESOLVED here
+            # rather than handed to Go as an ambiguity every consumer — the
+            # walker clamp retry, the audit clamp, the static-scalar re-arm, the
+            # one-shot fixed-ATR arm — must then resolve by choosing between
+            # duplicating an order and leaving the position naked. On the cancel
+            # path open_oids is the pre-cancel read, which still works: the diff
+            # only looks for oids that are NEW, and the cancelled one leaves.
+            # A fresh arm (cancel_oid == 0) has no such read, so take one.
+            pre_oids = set(int(o) for o in open_oids) if open_oids is not None else _snapshot_open_oids(adapter, symbol)
             try:
                 sl_resp = adapter.place_stop_loss(symbol, size, trigger_px, sl_is_buy)
                 kind, payload = _classify_sl_response(sl_resp)
@@ -1496,14 +1712,26 @@ def run_update_stop_loss(symbol, side, size, trigger_px, mode, cancel_oid=0):
                     sl_filled_immediately = True
                     print(f"[WARN] stop-loss filled immediately at submit (price already through {trigger_px})", file=sys.stderr)
                 elif kind == "error":
+                    # Positively REJECTED by the exchange — nothing rests, so
+                    # this is never outcome-unknown.
                     sl_err = f"place_stop_loss SDK error: {payload}"
                     print(f"[WARN] {sl_err}", file=sys.stderr)
                 else:
                     sl_err = f"place_stop_loss returned no usable status: {sl_resp}"
                     print(f"[WARN] {sl_err}", file=sys.stderr)
+                    resolved, oid = _resolve_sl_placement_by_book_diff(adapter, symbol, pre_oids)
+                    if resolved == "resting":
+                        resting_oid = oid
+                    elif resolved == "unknown":
+                        place_unknown = True
             except Exception as se:
                 sl_err = str(se)
                 print(f"[WARN] place_stop_loss({symbol}, {size}, {trigger_px}) failed: {se}", file=sys.stderr)
+                resolved, oid = _resolve_sl_placement_by_book_diff(adapter, symbol, pre_oids)
+                if resolved == "resting":
+                    resting_oid = oid
+                elif resolved == "unknown":
+                    place_unknown = True
 
         out = {
             "platform": "hyperliquid",
@@ -1524,6 +1752,8 @@ def run_update_stop_loss(symbol, side, size, trigger_px, mode, cancel_oid=0):
             out["stop_loss_filled_immediately"] = True
         if sl_filled_externally:
             out["stop_loss_filled_externally"] = True
+        if place_unknown:
+            out["stop_loss_outcome_unknown"] = True
         print(json.dumps(out, cls=SafeEncoder))
 
     except SystemExit:

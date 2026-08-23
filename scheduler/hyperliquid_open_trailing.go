@@ -87,10 +87,15 @@ func armTrailingStopAtOpenNow(
 
 	// currentTrigger==0 / currentOID==0: the primitive computes the initial
 	// trigger and rests a fresh SL (no forceResize needed).
+	//
+	// #1450: the policy carries no liquidationPx. This is a FRESH open — the
+	// Phase-1 clearinghouseState snapshot predates the position, so Hyperliquid
+	// has not reported a liquidation price for it yet and there is nothing to
+	// compare against. The next cycle's audit and walker heal it.
 	newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, symbol, side, slEffectiveQty, &posSnap, mark, 0, 0, 0, trailingReplacePolicy{}, notifier, logger)
 	mu.Lock()
 	defer mu.Unlock()
-	if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, 0, newHighWater, updateConfirmed, slUpdate, logger); immediateFill {
+	if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, 0, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, 0); immediateFill {
 		return 1, fmt.Sprintf("[%s] LIVE TRAILING SL %s @ $%.2f", sc.ID, symbol, fillPx)
 	}
 	if updateConfirmed && slUpdate != nil && slUpdate.StopLossOID > 0 {

@@ -93,6 +93,120 @@ func TestFetchHyperliquidState(t *testing.T) {
 	}
 }
 
+// #1450: liquidationPx decode — present, absent, JSON null, and unparseable.
+// Absent / null / unparseable must all land on 0 (treated as "unknown" by every
+// consumer) without failing the whole snapshot parse.
+func TestFetchHyperliquidStateLiquidationPx(t *testing.T) {
+	resp := map[string]interface{}{
+		"marginSummary": map[string]string{
+			"accountValue": "50000.00",
+		},
+		"assetPositions": []map[string]interface{}{
+			{
+				// present
+				"position": map[string]interface{}{
+					"coin":          "ETH",
+					"szi":           "2.5",
+					"entryPx":       "2400.00",
+					"liquidationPx": "2340.5",
+				},
+			},
+			{
+				// absent
+				"position": map[string]interface{}{
+					"coin":    "BTC",
+					"szi":     "0.5",
+					"entryPx": "42000.00",
+				},
+			},
+			{
+				// JSON null
+				"position": map[string]interface{}{
+					"coin":          "SOL",
+					"szi":           "-10",
+					"entryPx":       "150.00",
+					"liquidationPx": nil,
+				},
+			},
+			{
+				// unparseable
+				"position": map[string]interface{}{
+					"coin":          "DOGE",
+					"szi":           "1000",
+					"entryPx":       "0.35",
+					"liquidationPx": "abc",
+				},
+			},
+			{
+				// non-positive: HL should never send this, but 0 must not be
+				// mistaken for a real liquidation price.
+				"position": map[string]interface{}{
+					"coin":          "AVAX",
+					"szi":           "5",
+					"entryPx":       "30.00",
+					"liquidationPx": "0",
+				},
+			},
+			{
+				// #1456 review: HL also sends a BARE NUMBER. A plain string
+				// field fails the whole snapshot unmarshal on this shape.
+				"position": map[string]interface{}{
+					"coin":          "LINK",
+					"szi":           "50",
+					"entryPx":       "20.00",
+					"liquidationPx": 17.25,
+				},
+			},
+			{
+				// #1456 review: mixed response — one asset reports a string,
+				// another (above) a number. Both must decode.
+				"position": map[string]interface{}{
+					"coin":          "ARB",
+					"szi":           "200",
+					"entryPx":       "1.50",
+					"liquidationPx": "1.2",
+				},
+			},
+		},
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	origURL := hlMainnetURL
+	hlMainnetURL = ts.URL
+	defer func() { hlMainnetURL = origURL }()
+
+	_, positions, err := fetchHyperliquidState("0xabc123")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(positions) != 7 {
+		t.Fatalf("positions count = %d, want 7", len(positions))
+	}
+	want := map[string]float64{
+		"ETH":  2340.5,
+		"BTC":  0,
+		"SOL":  0,
+		"DOGE": 0,
+		"AVAX": 0,
+		"LINK": 17.25,
+		"ARB":  1.2,
+	}
+	for _, p := range positions {
+		w, ok := want[p.Coin]
+		if !ok {
+			t.Fatalf("unexpected coin %s", p.Coin)
+		}
+		if p.LiquidationPx != w {
+			t.Errorf("%s LiquidationPx = %g, want %g", p.Coin, p.LiquidationPx, w)
+		}
+	}
+}
+
 func TestFetchHyperliquidStateNoPositions(t *testing.T) {
 	resp := map[string]interface{}{
 		"marginSummary": map[string]string{
