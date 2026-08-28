@@ -1181,9 +1181,9 @@ func tradeAlertExtras(sc StrategyConfig, trade Trade, isClose bool) []string {
 	if !isClose && trade.EntryATR > 0 {
 		tiers = strategyTPTiersForRegime(sc, trade.Regime)
 		tps = tieredTPATRPricesFromTiers(tiers, direction, trade.Price, trade.EntryATR)
-		if len(tps) > 0 {
-			extras = append(extras, fmt.Sprintf("ATR: $%s", fmtComma2(trade.EntryATR)))
-		}
+	}
+	if !isClose && trade.EntryATR > 0 {
+		extras = append(extras, fmt.Sprintf("ATR: $%s", fmtComma2(trade.EntryATR)))
 	}
 	if trade.StopLossTriggerPx > 0 {
 		slPct := percentFromEntry(direction, trade.Price, trade.StopLossTriggerPx)
@@ -1196,9 +1196,42 @@ func tradeAlertExtras(sc StrategyConfig, trade Trade, isClose bool) []string {
 	for i, tp := range tps {
 		extras = append(extras, fmt.Sprintf("TP%d: $%s (%gx)", i+1, fmtComma2(tp), tiers[i].Multiple))
 	}
+	if !isClose && len(tps) == 0 && trade.EntryATR > 0 && trade.Price > 0 &&
+		trade.TradeType != scaleInTradeType && !strategyUsesNonDefaultATRWindow(sc) {
+		if ratchetTiers := trailingRatchetTiersForRegime(sc, trade.Regime); len(ratchetTiers) > 0 {
+			if trail := tradeAlertInitialTrailMult(sc, trade); trail > 0 {
+				extras = append(extras, fmt.Sprintf("Ratchet: 0/%d | Trail: %gx", len(ratchetTiers), trail))
+			} else {
+				extras = append(extras, fmt.Sprintf("Ratchet: 0/%d", len(ratchetTiers)))
+			}
+			for i, tier := range ratchetTiers {
+				target := ratchetTargetPrice(direction, trade.Price, trade.EntryATR, tier.ATRMultiple)
+				pct := percentFromEntry(direction, trade.Price, target)
+				extras = append(extras, fmt.Sprintf("RT%d: $%s (%s) (%gx -> %gx trail)", i+1, fmtComma2(target), fmtPnlPct(pct), tier.ATRMultiple, tier.TrailingMultAfter))
+			}
+		}
+	}
 	return extras
 }
 
+func strategyUsesNonDefaultATRWindow(sc StrategyConfig) bool {
+	key := normalizeRegimeWindowKey(sc.RegimeATRWindow)
+	return key != "" && key != regimeWindowDefaultKey
+}
+
+func tradeAlertInitialTrailMult(sc StrategyConfig, trade Trade) float64 {
+	if sc.TrailingStopATRMult != nil && *sc.TrailingStopATRMult > 0 {
+		return *sc.TrailingStopATRMult
+	}
+	if sc.TrailingStopATRRegime != nil && !sc.TrailingStopATRRegime.IsZero() && trade.Regime != "" {
+		if v, ok := resolveRegimeATR(*sc.TrailingStopATRRegime, trade.Regime); ok {
+			return v
+		}
+	}
+	return 0
+}
+
+// tradeSideToDirection converts buy/sell trade sides to LONG/SHORT direction labels.
 func tradeSideToDirection(side string) string {
 	switch strings.ToLower(side) {
 	case "buy":
