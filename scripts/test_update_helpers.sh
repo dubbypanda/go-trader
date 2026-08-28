@@ -131,6 +131,243 @@ fi
     esac
 )
 
+if ! command -v systemctl >/dev/null 2>&1; then
+    assert_eq "$(discover_deployment_unit_map)" "" \
+        "unit_map: no systemctl -> empty (parent service_unit fallback)"
+fi
+
+(
+    systemctl() {
+        case "$1" in
+            list-units)
+                local active_only=0 a
+                for a in "$@"; do [[ "$a" == "--state=active" ]] && active_only=1; done
+                printf '%s\n' \
+                    'go-trader.service           loaded active running primary' \
+                    'go-trader-live.service      loaded active running live' \
+                    'go-trader@paper-1.service   loaded active running paper-1' \
+                    'go-trader@paper-2.service   loaded active running paper-2' \
+                    'go-trader@noworkdir.service loaded active running noworkdir'
+                if [[ "$active_only" != "1" ]]; then
+                    printf '%s\n' 'go-trader@stopped.service   loaded inactive dead stopped'
+                fi
+                ;;
+            show)
+                case "$2" in
+                    go-trader.service) printf '%s\n' '/root/go-trader' ;;
+                    go-trader-live.service) printf '%s\n' '/root/.openclaw/workspace/go-trader-live' ;;
+                    go-trader@paper-1.service) printf '%s\n' '/srv/deploys/go-trader-paper-1/' ;;
+                    go-trader@paper-2.service) printf '%s\n' '/srv/deploys/go-trader-shared/' ;;
+                    go-trader@noworkdir.service) printf '%s\n' '' ;;
+                    go-trader@stopped.service) printf '%s\n' '/srv/deploys/go-trader-stopped' ;;
+                esac
+                ;;
+        esac
+    }
+    export -f systemctl 2>/dev/null || true
+    got=$(discover_deployment_unit_map)
+    want=$'/root/go-trader/|go-trader.service\n/root/.openclaw/workspace/go-trader-live/|go-trader-live.service\n/srv/deploys/go-trader-paper-1/|go-trader@paper-1.service\n/srv/deploys/go-trader-shared/|go-trader@paper-2.service'
+    assert_eq "$got" "$want" \
+        "unit_map: active-only, layout-independent, unset-WD dropped, stopped unit excluded"
+    case "$got" in
+        *go-trader-stopped*) echo "FAIL: unit_map surfaced a stopped-but-loaded unit (--state=active not applied)" >&2; exit 1 ;;
+        *go-trader@noworkdir*) echo "FAIL: unit_map surfaced an unset-WD unit (WorkingDirectory filter not applied)" >&2; exit 1 ;;
+    esac
+    canon_pair=$(printf '%s\n' "$got" | awk -F'|' '$1 == "/srv/deploys/go-trader-shared/" { print $2 }')
+    assert_eq "$canon_pair" "go-trader@paper-2.service" \
+        "unit_map: trailing-slash WD canonicalizes to physical-path+slash key"
+    collision_count=$(printf '%s\n' "$got" | awk -F'|' '{ print $1 }' | sort | uniq -d | wc -l)
+    assert_eq "$collision_count" "0" \
+        "unit_map: helper does not de-dupe; consumer must dedupe + warn"
+)
+
+(
+    link_tmp=$(mktemp -d)
+    canon_phys=$(cd "$link_tmp" && pwd -P)/
+    ln -s "$link_tmp" "${link_tmp}.link"
+    systemctl() {
+        case "$1" in
+            list-units)
+                printf '%s\n' 'go-trader-link.service loaded active running link'
+                ;;
+            show)
+                printf '%s\n' "${link_tmp}.link"
+                ;;
+        esac
+    }
+    export -f systemctl 2>/dev/null || true
+    got=$(discover_deployment_unit_map)
+    want="${canon_phys}|go-trader-link.service"
+    assert_eq "$got" "$want" \
+        "unit_map: symlink WorkingDirectory resolves to physical-path key (aliases collapse)"
+    rm -rf "$link_tmp" "${link_tmp}.link"
+)
+
+(
+    no_wd_tmp=$(mktemp -d)
+    systemctl() {
+        case "$1" in
+            list-units)
+                printf '%s\n' 'go-trader-nowd.service loaded active running nowd'
+                ;;
+            show)
+                printf '\n'
+                ;;
+        esac
+    }
+    export -f systemctl 2>/dev/null || true
+    got=$(discover_deployment_unit_map)
+    assert_eq "$got" "" \
+        "unit_map: unit with unset WorkingDirectory -> no row (miss handled by consumer)"
+    rm -rf "$no_wd_tmp"
+)
+
+assert_eq "$(strip_unit_flags_from_argv --all --unit go-trader-x --restart)" \
+    $'--all\n--restart' \
+    "strip: --unit <value> (the next token) is removed"
+assert_eq "$(strip_unit_flags_from_argv --all --service go-trader-x --restart)" \
+    $'--all\n--restart' \
+    "strip: --service <value> (the next token) is removed"
+assert_eq "$(strip_unit_flags_from_argv --all --unit=go-trader-x --restart)" \
+    $'--all\n--restart' \
+    "strip: --unit=<value> form is removed (single argv token)"
+assert_eq "$(strip_unit_flags_from_argv --all --service=go-trader-x --restart)" \
+    $'--all\n--restart' \
+    "strip: --service=<value> form is removed (single argv token)"
+assert_eq "$(strip_unit_flags_from_argv --all --unit go-trader-a --service go-trader-b --unit=go-trader-c --service=go-trader-d --restart)" \
+    $'--all\n--restart' \
+    "strip: mixed forms (space + equals) all removed"
+assert_eq "$(strip_unit_flags_from_argv --all --restart --yes)" \
+    $'--all\n--restart\n--yes' \
+    "strip: unrelated flags untouched (--yes preserved)"
+assert_eq "$(strip_unit_flags_from_argv)" "" \
+    "strip: empty input -> empty output"
+assert_eq "$(strip_unit_flags_from_argv --unit only)" "" \
+    "strip: input that is only unit flags -> empty"
+
+assert_eq "$(resolve_child_unit_override go-trader-parent go-trader-live --all --unit go-trader-x --restart)" \
+    $'go-trader-live\n--all\n--restart' \
+    "resolve: map hit picks mapped unit AND strips --unit <value> from child argv"
+assert_eq "$(resolve_child_unit_override go-trader-parent go-trader-live --all --unit=go-trader-x --restart)" \
+    $'go-trader-live\n--all\n--restart' \
+    "resolve: map hit picks mapped unit AND strips --unit=<value> from child argv"
+assert_eq "$(resolve_child_unit_override go-trader-parent go-trader-live --all --service=go-trader-x --restart)" \
+    $'go-trader-live\n--all\n--restart' \
+    "resolve: map hit strips --service=<value> from child argv"
+assert_eq "$(resolve_child_unit_override go-trader-parent go-trader-live --all --unit foo --service bar --restart)" \
+    $'go-trader-live\n--all\n--restart' \
+    "resolve: map hit strips BOTH --unit <v> and --service <v> from child argv"
+assert_eq "$(resolve_child_unit_override go-trader-parent go-trader-live --all --unit --service --unit=foo --restart)" \
+    $'go-trader-live\n--all\n--restart' \
+    "resolve: map hit strips clustered unit/service flags"
+assert_eq "$(resolve_child_unit_override go-trader-parent "" --all --unit go-trader-x --restart)" \
+    $'go-trader-parent\n--all\n--unit\ngo-trader-x\n--restart' \
+    "resolve: map MISS keeps parent's service_unit AND preserves parent's --unit <v> in child argv"
+assert_eq "$(resolve_child_unit_override go-trader-parent "" --all --unit=go-trader-x --restart)" \
+    $'go-trader-parent\n--all\n--unit=go-trader-x\n--restart' \
+    "resolve: map MISS preserves parent's --unit=<v> in child argv"
+assert_eq "$(resolve_child_unit_override go-trader-parent "" --all --restart)" \
+    $'go-trader-parent\n--all\n--restart' \
+    "resolve: map MISS without any parent unit token still inherits parent's service_unit"
+
+# Integration: drive the real scripts/update.sh --all coordinator with mocked
+# systemctl + mocked bash recursion. Asserts that the per-dir hit/miss
+# branch + GO_TRADER_SERVICE injection + parent-flag strip that production
+# runs matches the resolve_child_unit_override contract.
+update_test_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [[ -n "$update_test_repo_root" && -x "$update_test_repo_root/scripts/update.sh" ]]; then
+(
+    cd "$update_test_repo_root"
+
+    fleet=$(mktemp -d)
+    for n in go-trader-a go-trader-b go-trader-c; do
+        mkdir -p "$fleet/$n/scheduler"
+        echo '{}' > "$fleet/$n/scheduler/config.json"
+    done
+
+    # Shim: a real `systemctl` binary on PATH so update_helpers.sh's
+    # `command -v systemctl` guard resolves AND list-units/show returns
+    # our test data. Functions exported from the test driver are not
+    # visible to `command -v`, so a PATH shim is the only way to drive
+    # discover_deployment_dirs_from_systemd + discover_deployment_unit_map
+    # in the test.
+    mkdir -p "$fleet/shimbin"
+    cat > "$fleet/shimbin/systemctl" <<EOS
+#!/usr/bin/env bash
+case "\$1" in
+    list-units)
+        active_only=0
+        for a in "\$@"; do [[ "\$a" == "--state=active" ]] && active_only=1; done
+        if [[ "\$active_only" == "1" ]]; then
+            printf '%s\n' \\
+                'go-trader-x.service loaded active running x' \\
+                'go-trader-y.service loaded active running y'
+        fi
+        ;;
+    show)
+        case "\$2" in
+            go-trader-x.service) printf '%s\n' "$fleet/go-trader-a" ;;
+            go-trader-y.service) printf '%s\n' "$fleet/go-trader-b" ;;
+        esac
+        ;;
+esac
+EOS
+    chmod +x "$fleet/shimbin/systemctl"
+
+    bash() {
+        if [[ "${1:-}" == *update.sh ]]; then
+            printf '[child] cwd=%s GO_TRADER_SERVICE=%s argv=%s\n' \
+                "$(pwd)" "${GO_TRADER_SERVICE:-<unset>}" "$*" >> "${RECORD_OUT:?}"
+            return 0
+        fi
+        command bash "$@"
+    }
+    export -f bash 2>/dev/null || true
+
+    # Scenario 1: auto-resolve (default scan_root, shim systemd for a/b).
+    : > "$fleet/records"
+    RECORD_OUT="$fleet/records" \
+        PATH="$fleet/shimbin:$PATH" \
+        GO_TRADER_SERVICE=go-trader-parent \
+        command bash scripts/update.sh --all --restart --unit=go-trader-foo >/dev/null 2>&1 || true
+    r=$(grep "$fleet" "$fleet/records" || true)
+    spawn_count=$(printf '%s\n' "$r" | grep -c '\[child\] ' || true)
+    assert_eq "$spawn_count" "2" "integration auto-resolve: 2 systemd-mapped dirs spawn"
+    a_line=$(printf '%s\n' "$r" | grep "cwd=$fleet/go-trader-a" || true)
+    b_line=$(printf '%s\n' "$r" | grep "cwd=$fleet/go-trader-b" || true)
+    if [[ "$a_line" != *"GO_TRADER_SERVICE=go-trader-x.service"* || "$a_line" != *"--restart"* ]]; then
+        echo "FAIL: a record missing x.service or --restart" >&2; printf '%s\n' "$r" >&2; exit 1
+    fi
+    if [[ "$b_line" != *"GO_TRADER_SERVICE=go-trader-y.service"* || "$b_line" != *"--restart"* ]]; then
+        echo "FAIL: b record missing y.service or --restart" >&2; printf '%s\n' "$r" >&2; exit 1
+    fi
+    if printf '%s\n' "$r" | grep -v '/go-trader-c/' | grep -q -- '--unit=go-trader-foo'; then
+        echo "FAIL: parent --unit=go-trader-foo leaked into auto-resolved child argv" >&2
+        printf '%s\n' "$r" >&2
+        exit 1
+    fi
+
+    # Scenario 2: fallback (--update-all-root=$fleet, no systemd mapping).
+    # Drop the shim so the bounded-glob run treats systemd as absent; all
+    # 3 dirs must fall back to parent's service_unit.
+    rm -rf "$fleet/shimbin"
+    : > "$fleet/records"
+    RECORD_OUT="$fleet/records" \
+        GO_TRADER_SERVICE=go-trader-parent \
+        command bash scripts/update.sh --all --restart --update-all-root="$fleet" >/dev/null 2>&1 || true
+    r=$(grep "$fleet" "$fleet/records" || true)
+    spawn_count=$(printf '%s\n' "$r" | grep -c '\[child\] ' || true)
+    assert_eq "$spawn_count" "3" "integration fallback: 3 dirs spawn (a, b, c all miss)"
+    if printf '%s\n' "$r" | grep -vq 'GO_TRADER_SERVICE=go-trader-parent'; then
+        echo "FAIL: at least one fallback child did not inherit parent's service_unit" >&2
+        printf '%s\n' "$r" >&2
+        exit 1
+    fi
+
+    rm -rf "$fleet"
+)
+fi
+
 canon_tmp=$(mktemp -d)
 canon_phys=$(cd "$canon_tmp" && pwd -P)/
 ln -s "$canon_tmp" "${canon_tmp}.link"

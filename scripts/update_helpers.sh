@@ -92,6 +92,28 @@ discover_deployment_dirs_from_systemd() {
     done | normalize_systemd_deployment_dirs
 }
 
+discover_deployment_unit_map() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local -a globs=()
+    local g
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && globs+=("$g")
+    done < <(update_systemd_unit_globs)
+    local -a units=()
+    local unit
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] && units+=("$unit")
+    done < <(systemctl list-units --type=service --state=active --no-legend --plain "${globs[@]}" 2>/dev/null | awk '{print $1}')
+    [[ ${#units[@]} -gt 0 ]] || return 0
+    local wd canon
+    for unit in "${units[@]}"; do
+        wd=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null)
+        [[ -n "$wd" ]] || continue
+        canon=$(canonicalize_deployment_dir "$wd")
+        printf '%s|%s\n' "$canon" "$unit"
+    done
+}
+
 update_execstart_config_path() {
     local execstart="$1"
     if [[ "$execstart" =~ --config=([^[:space:]\;]+) ]]; then
@@ -153,4 +175,40 @@ update_config_writable_directive() {
 
 update_db_rsync_excludes() {
     printf '%s\n' '*.db' '*.db-wal' '*.db-shm' '*.db.lock'
+}
+
+strip_unit_flags_from_argv() {
+    declare -a out=()
+    local skip_next=0
+    local a
+    for a in "$@"; do
+        if [[ "$skip_next" == "1" ]]; then
+            skip_next=0
+            continue
+        fi
+        case "$a" in
+            --unit|--service)
+                skip_next=1
+                continue
+                ;;
+            --unit=*|--service=*)
+                continue
+                ;;
+        esac
+        out+=("$a")
+    done
+    printf '%s\n' "${out[@]}"
+}
+
+resolve_child_unit_override() {
+    local parent_service_unit="$1"
+    local mapped_unit="$2"
+    shift 2
+    if [[ -n "$mapped_unit" ]]; then
+        printf '%s\n' "$mapped_unit"
+        strip_unit_flags_from_argv "$@"
+    else
+        printf '%s\n' "$parent_service_unit"
+        printf '%s\n' "$@"
+    fi
 }
