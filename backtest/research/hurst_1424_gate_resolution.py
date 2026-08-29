@@ -1613,8 +1613,8 @@ def render_report(payload: dict) -> str:
         "Report-only evidence on whether a Hurst-based entry gate is worth "
         "building. Nothing here is wired to the scheduler, to config, or to any "
         "live path. This file is the LIVE-EVIDENCE CONTRACT PATH: "
-        "`scheduler/hurst_gate.go`, `docs/ARCHITECTURE.md` and #1412's Stage 0 "
-        "gate all read it. It supersedes the #1422 power study, whose own "
+        "`scheduler/hurst_gate.go` and #1412's Stage 0 "
+        "gate both read it. It supersedes the #1422 power study, whose own "
         "render now lives at `hurst_1422_gate_power.md`; #1410's is at "
         "`hurst_1410_gate_calibration.md`.")
     out.append("")

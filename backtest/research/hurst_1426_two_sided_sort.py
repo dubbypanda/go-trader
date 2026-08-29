@@ -214,8 +214,8 @@ COHORT_DECISION_STATEMENT = (
 
 CONTRACT_PATH_STATEMENT = (
     "CONTRACT PATH: this study DEFERS. `hurst_gate_calibration.md` is the "
-    "live-evidence path cited by `scheduler/hurst_gate.go`, "
-    "`docs/ARCHITECTURE.md` and #1412's Stage 0, and an exploratory-only study "
+    "live-evidence path cited by `scheduler/hurst_gate.go` "
+    "and #1412's Stage 0, and an exploratory-only study "
     "cannot be the evidence behind a shipping gate. "
     "`hurst_1424_gate_resolution.py` keeps it, its script and tests are "
     "untouched by this work, and this study's `main` refuses that path "

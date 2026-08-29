@@ -1,6 +1,6 @@
 # Hurst gate power study (#1422)
 
-**SUPERSEDED by the #1424 resolution study.** This file is NOT the live-evidence contract path. `backtest/research/hurst_gate_calibration.md` is that path — `scheduler/hurst_gate.go`, `docs/ARCHITECTURE.md` and #1412's Stage 0 gate all read it — and `research/hurst_1424_gate_resolution.py` owns it now. #1424 keeps this design and changes three things: ONE pre-registered primary hypothesis instead of four, pre-2020 calendar clusters from two additional venues, and a bounded-variance primary target. Read #1424's report for the live verdict; read this one for the design it inherits and for the interim look #1424 discloses.
+**SUPERSEDED by the #1424 resolution study.** This file is NOT the live-evidence contract path. `backtest/research/hurst_gate_calibration.md` is that path — `scheduler/hurst_gate.go` and #1412's Stage 0 gate both read it — and `research/hurst_1424_gate_resolution.py` owns it now. #1424 keeps this design and changes three things: ONE pre-registered primary hypothesis instead of four, pre-2020 calendar clusters from two additional venues, and a bounded-variance primary target. Read #1424's report for the live verdict; read this one for the design it inherits and for the interim look #1424 discloses.
 
 Report-only evidence on whether a Hurst-based entry gate is worth building. Nothing here is wired to the scheduler, to config, or to any live path. It supersedes the #1410 study, whose own render lives at `hurst_1410_gate_calibration.md`.
 
