@@ -1507,8 +1507,8 @@ def render_report(payload: dict) -> str:
     out.append(
         "**SUPERSEDED by the #1424 resolution study.** This file is NOT the "
         "live-evidence contract path. `backtest/research/hurst_gate_calibration.md` "
-        "is that path — `scheduler/hurst_gate.go`, `docs/ARCHITECTURE.md` and "
-        "#1412's Stage 0 gate all read it — and "
+        "is that path — `scheduler/hurst_gate.go` and "
+        "#1412's Stage 0 gate both read it — and "
         "`research/hurst_1424_gate_resolution.py` owns it now. #1424 keeps this "
         "design and changes three things: ONE pre-registered primary hypothesis "
         "instead of four, pre-2020 calendar clusters from two additional venues, "

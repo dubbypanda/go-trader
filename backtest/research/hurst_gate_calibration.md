@@ -1,6 +1,6 @@
 # Hurst gate resolution study (#1424)
 
-Report-only evidence on whether a Hurst-based entry gate is worth building. Nothing here is wired to the scheduler, to config, or to any live path. This file is the LIVE-EVIDENCE CONTRACT PATH: `scheduler/hurst_gate.go`, `docs/ARCHITECTURE.md` and #1412's Stage 0 gate all read it. It supersedes the #1422 power study, whose own render now lives at `hurst_1422_gate_power.md`; #1410's is at `hurst_1410_gate_calibration.md`.
+Report-only evidence on whether a Hurst-based entry gate is worth building. Nothing here is wired to the scheduler, to config, or to any live path. This file is the LIVE-EVIDENCE CONTRACT PATH: `scheduler/hurst_gate.go` and #1412's Stage 0 gate both read it. It supersedes the #1422 power study, whose own render now lives at `hurst_1422_gate_power.md`; #1410's is at `hurst_1410_gate_calibration.md`.
 
 #1422 returned INCONCLUSIVE because of POWER: its primary cohort could resolve 0.96 pp per trade and that cohort separated by only 0.37 pp, so the null bounded the edge from above and said nothing about anything smaller. This study exists to make its OWN null readable. It lowers the detection limit three ways at once — ONE pre-registered hypothesis instead of four, 8 added pre-2020 calendar windows from two venues the `binanceus` cache cannot reach (the coverage table below says which of them survived), and a bounded-variance primary target — and it publishes a mechanical VALIDITY GATE that decides, before any interpretation, whether the result is a statement about the market or about the design.
 

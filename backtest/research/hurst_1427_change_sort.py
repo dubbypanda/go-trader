@@ -263,8 +263,8 @@ DEFERRING_SIBLINGS = (1426,)
 CONTRACT_PATH_STATEMENT = (
     "CONTRACT PATH: this study DEFERS, and it would defer on a positive "
     "finding exactly as on a null. `hurst_gate_calibration.md` is the "
-    "live-evidence path cited by `scheduler/hurst_gate.go`, "
-    "`docs/ARCHITECTURE.md` and #1412's Stage 0, and it must describe the "
+    "live-evidence path cited by `scheduler/hurst_gate.go` "
+    "and #1412's Stage 0, and it must describe the "
     "quantity the shipped gate actually reads. `scheduler/hurst_gate.go` "
     "reads the LEVEL of H at entry and never its change, so nothing measured "
     "here can calibrate it: a positive result licenses a follow-up DESIGN, "
