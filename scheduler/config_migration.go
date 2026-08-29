@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const CurrentConfigVersion = 17
+const CurrentConfigVersion = 18
 
 const MinSupportedConfigVersion = 13
 
@@ -50,6 +50,34 @@ func versionlessConfigRemovedTranslationKey(data []byte) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func rawConfigVersion(data []byte) int {
+	var meta struct {
+		ConfigVersion int `json:"config_version"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return 0
+	}
+	return meta.ConfigVersion
+}
+
+func configMigrationNotices(baseVersion int) []string {
+	var notices []string
+	for _, n := range []struct {
+		since  int
+		notice string
+	}{
+		{14, v14DeprecationNotice},
+		{15, v15DeprecationNotice},
+		{17, v17ATRMethodNotice},
+		{18, v18TrailStopRenameNotice},
+	} {
+		if baseVersion < n.since {
+			notices = append(notices, n.notice)
+		}
+	}
+	return notices
 }
 
 func checkRawConfigVersionSupported(data []byte) error {
@@ -102,6 +130,15 @@ const v17ATRMethodNotice = "**Note:** ATR smoothing is now configurable (#1277).
 	"frozen entry-ATR and on-chain protection are unaffected. A startup check DMs the owner if " +
 	"this happens. " +
 	"Backtest baselines were established under simple; re-validate before promoting Wilder-based results."
+
+const v18TrailStopRenameNotice = "**Note:** the per-regime trailing-stop field was renamed (#1465). " +
+	"`trailing_stop_atr_regime` is now `trail_stop_atr_regime`, so it no longer shares the `trailing_` " +
+	"prefix with the `trailing_tp_ratchet_regime` close evaluator. Migration rewrites the key on disk in " +
+	"strategy blocks, `user_defaults.regime_atr`, `user_defaults.manual` and every `user_defaults.close` " +
+	"entry. Runtime behavior is unchanged — the field still owns the high-water trailing stop on Hyperliquid " +
+	"perps. Where `scheduler/config.json` is still the #1056 transition symlink, this on-disk rewrite " +
+	"replaces the symlink with a regular in-tree file; deployments already pointed at " +
+	"`/var/lib/go-trader[/<instance>]/config.json` via `ExecStart --config` are unaffected."
 
 func NewFieldsSince(version int) []ConfigField {
 	var fields []ConfigField
@@ -156,6 +193,12 @@ func MigrateConfig(configPath string, fieldValues map[string]string, cfg *Config
 
 	if oldVer < 16 || hasLegacyUserDefaultAliases(raw) {
 		if err := migrateV16UserDefaults(raw); err != nil {
+			return err
+		}
+	}
+
+	if oldVer < 18 || hasLegacyTrailStopATRRegimeKey(raw) {
+		if err := migrateV18TrailStopATRRegimeKey(raw); err != nil {
 			return err
 		}
 	}
@@ -229,27 +272,25 @@ func cloneOrNewJSONMap(v interface{}) map[string]interface{} {
 	return out
 }
 
+func deliverConfigMigrationNotices(baseVersion int, notifier *MultiNotifier) {
+	for _, notice := range configMigrationNotices(baseVersion) {
+		if notifier != nil && notifier.HasOwner() {
+			notifier.SendOwnerDM(notice)
+		} else {
+			fmt.Printf("[migration] %s\n", notice)
+		}
+	}
+}
+
 func runConfigMigrationDM(cfg *Config, notifier *MultiNotifier, configPath string) {
-	fields := NewFieldsSince(cfg.ConfigVersion)
+	baseVersion := cfg.MigrationBaseVersion()
+	fields := NewFieldsSince(baseVersion)
 
 	if len(fields) == 0 {
 		if err := MigrateConfig(configPath, nil, cfg); err != nil {
 			fmt.Printf("[migration] Failed to bump config version: %v\n", err)
 		}
-		if cfg.ConfigVersion < 14 {
-			if notifier != nil && notifier.HasOwner() {
-				notifier.SendOwnerDM(v14DeprecationNotice)
-			} else {
-				fmt.Printf("[migration] %s\n", v14DeprecationNotice)
-			}
-		}
-		if cfg.ConfigVersion < 17 {
-			if notifier != nil && notifier.HasOwner() {
-				notifier.SendOwnerDM(v17ATRMethodNotice)
-			} else {
-				fmt.Printf("[migration] %s\n", v17ATRMethodNotice)
-			}
-		}
+		deliverConfigMigrationNotices(baseVersion, notifier)
 		return
 	}
 
@@ -265,15 +306,7 @@ func runConfigMigrationDM(cfg *Config, notifier *MultiNotifier, configPath strin
 		if err := MigrateConfig(configPath, values, cfg); err != nil {
 			fmt.Printf("[migration] Failed to migrate config: %v\n", err)
 		}
-		if cfg.ConfigVersion < 14 {
-			fmt.Printf("[migration] %s\n", v14DeprecationNotice)
-		}
-		if cfg.ConfigVersion < 15 {
-			fmt.Printf("[migration] %s\n", v15DeprecationNotice)
-		}
-		if cfg.ConfigVersion < 17 {
-			fmt.Printf("[migration] %s\n", v17ATRMethodNotice)
-		}
+		deliverConfigMigrationNotices(baseVersion, nil)
 		return
 	}
 
@@ -303,15 +336,7 @@ func runConfigMigrationDM(cfg *Config, notifier *MultiNotifier, configPath strin
 
 	notifier.SendOwnerDM("Config updated. Changes take effect next restart.")
 
-	if cfg.ConfigVersion < 14 {
-		notifier.SendOwnerDM(v14DeprecationNotice)
-	}
-	if cfg.ConfigVersion < 15 {
-		notifier.SendOwnerDM(v15DeprecationNotice)
-	}
-	if cfg.ConfigVersion < 17 {
-		notifier.SendOwnerDM(v17ATRMethodNotice)
-	}
+	deliverConfigMigrationNotices(baseVersion, notifier)
 }
 
 func needsV13SchemaMigration(data []byte) bool {
