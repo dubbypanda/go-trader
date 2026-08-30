@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -348,11 +349,11 @@ func findPendingLimitOrderByOID(orders []PendingLimitOrder, oid int64) (PendingL
 func clearOperatorRequiredLimitRowRefusal(cfg *Config, o PendingLimitOrder, flattened bool) string {
 	sc, known := scByIDLookup(cfg, o.StrategyID)
 	block := killSwitchLimitOrderAdoptionBlock(sc, known)
-	if block == "" {
-		return fmt.Sprintf("refusing: %s is a Hyperliquid-live type=manual strategy, so the scheduler adopts this fill itself — clearing the row would orphan it; let the reconciler converge instead",
-			o.StrategyID)
-	}
 	if o.OperatorRequiredSince.IsZero() {
+		if block == "" {
+			return fmt.Sprintf("refusing: %s is a Hyperliquid-live type=manual strategy and the reconciler has NOT marked oid=%d as needing an operator, so the scheduler adopts this fill itself — clearing the row would orphan it; let the reconciler converge instead",
+				o.StrategyID, o.OrderOID)
+		}
 		return fmt.Sprintf("refusing: the reconciler has not classified oid=%d as needing an operator — it is still converging on its own, and clearing the row now would discard a live recovery record",
 			o.OrderOID)
 	}
@@ -754,9 +755,12 @@ func reconcilePendingLimitOrders(state *AppState, cfg *Config, stateDB *StateDB,
 
 	now := time.Now().UTC()
 	orphanLimitCancelAlerts.Retain(orders)
+	limitFillExposureAlerts.Retain(orders)
+	exposureReader := &hlLiveExposureReader{}
 	applied := make(map[string]*manualAlert)
 	var order []string
 
+	var candidates []*limitFillCandidate
 	for _, o := range orders {
 		sc, known := scByID[o.StrategyID]
 		if block := killSwitchLimitOrderAdoptionBlock(sc, known); block != "" {
@@ -781,17 +785,12 @@ func reconcilePendingLimitOrders(state *AppState, cfg *Config, stateDB *StateDB,
 			reportOrphanLimitCancel(notifier, o, block, outcome, now)
 			continue
 		}
-		if !o.OperatorRequiredSince.IsZero() {
-			if err := stateDB.ClearPendingLimitOrderOperatorRequired(o.ID); err != nil {
-				fmt.Printf("[limit] failed to clear the operator-required marker on row %d: %v\n", o.ID, err)
-			}
-			o.OperatorRequiredSince = time.Time{}
-		}
 		var logger *StrategyLogger
 		if logMgr != nil {
 			logger, _ = logMgr.GetStrategyLogger(o.StrategyID)
 		}
 
+		statusPolledAt := time.Now()
 		statusRes, stderr, perr := runHyperliquidLimitStatusFn(sc.Script, o.Symbol, []int64{o.OrderOID}, limitStatusSinceMs(o.CreatedAt))
 		if stderr != "" {
 			fmt.Fprintf(os.Stderr, "[limit] %s status stderr: %s\n", o.StrategyID, stderr)
@@ -809,50 +808,120 @@ func reconcilePendingLimitOrders(state *AppState, cfg *Config, stateDB *StateDB,
 		}
 		st := statusRes.Orders[0]
 
+		c := &limitFillCandidate{order: o, sc: sc, logger: logger, status: st, polledAt: statusPolledAt}
 		if st.FilledSize > o.FilledSize+limitFillEpsilon {
-			avgPx := st.AvgPx
-			if avgPx <= 0 {
-				avgPx = o.LimitPrice
+			c.hasFill = true
+			c.avgPx = st.AvgPx
+			if c.avgPx <= 0 {
+				c.avgPx = o.LimitPrice
 			}
-			entryATR := o.EntryATR
-			resolveATR := o.FilledSize == 0
-			if !resolveATR {
-				mu.RLock()
-				if ss := state.Strategies[o.StrategyID]; ss != nil {
-					if p := ss.Positions[o.Symbol]; p != nil && p.EntryATR == 0 {
-						resolveATR = true
+			c.signedDelta = hlSignedQty(o.Side, st.FilledSize-o.FilledSize)
+			c.entryATR = o.EntryATR
+		}
+		candidates = append(candidates, c)
+	}
+
+	coinRows := make(map[string][]*limitFillCandidate)
+	var coins []string
+	for _, c := range candidates {
+		if !c.hasFill {
+			continue
+		}
+		if _, seen := coinRows[c.order.Symbol]; !seen {
+			coins = append(coins, c.order.Symbol)
+		}
+		coinRows[c.order.Symbol] = append(coinRows[c.order.Symbol], c)
+	}
+	sort.Strings(coins)
+
+	for _, coin := range coins {
+		rows := coinRows[coin]
+		latestPoll := rows[0].polledAt
+		totalDelta := 0.0
+		for _, r := range rows {
+			if r.polledAt.After(latestPoll) {
+				latestPoll = r.polledAt
+			}
+			totalDelta += r.signedDelta
+		}
+		positions, readErr := exposureReader.snapshotNewerThan(latestPoll)
+		onChainNet := hyperliquidOnChainNetForCoin(positions, coin)
+		owners := hyperliquidLiveOwnersForCoin(cfg.Strategies, coin)
+
+		mu.RLock()
+		preBooked := hyperliquidBookedSignedNetForCoin(cfg.Strategies, state, coin)
+		for _, r := range rows {
+			r.resolveATR = r.order.FilledSize == 0
+			if !r.resolveATR {
+				if ss := state.Strategies[r.order.StrategyID]; ss != nil {
+					if p := ss.Positions[coin]; p != nil && p.EntryATR == 0 {
+						r.resolveATR = true
 					}
 				}
-				mu.RUnlock()
 			}
-			if resolveATR {
-				entryATR = resolveLimitFillEntryATR(sc, cfg, o.EntryATR, avgPx, notifier)
-			}
-			mu.Lock()
-			tradesBooked, applyErr := applyLimitFillProgress(state, sc, o, st.FilledSize, avgPx, st.Fee, entryATR, resolveATRMethod(sc, cfg), now)
-			mu.Unlock()
-			if applyErr != nil {
-				warnNotifier(notifier, fmt.Sprintf("[limit-fill] %s %s: %v", o.StrategyID, o.Symbol, applyErr))
-				continue
-			}
-			if err := stateDB.UpdatePendingLimitOrderFill(o.ID, st.FilledSize, avgPx, st.Fee); err != nil {
-				fmt.Printf("[limit] failed to persist fill watermark for row %d: %v\n", o.ID, err)
-			}
-			o.FilledSize = st.FilledSize
-			o.AvgFillPrice = avgPx
-			o.FillFee = st.Fee
-			if _, fillPx := runHyperliquidProtectionSync(sc, state.Strategies[o.StrategyID], stateDB, o.Symbol, mu, notifier, logger, "HL limit-fill protection synced", nil, nil, nil); fillPx > 0 {
-				tradesBooked++
-			}
-			if ma := applied[o.StrategyID]; ma == nil {
-				applied[o.StrategyID] = &manualAlert{sc: sc, ss: state.Strategies[o.StrategyID], trades: tradesBooked}
-				order = append(order, o.StrategyID)
-			} else {
-				ma.trades += tradesBooked
+		}
+		mu.RUnlock()
+
+		if pre := classifyLimitFillLiveExposure(coin, preBooked, totalDelta, onChainNet, readErr, owners); pre.adopts() {
+			for _, r := range rows {
+				if r.resolveATR {
+					r.entryATR = resolveLimitFillEntryATR(r.sc, cfg, r.order.EntryATR, r.avgPx, notifier)
+				}
 			}
 		}
 
+		decision, trades, errs := applyCoinLimitFills(state, cfg, mu, coin, rows, totalDelta, onChainNet, readErr, owners, now)
+		if !decision.adopts() {
+			for _, r := range rows {
+				r.refused = true
+				r.refusalVerdict = decision.Verdict
+				reportLimitFillExposureRefusal(notifier, r.order, r.status.FilledSize, decision, now)
+			}
+			continue
+		}
+		for i, r := range rows {
+			if errs[i] != nil {
+				warnNotifier(notifier, fmt.Sprintf("[limit-fill] %s %s: %v", r.order.StrategyID, coin, errs[i]))
+				r.applyFailed = true
+				continue
+			}
+			limitFillExposureAlerts.Clear(limitFillExposureKeyFor(r.order))
+			if err := stateDB.UpdatePendingLimitOrderFill(r.order.ID, r.status.FilledSize, r.avgPx, r.status.Fee); err != nil {
+				fmt.Printf("[limit] failed to persist fill watermark for row %d: %v\n", r.order.ID, err)
+			}
+			r.order.FilledSize = r.status.FilledSize
+			r.order.AvgFillPrice = r.avgPx
+			r.order.FillFee = r.status.Fee
+			booked := trades[i]
+			if _, fillPx := runHyperliquidProtectionSync(r.sc, state.Strategies[r.order.StrategyID], stateDB, coin, mu, notifier, r.logger, "HL limit-fill protection synced", nil, nil, nil); fillPx > 0 {
+				booked++
+			}
+			if ma := applied[r.order.StrategyID]; ma == nil {
+				applied[r.order.StrategyID] = &manualAlert{sc: r.sc, ss: state.Strategies[r.order.StrategyID], trades: booked}
+				order = append(order, r.order.StrategyID)
+			} else {
+				ma.trades += booked
+			}
+		}
+	}
+
+	for _, c := range candidates {
+		applyLimitExposureOperatorRequired(stateDB, c, now)
+	}
+
+	for _, c := range candidates {
+		if c.applyFailed {
+			continue
+		}
+		o := c.order
+		st := c.status
+
 		if st.Resting != nil && !*st.Resting {
+			if c.refused {
+				fmt.Printf("[limit] %s: order is off-book and its fill was NOT booked — keeping the queue row as the recovery record\n",
+					killSwitchLimitOrderLabel(o))
+				continue
+			}
 			if limitOrderFullyFilled(o.FilledSize, o.OrderSize) {
 				fmt.Printf("[limit] %s oid=%d fully filled (%.6f %s)\n", o.StrategyID, o.OrderOID, o.FilledSize, o.Symbol)
 			} else if o.FilledSize > 0 {
@@ -887,7 +956,7 @@ func reconcilePendingLimitOrders(state *AppState, cfg *Config, stateDB *StateDB,
 			if expired {
 				reason = "TTL expiry"
 			}
-			cancelRes, cstderr, cerr := runHyperliquidCancelOrderFn(sc.Script, o.Symbol, o.OrderOID)
+			cancelRes, cstderr, cerr := runHyperliquidCancelOrderFn(c.sc.Script, o.Symbol, o.OrderOID)
 			if cstderr != "" {
 				fmt.Fprintf(os.Stderr, "[limit] %s cancel stderr: %s\n", o.StrategyID, cstderr)
 			}
