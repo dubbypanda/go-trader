@@ -1,5 +1,5 @@
 {
-  "config_version": 17,
+  "config_version": 19,
   "interval_seconds": 300,
   "db_file": "scheduler/state.db",
   "replay_log_path": "",
@@ -20,7 +20,7 @@
       }
     },
     "regime_atr": {
-      "stop_loss_atr_regime": {
+      "stop_loss_atr_mult_regime": {
         "trend_regime": {
           "trending_up": { "atr_multiple": 2.0 },
           "trending_down": { "atr_multiple": 2.0 },

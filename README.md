@@ -113,7 +113,7 @@ Generate via `./go-trader init` or `--json`. Skeleton:
 
 ```json
 {
-  "config_version": 17,
+  "config_version": 19,
   "interval_seconds": 3600,
   "db_file": "scheduler/state.db",
   "log_dir": "logs",
@@ -145,7 +145,7 @@ Generate via `./go-trader init` or `--json`. Skeleton:
 }
 ```
 
-`config_version` migrates on startup (current **17**: v17 adds the opt-in `atr_method` ATR-smoothing selector, stamp-only). Configs older than **13** are rejected at load — start the pre-upgrade binary once to migrate first.
+`config_version` migrates on startup (current **19**: v19 renames the per-regime stop fields to `stop_loss_atr_mult_regime` / `trailing_stop_atr_mult_regime`, after v18's `trail_stop_atr_regime` rename). Configs older than **13** are rejected at load — start the pre-upgrade binary once to migrate first.
 
 ### Portfolio Risk
 
@@ -183,7 +183,7 @@ Optional ADX+DI 3-state gate (`trending_up` / `trending_down` / `ranging`) from 
 
 OHLCV fetch scales to the longest window. `go-trader inspect <id>` shows resolved selectors and stamped windows on open positions.
 
-**Regime-aware ATR multipliers (HL perps).** With `regime.enabled`, swap scalar stop/TP fields for `*_regime` siblings (`stop_loss_atr_regime`, `trail_stop_atr_regime`, `tiered_tp_atr_regime`, `tiered_tp_atr_live_regime`). `{"use_defaults": true}` expands a baseline table; explicit form requires all three ADX labels. Regime is frozen at open for stops; live TP regime refs re-resolve each tick.
+**Regime-aware ATR multipliers (HL perps).** With `regime.enabled`, swap scalar stop/TP fields for `*_regime` siblings (`stop_loss_atr_mult_regime`, `trailing_stop_atr_mult_regime`, `tiered_tp_atr_regime`, `tiered_tp_atr_live_regime`). `{"use_defaults": true}` expands a baseline table; explicit form requires all three ADX labels. Regime is frozen at open for stops; live TP regime refs re-resolve each tick. (Renamed #1475; pre-v19 spellings `stop_loss_atr_regime`/`trail_stop_atr_regime` migrate on load.)
 
 ### Correlation Tracking
 
@@ -284,7 +284,7 @@ Hand-placed positions (or TradingView alerts) tracked for P&L, stops/TPs, and Di
 
 Sizing: mutually exclusive `--size` / `--notional` / `--margin` (default `--margin 50` when omitted). `--side` defaults to `long`. Omitting `--atr` auto-fetches ATR(14); leverage-aware fallback if fetch fails. SL + tiered TPs placed inline so the position is never naked.
 
-**Close defaults (#1115/#1135):** with `regime.enabled` and a resolvable per-regime trail, manual defaults to `trailing_tp_ratchet_regime` (regime trail owns the SL); otherwise `tiered_tp_atr_live` + scalar **2.0×ATR** SL (#1121). Override via `close_strategy`, stop fields, or `user_defaults.manual` (hot-reloadable via SIGHUP). Fleet close ladders live under `user_defaults.close`; standalone `*_atr_regime` defaults live under `user_defaults.regime_atr`.
+**Close defaults (#1115/#1135):** with `regime.enabled` and a resolvable per-regime trail, manual defaults to `trailing_tp_ratchet_regime` (regime trail owns the SL); otherwise `tiered_tp_atr_live` + scalar **2.0×ATR** SL (#1121). Override via `close_strategy`, stop fields, or `user_defaults.manual` (hot-reloadable via SIGHUP). Fleet close ladders live under `user_defaults.close`; standalone `*_atr_mult_regime` defaults live under `user_defaults.regime_atr`.
 
 Operator guardrails, refusals, and the queueing model: [SKILL.md](SKILL.md) § Manual Trading.
 
@@ -375,7 +375,7 @@ Open `https://<node>.tailnet.ts.net:8443/dashboard`. `status_token` still applie
 
 - **Portfolio kill switch** — halts at `portfolio_risk.max_drawdown_pct` (default 25); submits real closes on HL / OKX perps / Robinhood crypto / TopStep. Owner-DM reset confirmation wait is tunable via `kill_switch_reset_dm_timeout` (Go duration string, e.g. `"6h"`; default 6h).
 - **Per-strategy circuit breakers** — max-drawdown (24h cooldown) or consecutive losses (default 5, 1h cooldown); threshold and both cooldowns tunable per strategy via `cb_drawdown_cooldown_minutes` / `cb_loss_streak_threshold` / `cb_loss_streak_cooldown_minutes`. HL/OKX perps, Robinhood crypto, TopStep auto-close; OKX spot and Robinhood options need manual flatten. Latched HL perps CB still permits trailing-SL management. `circuit_breaker: false` disables firing.
-- **Hyperliquid stop-loss** — one positive field among seven mutually-exclusive stop owners (`stop_loss_pct`, `stop_loss_margin_pct`, `stop_loss_atr_mult`, `stop_loss_atr_regime`, `trailing_stop_pct`, `trailing_stop_atr_mult`, `trail_stop_atr_regime`); all omitted → `default_stop_loss_atr_mult × entry_atr` (1.0); `0` opts out. A stop past the Hyperliquid liquidation price is clamped, never left unreachable.
+- **Hyperliquid stop-loss** — one positive field among seven mutually-exclusive stop owners (`stop_loss_pct`, `stop_loss_margin_pct`, `stop_loss_atr_mult`, `stop_loss_atr_mult_regime`, `trailing_stop_pct`, `trailing_stop_atr_mult`, `trailing_stop_atr_mult_regime`); all omitted → `default_stop_loss_atr_mult × entry_atr` (1.0); `0` opts out. A stop past the Hyperliquid liquidation price is clamped, never left unreachable.
 - **On-chain N-tier TP/SL** — `tiered_tp_atr` / `tiered_tp_atr_live` (default tiers `[{1.5×, 0.4}, {3×, 0.8}, {5×, 1.0}]`).
 - **Trailing-ratchet close** — `trailing_tp_ratchet` / `trailing_tp_ratchet_regime`: cleared tiers tighten a single trailing stop; no fixed on-chain TPs. HL perps + `manual`.
 - **AVWAP stop close** — `avwap_stop`: exits when price breaches the anchored VWAP by `buffer_atr_mult`× ATR on the losing side; virtual exit only (no on-chain trigger).

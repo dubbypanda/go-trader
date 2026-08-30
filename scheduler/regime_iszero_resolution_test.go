@@ -7,7 +7,7 @@ import (
 
 const (
 	minMoveRequiresErr = "trailing_stop_min_move_pct requires"
-	regimeStopMutexErr = "stop_loss_atr_regime is mutually exclusive with trail_stop_atr_regime"
+	regimeStopMutexErr = "stop_loss_atr_mult_regime is mutually exclusive with trailing_stop_atr_mult_regime"
 )
 
 func adx3StateATR(atr float64) map[string]interface{} {
@@ -45,21 +45,21 @@ func TestConfigValidation_MinMoveAcceptsUnresolvedRegimeTrail(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sc := StrategyConfig{
-				ID:                     "hl-rmc-eth-live",
-				Type:                   "perps",
-				Platform:               "hyperliquid",
-				Script:                 "shared_scripts/check_hyperliquid.py",
-				Capital:                1000,
-				MaxDrawdownPct:         10,
-				Leverage:               10,
-				MarginMode:             "isolated",
-				RegimeATRWindow:        "daily",
-				TrailStopATRRegime:     &RegimeATRBlock{raw: tc.raw},
-				TrailingStopMinMovePct: &minMove,
+				ID:                        "hl-rmc-eth-live",
+				Type:                      "perps",
+				Platform:                  "hyperliquid",
+				Script:                    "shared_scripts/check_hyperliquid.py",
+				Capital:                   1000,
+				MaxDrawdownPct:            10,
+				Leverage:                  10,
+				MarginMode:                "isolated",
+				RegimeATRWindow:           "daily",
+				TrailingStopATRMultRegime: &RegimeATRBlock{raw: tc.raw},
+				TrailingStopMinMovePct:    &minMove,
 			}
 			err := validateConfig(adxRegimeCfg(sc), false)
 			if err != nil && strings.Contains(err.Error(), minMoveRequiresErr) {
-				t.Fatalf("trailing_stop_min_move_pct wrongly rejected alongside trail_stop_atr_regime: %v", err)
+				t.Fatalf("trailing_stop_min_move_pct wrongly rejected alongside trailing_stop_atr_mult_regime: %v", err)
 			}
 		})
 	}
@@ -86,12 +86,12 @@ func TestConfigValidation_MinMoveStillRequiresATrailingMode(t *testing.T) {
 
 func TestValidateRegimeATRConfig_RegimeStopMutexEnforced(t *testing.T) {
 	sc := StrategyConfig{
-		ID:                 "hl-test",
-		Type:               "perps",
-		Platform:           "hyperliquid",
-		RegimeATRWindow:    "daily",
-		StopLossATRRegime:  &RegimeATRBlock{raw: adx3StateATR(2.0)},
-		TrailStopATRRegime: &RegimeATRBlock{raw: adx3StateATR(2.0)},
+		ID:                        "hl-test",
+		Type:                      "perps",
+		Platform:                  "hyperliquid",
+		RegimeATRWindow:           "daily",
+		StopLossATRMultRegime:     &RegimeATRBlock{raw: adx3StateATR(2.0)},
+		TrailingStopATRMultRegime: &RegimeATRBlock{raw: adx3StateATR(2.0)},
 	}
 	errs := validateRegimeATRConfig(adxRegimeCfg(sc))
 	found := false
@@ -102,21 +102,21 @@ func TestValidateRegimeATRConfig_RegimeStopMutexEnforced(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("config with both stop_loss_atr_regime and trail_stop_atr_regime must be rejected as mutually exclusive, got: %v", errs)
+		t.Fatalf("config with both stop_loss_atr_mult_regime and trailing_stop_atr_mult_regime must be rejected as mutually exclusive, got: %v", errs)
 	}
 }
 
 func TestValidateRegimeATRConfig_SingleRegimeStopNoMutex(t *testing.T) {
 	sc := StrategyConfig{
-		ID:                 "hl-test",
-		Type:               "perps",
-		Platform:           "hyperliquid",
-		RegimeATRWindow:    "daily",
-		TrailStopATRRegime: &RegimeATRBlock{raw: adx3StateATR(2.0)},
+		ID:                        "hl-test",
+		Type:                      "perps",
+		Platform:                  "hyperliquid",
+		RegimeATRWindow:           "daily",
+		TrailingStopATRMultRegime: &RegimeATRBlock{raw: adx3StateATR(2.0)},
 	}
 	for _, e := range validateRegimeATRConfig(adxRegimeCfg(sc)) {
 		if strings.Contains(e, regimeStopMutexErr) {
-			t.Fatalf("single trail_stop_atr_regime must not trip the stop mutex, got: %v", e)
+			t.Fatalf("single trailing_stop_atr_mult_regime must not trip the stop mutex, got: %v", e)
 		}
 	}
 }

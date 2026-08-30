@@ -39,17 +39,17 @@ func compositeRegimeCfg(scs ...StrategyConfig) *Config {
 
 func TestValidateRegimeATRConfig_CompositeStopLossExplicit(t *testing.T) {
 	sc := StrategyConfig{
-		ID:                "hl-test",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		RegimeATRWindow:   "daily",
-		StopLossATRRegime: &RegimeATRBlock{raw: composite7StateATR(2.0)},
+		ID:                    "hl-test",
+		Type:                  "perps",
+		Platform:              "hyperliquid",
+		RegimeATRWindow:       "daily",
+		StopLossATRMultRegime: &RegimeATRBlock{raw: composite7StateATR(2.0)},
 	}
 	cfg := compositeRegimeCfg(sc)
 	if errs := validateRegimeATRConfig(cfg); len(errs) != 0 {
-		t.Fatalf("composite stop_loss_atr_regime must validate, got: %v", errs)
+		t.Fatalf("composite stop_loss_atr_mult_regime must validate, got: %v", errs)
 	}
-	block := cfg.Strategies[0].StopLossATRRegime
+	block := cfg.Strategies[0].StopLossATRMultRegime
 	if got := len(block.TrendRegime); got != 9 {
 		t.Fatalf("block must be populated with all 9 composite labels, got %d: %v", got, block.TrendRegime)
 	}
@@ -89,17 +89,17 @@ func TestValidateRegimeATRConfig_CompositeSLAfterTPATRFraction(t *testing.T) {
 
 func TestValidateRegimeATRConfig_CompositeTrailingExplicit(t *testing.T) {
 	sc := StrategyConfig{
-		ID:                 "hl-test",
-		Type:               "perps",
-		Platform:           "hyperliquid",
-		RegimeATRWindow:    "daily",
-		TrailStopATRRegime: &RegimeATRBlock{raw: composite7StateATR(2.5)},
+		ID:                        "hl-test",
+		Type:                      "perps",
+		Platform:                  "hyperliquid",
+		RegimeATRWindow:           "daily",
+		TrailingStopATRMultRegime: &RegimeATRBlock{raw: composite7StateATR(2.5)},
 	}
 	cfg := compositeRegimeCfg(sc)
 	if errs := validateRegimeATRConfig(cfg); len(errs) != 0 {
-		t.Fatalf("composite trail_stop_atr_regime must validate, got: %v", errs)
+		t.Fatalf("composite trailing_stop_atr_mult_regime must validate, got: %v", errs)
 	}
-	if got := len(cfg.Strategies[0].TrailStopATRRegime.TrendRegime); got != 9 {
+	if got := len(cfg.Strategies[0].TrailingStopATRMultRegime.TrendRegime); got != 9 {
 		t.Fatalf("trailing block must hold 9 composite labels, got %d", got)
 	}
 }
@@ -107,7 +107,7 @@ func TestValidateRegimeATRConfig_CompositeTrailingExplicit(t *testing.T) {
 func TestParseRegimeATRBlock_TrailingUseDefaultsComposite(t *testing.T) {
 	labels := regimeLabelsForClassifier(regimeClassifierComposite)
 	raw := map[string]interface{}{"use_defaults": true}
-	block, errs := parseRegimeATRBlock(raw, "trail_stop_atr_regime", regimeSurfaceTrailing, labels)
+	block, errs := parseRegimeATRBlock(raw, "trailing_stop_atr_mult_regime", regimeSurfaceTrailing, labels)
 	if len(errs) > 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -141,11 +141,11 @@ func TestValidateRegimeATRConfig_CompositeMissingLabelRejected(t *testing.T) {
 	raw := composite7StateATR(2.0)
 	delete(raw["trend_regime"].(map[string]interface{}), "ranging_volatile")
 	sc := StrategyConfig{
-		ID:                "hl-test",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		RegimeATRWindow:   "daily",
-		StopLossATRRegime: &RegimeATRBlock{raw: raw},
+		ID:                    "hl-test",
+		Type:                  "perps",
+		Platform:              "hyperliquid",
+		RegimeATRWindow:       "daily",
+		StopLossATRMultRegime: &RegimeATRBlock{raw: raw},
 	}
 	errs := validateRegimeATRConfig(compositeRegimeCfg(sc))
 	joined := strings.Join(errs, "\n")
@@ -169,11 +169,11 @@ func TestValidateRegimeATRConfig_CompositeBareDirectionalCoversSubLabels(t *test
 		t.Fatal("test fixture: expected bare ranging_directional key")
 	}
 	sc := StrategyConfig{
-		ID:                "hl-test",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		RegimeATRWindow:   "daily",
-		StopLossATRRegime: &RegimeATRBlock{raw: raw},
+		ID:                    "hl-test",
+		Type:                  "perps",
+		Platform:              "hyperliquid",
+		RegimeATRWindow:       "daily",
+		StopLossATRMultRegime: &RegimeATRBlock{raw: raw},
 	}
 	if errs := validateRegimeATRConfig(compositeRegimeCfg(sc)); len(errs) != 0 {
 		t.Fatalf("legacy bare-only directional block must still validate, got: %v", errs)
@@ -184,11 +184,11 @@ func TestValidateRegimeATRConfig_CompositeSubLabelsWithoutBareRejected(t *testin
 	raw := composite7StateATR(2.0)
 	delete(raw["trend_regime"].(map[string]interface{}), "ranging_directional")
 	sc := StrategyConfig{
-		ID:                "hl-test",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		RegimeATRWindow:   "daily",
-		StopLossATRRegime: &RegimeATRBlock{raw: raw},
+		ID:                    "hl-test",
+		Type:                  "perps",
+		Platform:              "hyperliquid",
+		RegimeATRWindow:       "daily",
+		StopLossATRMultRegime: &RegimeATRBlock{raw: raw},
 	}
 	errs := validateRegimeATRConfig(compositeRegimeCfg(sc))
 	joined := strings.Join(errs, "\n")
@@ -203,16 +203,16 @@ func TestRegimeATRBlock_ResolveSubLabelFallsBackToBareAndExplicitWins(t *testing
 	delete(tr, "ranging_directional_up")
 	delete(tr, "ranging_directional_down")
 	sc := StrategyConfig{
-		ID:                "hl-test",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		RegimeATRWindow:   "daily",
-		StopLossATRRegime: &RegimeATRBlock{raw: raw},
+		ID:                    "hl-test",
+		Type:                  "perps",
+		Platform:              "hyperliquid",
+		RegimeATRWindow:       "daily",
+		StopLossATRMultRegime: &RegimeATRBlock{raw: raw},
 	}
 	if errs := validateRegimeATRConfig(compositeRegimeCfg(sc)); len(errs) != 0 {
 		t.Fatalf("fixture must validate, got: %v", errs)
 	}
-	block := *sc.StopLossATRRegime
+	block := *sc.StopLossATRMultRegime
 	if v, ok := block.Resolve("ranging_directional"); !ok || v.ATR != 1.5 {
 		t.Fatalf("bare resolve: got (%g, %v), want (1.5, true)", v.ATR, ok)
 	}
@@ -226,16 +226,16 @@ func TestRegimeATRBlock_ResolveSubLabelFallsBackToBareAndExplicitWins(t *testing
 	raw2 := composite7StateATR(1.5)
 	raw2["trend_regime"].(map[string]interface{})["ranging_directional_up"] = map[string]interface{}{"atr_multiple": 0.9}
 	sc2 := StrategyConfig{
-		ID:                "hl-test2",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		RegimeATRWindow:   "daily",
-		StopLossATRRegime: &RegimeATRBlock{raw: raw2},
+		ID:                    "hl-test2",
+		Type:                  "perps",
+		Platform:              "hyperliquid",
+		RegimeATRWindow:       "daily",
+		StopLossATRMultRegime: &RegimeATRBlock{raw: raw2},
 	}
 	if errs := validateRegimeATRConfig(compositeRegimeCfg(sc2)); len(errs) != 0 {
 		t.Fatalf("explicit-sub fixture must validate, got: %v", errs)
 	}
-	block2 := *sc2.StopLossATRRegime
+	block2 := *sc2.StopLossATRMultRegime
 	if v, ok := block2.Resolve("ranging_directional_up"); !ok || v.ATR != 0.9 {
 		t.Fatalf("explicit _up must win: got (%g, %v), want (0.9, true)", v.ATR, ok)
 	}
@@ -360,7 +360,7 @@ func TestLoadConfig_CompositeStopLossAtrRegime(t *testing.T) {
 			"max_drawdown_pct": 25,
 			"leverage": 1,
 			"regime_atr_window": "daily",
-			"stop_loss_atr_regime": {
+			"stop_loss_atr_mult_regime": {
 				"trend_regime": {
 					"trending_up_clean": {"atr_multiple": 2.0},
 					"trending_up_choppy": {"atr_multiple": 1.2},
@@ -380,9 +380,9 @@ func TestLoadConfig_CompositeStopLossAtrRegime(t *testing.T) {
 	}
 	cfg, err := LoadConfig(cfgPath)
 	if err != nil {
-		t.Fatalf("LoadConfig must accept composite 9-state stop_loss_atr_regime, got: %v", err)
+		t.Fatalf("LoadConfig must accept composite 9-state stop_loss_atr_mult_regime, got: %v", err)
 	}
-	block := cfg.Strategies[0].StopLossATRRegime
+	block := cfg.Strategies[0].StopLossATRMultRegime
 	if block == nil || len(block.TrendRegime) != 9 {
 		t.Fatalf("composite SL block must be populated with 9 labels post-load, got %#v", block)
 	}
