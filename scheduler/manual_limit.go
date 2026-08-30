@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -334,6 +336,120 @@ func runManualCancel(args []string) int {
 	return 0
 }
 
+func findPendingLimitOrderByOID(orders []PendingLimitOrder, oid int64) (PendingLimitOrder, bool) {
+	for _, o := range orders {
+		if o.OrderOID == oid {
+			return o, true
+		}
+	}
+	return PendingLimitOrder{}, false
+}
+
+func clearOperatorRequiredLimitRowRefusal(cfg *Config, o PendingLimitOrder, flattened bool) string {
+	sc, known := scByIDLookup(cfg, o.StrategyID)
+	block := killSwitchLimitOrderAdoptionBlock(sc, known)
+	if block == "" {
+		return fmt.Sprintf("refusing: %s is a Hyperliquid-live type=manual strategy, so the scheduler adopts this fill itself — clearing the row would orphan it; let the reconciler converge instead",
+			o.StrategyID)
+	}
+	if o.OperatorRequiredSince.IsZero() {
+		return fmt.Sprintf("refusing: the reconciler has not classified oid=%d as needing an operator — it is still converging on its own, and clearing the row now would discard a live recovery record",
+			o.OrderOID)
+	}
+	if !flattened {
+		return fmt.Sprintf("refusing: pass --flattened to assert that you have confirmed on the Hyperliquid UI that the %s position from oid=%d is closed — the scheduler cannot verify a flatten for a strategy it does not own",
+			o.Symbol, o.OrderOID)
+	}
+	return ""
+}
+
+func scByIDLookup(cfg *Config, id string) (StrategyConfig, bool) {
+	for _, sc := range cfg.Strategies {
+		if sc.ID == id {
+			return sc, true
+		}
+	}
+	return StrategyConfig{}, false
+}
+
+func runManualClearLimitRow(args []string) int {
+	fs := flag.NewFlagSet("manual-clear-limit-row", flag.ContinueOnError)
+	configPath := fs.String("config", "scheduler/config.json", "Path to config file")
+	flattened := fs.Bool("flattened", false, "Assert you confirmed on the Hyperliquid UI that the position from this order is closed")
+	dryRun := fs.Bool("dry-run", false, "Print the record that would be discarded without deleting it")
+
+	args = reorderArgsForPositional(args, collectBoolFlagNames(fs))
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "Usage: go-trader manual-clear-limit-row <order-oid> --flattened [--dry-run]")
+		return 2
+	}
+	oid, convErr := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if convErr != nil || oid <= 0 {
+		fmt.Fprintf(os.Stderr, "error: <order-oid> must be a positive integer, got %q\n", fs.Arg(0))
+		return 2
+	}
+
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		return 1
+	}
+	stateDB, err := OpenStateDB(cfg.DBFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open state DB: %v\n", err)
+		return 1
+	}
+	defer stateDB.Close()
+
+	unlock, lockErr := acquireManualActionFileLock(cfg.DBFile)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %v — refusing to discard a recovery record under a concurrent manual action\n", lockErr)
+		return 1
+	}
+	defer unlock()
+
+	orders, loadErr := stateDB.LoadPendingLimitOrders()
+	if loadErr != nil {
+		fmt.Fprintf(os.Stderr, "error loading the resting limit order queue: %v\n", loadErr)
+		return 1
+	}
+	o, found := findPendingLimitOrderByOID(orders, oid)
+	if !found {
+		fmt.Fprintf(os.Stderr, "no queued limit order with oid=%d — nothing to clear\n", oid)
+		return 1
+	}
+
+	fmt.Printf("Queue row %d: %s/%s %s %.6f @ $%.4f (oid=%d), tracked fill %.6f, operator-required since %s\n",
+		o.ID, o.StrategyID, o.Symbol, o.Side, o.OrderSize, o.LimitPrice, o.OrderOID, o.FilledSize,
+		limitRowOperatorRequiredLabel(o))
+
+	if refusal := clearOperatorRequiredLimitRowRefusal(cfg, o, *flattened); refusal != "" {
+		fmt.Fprintln(os.Stderr, refusal)
+		return 1
+	}
+	if *dryRun {
+		fmt.Printf("[dry-run] would discard the recovery record for oid=%d; the unadopted fill is NOT booked and stays off the ledger\n", o.OrderOID)
+		return 0
+	}
+	if err := stateDB.DeletePendingLimitOrder(o.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "error clearing queue row %d: %v\n", o.ID, err)
+		return 1
+	}
+	fmt.Printf("Cleared queue row %d (oid=%d). Its unadopted fill was never booked, so it stays off the ledger — the scheduler stops alerting on it next cycle.\n",
+		o.ID, o.OrderOID)
+	return 0
+}
+
+func limitRowOperatorRequiredLabel(o PendingLimitOrder) string {
+	if o.OperatorRequiredSince.IsZero() {
+		return "never"
+	}
+	return o.OperatorRequiredSince.Format(time.RFC3339)
+}
+
 func limitOrderFullyFilled(cumFilled, orderSize float64) bool {
 	tol := orderSize * 1e-6
 	if tol < 1e-9 {
@@ -475,6 +591,149 @@ func applyLimitFillProgress(state *AppState, sc StrategyConfig, o PendingLimitOr
 	return 1, nil
 }
 
+type orphanLimitCancelState int
+
+const (
+	orphanLimitStateUnknown orphanLimitCancelState = iota
+	orphanLimitStateResting
+	orphanLimitStateOffBookUnadoptedFill
+	orphanLimitStateOffBookRowStuck
+)
+
+type orphanLimitCancelOutcome struct {
+	Resolved     bool
+	State        orphanLimitCancelState
+	Reason       string
+	CancelIssued bool
+	AdoptedFill  float64
+	ExchangeFill float64
+}
+
+func orphanLimitOrderStatus(script string, o PendingLimitOrder) (HyperliquidLimitOrderStatus, string) {
+	res, stderr, err := runHyperliquidLimitStatusFn(script, o.Symbol, []int64{o.OrderOID}, limitStatusSinceMs(o.CreatedAt))
+	if stderr != "" {
+		fmt.Fprintf(os.Stderr, "[limit] %s orphan status stderr: %s\n", o.StrategyID, stderr)
+	}
+	if err != nil || res == nil || res.Error != "" {
+		msg := ""
+		if res != nil {
+			msg = res.Error
+		}
+		return HyperliquidLimitOrderStatus{}, strings.TrimSpace(fmt.Sprintf("order state unreadable: %v %s", err, msg))
+	}
+	if res.OpenOrdersError != "" {
+		return HyperliquidLimitOrderStatus{}, fmt.Sprintf("open-orders state unknown (%s)", res.OpenOrdersError)
+	}
+	st, ok := limitStatusForOID(res, o.OrderOID)
+	if !ok {
+		return HyperliquidLimitOrderStatus{}, "status response did not include the order"
+	}
+	if st.FillsError != "" {
+		return HyperliquidLimitOrderStatus{}, fmt.Sprintf("fills unreadable (%s)", st.FillsError)
+	}
+	if st.Resting == nil {
+		return HyperliquidLimitOrderStatus{}, "the exchange did not report whether the order is still resting"
+	}
+	return st, ""
+}
+
+func cancelOrphanedLimitOrder(state *AppState, cfg *Config, stateDB *StateDB, mu *sync.RWMutex, o PendingLimitOrder) orphanLimitCancelOutcome {
+	out := orphanLimitCancelOutcome{AdoptedFill: o.FilledSize}
+
+	candidates, _ := collectKillSwitchLimitOrderCandidates(
+		[]PendingLimitOrder{o}, killSwitchLimitOrderRoster(cfg.Strategies))
+	if len(candidates) == 0 {
+		out.State = orphanLimitStateUnknown
+		out.Reason = "no Hyperliquid strategy with a script remains in this config to cancel it — its on-chain state was never read, so manual intervention is required"
+		return out
+	}
+	script := candidates[0].Script
+
+	st, reason := orphanLimitOrderStatus(script, o)
+	if reason != "" {
+		out.State = orphanLimitStateUnknown
+		out.Reason = reason
+		return out
+	}
+
+	if *st.Resting {
+		cancelRes, cstderr, cerr := runHyperliquidCancelOrderFn(script, o.Symbol, o.OrderOID)
+		if cstderr != "" {
+			fmt.Fprintf(os.Stderr, "[limit] %s orphan cancel stderr: %s\n", o.StrategyID, cstderr)
+		}
+		if cerr != nil || cancelRes == nil || cancelRes.Error != "" {
+			msg := ""
+			if cancelRes != nil {
+				msg = cancelRes.Error
+			}
+			out.State = orphanLimitStateResting
+			out.Reason = strings.TrimSpace(fmt.Sprintf("cancel failed: %v %s", cerr, msg))
+			return out
+		}
+		out.CancelIssued = true
+		st, reason = orphanLimitOrderStatus(script, o)
+		if reason != "" {
+			out.State = orphanLimitStateUnknown
+			out.Reason = "cancel issued but unverified: " + reason
+			return out
+		}
+		if *st.Resting {
+			out.State = orphanLimitStateResting
+			out.Reason = "cancel issued but the order is still resting on the exchange"
+			return out
+		}
+	}
+
+	out.ExchangeFill = st.FilledSize
+	if st.FilledSize > o.FilledSize+limitFillEpsilon {
+		out.State = orphanLimitStateOffBookUnadoptedFill
+		out.Reason = fmt.Sprintf(
+			"the exchange reports a filled size of %.6f where the book holds %.6f, and NO automatic path can book the difference, so no fill was booked and the queue row is kept as the recovery record",
+			st.FilledSize, o.FilledSize)
+		return out
+	}
+	if o.FilledSize > 0 {
+		mu.Lock()
+		saveErr := SaveStateWithDB(state, cfg, stateDB)
+		mu.Unlock()
+		if saveErr != nil {
+			out.State = orphanLimitStateOffBookRowStuck
+			out.Reason = fmt.Sprintf(
+				"its already-booked fill of %.6f could not be flushed to the state DB (%v), so the queue row is kept as the recovery record",
+				o.FilledSize, saveErr)
+			return out
+		}
+	}
+	if err := stateDB.DeletePendingLimitOrder(o.ID); err != nil {
+		out.State = orphanLimitStateOffBookRowStuck
+		out.Reason = fmt.Sprintf("the queue row could not be cleared (%v)", err)
+		return out
+	}
+	out.Resolved = true
+	return out
+}
+
+func orphanLimitPollDeferred(o PendingLimitOrder, now time.Time) bool {
+	if o.OperatorRequiredSince.IsZero() {
+		return false
+	}
+	return now.Sub(o.OperatorRequiredSince) < effectiveAlertThrottleInterval()
+}
+
+func applyOrphanLimitOperatorRequired(stateDB *StateDB, o PendingLimitOrder, outcome orphanLimitCancelOutcome, now time.Time) {
+	if !outcome.Resolved && outcome.State == orphanLimitStateOffBookUnadoptedFill {
+		if err := stateDB.MarkPendingLimitOrderOperatorRequired(o.ID, now); err != nil {
+			fmt.Printf("[limit] failed to persist the operator-required marker on row %d: %v\n", o.ID, err)
+		}
+		return
+	}
+	if !o.OperatorRequiredSince.IsZero() && !outcome.Resolved {
+		if err := stateDB.ClearPendingLimitOrderOperatorRequired(o.ID); err != nil {
+			fmt.Printf("[limit] failed to clear the operator-required marker on row %d: %v\n", o.ID, err)
+		}
+	}
+}
+
 func reconcilePendingLimitOrders(state *AppState, cfg *Config, stateDB *StateDB, mu *sync.RWMutex, notifier *MultiNotifier, logMgr *LogManager) []manualAlert {
 	if stateDB == nil {
 		return nil
@@ -494,18 +753,39 @@ func reconcilePendingLimitOrders(state *AppState, cfg *Config, stateDB *StateDB,
 	}
 
 	now := time.Now().UTC()
+	orphanLimitCancelAlerts.Retain(orders)
 	applied := make(map[string]*manualAlert)
 	var order []string
 
 	for _, o := range orders {
-		sc, ok := scByID[o.StrategyID]
-		if !ok || sc.Type != "manual" {
-			fmt.Printf("[limit] skipping row %d: strategy %q missing or not type=manual\n", o.ID, o.StrategyID)
+		sc, known := scByID[o.StrategyID]
+		if block := killSwitchLimitOrderAdoptionBlock(sc, known); block != "" {
+			expired := !o.ExpiresAt.IsZero() && now.After(o.ExpiresAt)
+			if !o.CancelRequested && !expired {
+				fmt.Printf("[limit] skipping row %d: %s (%q) and no cancellation is queued for it\n", o.ID, block, o.StrategyID)
+				continue
+			}
+			if orphanLimitPollDeferred(o, now) {
+				fmt.Printf("[limit] row %d: %s needs an operator since %s — deferring the next exchange poll until %s\n",
+					o.ID, killSwitchLimitOrderLabel(o), o.OperatorRequiredSince.Format(time.RFC3339),
+					o.OperatorRequiredSince.Add(effectiveAlertThrottleInterval()).Format(time.RFC3339))
+				continue
+			}
+			outcome := cancelOrphanedLimitOrder(state, cfg, stateDB, mu, o)
+			applyOrphanLimitOperatorRequired(stateDB, o, outcome, now)
+			if outcome.Resolved {
+				orphanLimitCancelAlerts.Clear(orphanLimitCancelKeyFor(o))
+				warnNotifier(notifier, orphanLimitCancelResolvedMessage(o, block, outcome))
+				continue
+			}
+			reportOrphanLimitCancel(notifier, o, block, outcome, now)
 			continue
 		}
-		if !hyperliquidIsLive(sc.Args) {
-			fmt.Printf("[limit] skipping row %d: strategy %q is not HL-live\n", o.ID, o.StrategyID)
-			continue
+		if !o.OperatorRequiredSince.IsZero() {
+			if err := stateDB.ClearPendingLimitOrderOperatorRequired(o.ID); err != nil {
+				fmt.Printf("[limit] failed to clear the operator-required marker on row %d: %v\n", o.ID, err)
+			}
+			o.OperatorRequiredSince = time.Time{}
 		}
 		var logger *StrategyLogger
 		if logMgr != nil {
