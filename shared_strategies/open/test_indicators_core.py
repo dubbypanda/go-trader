@@ -1,6 +1,7 @@
 
 import importlib.util
 import inspect
+import math
 import os
 import sys
 
@@ -10,10 +11,12 @@ import pytest
 
 from indicators_core import (
     HURST_DFA_MIN_POINTS,
+    HURST_RS_MIN_POINTS,
     atr_from_true_range,
     atr_sma,
     atr_sma_series,
     hurst_exponent,
+    hurst_rescaled_range,
     round_atr_large,
     true_range,
     true_range_series,
@@ -638,3 +641,227 @@ def test_hurst_dfa_fluctuation_vectorization_matches_naive_per_segment_polyfit()
             assert np.isnan(actual)
             continue
         assert actual == pytest.approx(expected, rel=1e-9)
+
+
+def test_hurst_rs_random_walk_near_half():
+    close = _ar1_log_price_series(2000, phi=0.0, seed=1)
+    h = hurst_rescaled_range(close)
+    assert 0.35 <= h <= 0.65, h
+
+
+def test_hurst_rs_persistent_series_above_half():
+    close = _ar1_log_price_series(2000, phi=0.7, seed=2)
+    h = hurst_rescaled_range(close)
+    assert h > 0.5, h
+
+
+def test_hurst_rs_mean_reverting_series_below_half():
+    close = _ar1_log_price_series(2000, phi=-0.6, seed=3)
+    h = hurst_rescaled_range(close)
+    assert h < 0.5, h
+
+
+def test_hurst_rs_orders_the_three_regimes():
+    mr = hurst_rescaled_range(_ar1_log_price_series(2000, phi=-0.6, seed=3))
+    rw = hurst_rescaled_range(_ar1_log_price_series(2000, phi=0.0, seed=1))
+    persistent = hurst_rescaled_range(_ar1_log_price_series(2000, phi=0.7, seed=2))
+    assert mr < rw < persistent, (mr, rw, persistent)
+
+
+def test_hurst_rs_insufficient_data_returns_nan():
+    close = _ar1_log_price_series(HURST_RS_MIN_POINTS, phi=0.0, seed=4)
+    assert np.isnan(hurst_rescaled_range(close))
+
+
+def test_hurst_rs_exactly_at_minimum_is_not_nan():
+    close = _ar1_log_price_series(HURST_RS_MIN_POINTS + 1, phi=0.0, seed=4)
+    assert not np.isnan(hurst_rescaled_range(close))
+
+
+def test_hurst_rs_constant_price_returns_nan():
+    close = pd.Series(np.full(300, 100.0))
+    assert np.isnan(hurst_rescaled_range(close))
+
+
+def test_hurst_rs_non_positive_price_returns_nan():
+    close = pd.Series(np.concatenate([np.full(150, 100.0), [-1.0], np.full(150, 100.0)]))
+    assert np.isnan(hurst_rescaled_range(close))
+
+
+def test_hurst_rs_never_raises_on_degenerate_input():
+    for close in (
+        pd.Series([], dtype=float),
+        pd.Series([100.0]),
+        pd.Series(np.full(500, float("nan"))),
+    ):
+        assert np.isnan(hurst_rescaled_range(close))
+
+
+def test_hurst_rs_never_returns_half_as_a_sentinel():
+    for close in (
+        pd.Series([], dtype=float),
+        pd.Series([100.0]),
+        pd.Series(np.full(500, float("nan"))),
+        pd.Series(np.full(300, 100.0)),
+        _ar1_log_price_series(HURST_RS_MIN_POINTS, phi=0.0, seed=4),
+    ):
+        for corrected in (True, False):
+            assert np.isnan(hurst_rescaled_range(close, corrected=corrected))
+
+
+def test_hurst_rs_deterministic():
+    close = _ar1_log_price_series(500, phi=0.3, seed=5)
+    assert hurst_rescaled_range(close) == hurst_rescaled_range(close)
+    assert (hurst_rescaled_range(close, corrected=False)
+            == hurst_rescaled_range(close, corrected=False))
+
+
+def test_hurst_rs_custom_min_points():
+    close = _ar1_log_price_series(120, phi=0.0, seed=6)
+    assert np.isnan(hurst_rescaled_range(close, min_points=150))
+    assert not np.isnan(hurst_rescaled_range(close, min_points=80))
+
+
+def test_hurst_rs_anis_lloyd_correction_beats_the_raw_slope_on_a_random_walk():
+    close = _ar1_log_price_series(2000, phi=0.0, seed=1)
+    corrected = hurst_rescaled_range(close)
+    raw = hurst_rescaled_range(close, corrected=False)
+    assert corrected != raw
+    assert abs(corrected - 0.5) < abs(raw - 0.5), (corrected, raw)
+
+
+def test_hurst_rs_anis_lloyd_correction_recentres_the_null_mean():
+    corrected = []
+    raw = []
+    for i in range(200):
+        close = _ar1_log_price_series(2000, phi=0.0, seed=40_000 + i)
+        corrected.append(hurst_rescaled_range(close))
+        raw.append(hurst_rescaled_range(close, corrected=False))
+    mean_corrected = float(np.nanmean(corrected))
+    mean_raw = float(np.nanmean(raw))
+    assert mean_raw > 0.53, mean_raw
+    assert abs(mean_corrected - 0.5) < abs(mean_raw - 0.5), (mean_corrected, mean_raw)
+    assert abs(mean_corrected - 0.5) < 0.03, mean_corrected
+
+
+def test_hurst_rs_is_noisier_than_dfa_at_the_live_frame_size():
+    rs = []
+    dfa = []
+    for i in range(400):
+        close = _ar1_log_price_series(HURST_RS_MIN_POINTS + 1, phi=0.0, seed=50_000 + i)
+        rs.append(hurst_rescaled_range(close))
+        dfa.append(hurst_exponent(close))
+    sd_rs = float(np.nanstd(rs))
+    sd_dfa = float(np.nanstd(dfa))
+    assert sd_rs > sd_dfa, (sd_rs, sd_dfa)
+
+
+def test_hurst_rs_block_sizes_mirror_the_dfa_scale_grid_shape():
+    from indicators_core import (
+        _HURST_RS_MIN_BLOCK,
+        _HURST_RS_NUM_BLOCKS,
+        _hurst_rs_block_sizes,
+    )
+
+    for n in (64, 100, 128, 256, 512, 2000):
+        blocks = _hurst_rs_block_sizes(n)
+        assert blocks.dtype.kind == "i"
+        assert list(blocks) == sorted(set(blocks))
+        assert int(blocks[0]) >= _HURST_RS_MIN_BLOCK
+        assert int(blocks[-1]) == max(_HURST_RS_MIN_BLOCK, n // 4)
+        assert len(blocks) <= _HURST_RS_NUM_BLOCKS
+
+
+def test_hurst_rs_returns_nan_when_the_block_grid_collapses():
+    from indicators_core import _HURST_RS_MIN_BLOCK, _hurst_rs_block_sizes
+
+    n_returns = 4 * _HURST_RS_MIN_BLOCK
+    assert len(_hurst_rs_block_sizes(n_returns)) == 1
+    close = _ar1_log_price_series(n_returns + 1, phi=0.0, seed=8)
+    assert np.isnan(hurst_rescaled_range(close, min_points=n_returns))
+
+
+def test_hurst_rs_statistic_matches_a_naive_per_block_range_over_sd():
+    from indicators_core import _hurst_rs_statistic
+
+    def naive(series, block):
+        n = len(series)
+        n_blocks = n // block
+        if n_blocks < 1:
+            return float("nan")
+        starts = [series[: n_blocks * block]]
+        tail = series[n - n_blocks * block:]
+        if not np.array_equal(tail, starts[0]):
+            starts.append(tail)
+        ratios = []
+        for part in starts:
+            for seg in part.reshape(n_blocks, block):
+                sd = float(np.std(seg))
+                if sd <= 0:
+                    continue
+                z = np.cumsum(seg - float(np.mean(seg)))
+                ratios.append((float(np.max(z)) - float(np.min(z))) / sd)
+        if not ratios:
+            return float("nan")
+        return float(np.mean(ratios))
+
+    rng = np.random.default_rng(1474)
+    for _ in range(50):
+        n = int(rng.integers(40, 600))
+        block = int(rng.integers(8, max(9, n // 3)))
+        series = rng.normal(0, 1, n)
+        expected = naive(series, block)
+        actual = _hurst_rs_statistic(series, block)
+        if np.isnan(expected):
+            assert np.isnan(actual)
+            continue
+        assert actual == pytest.approx(expected, rel=1e-9)
+
+
+def test_anis_lloyd_expectation_matches_the_published_closed_form():
+    from indicators_core import _anis_lloyd_expected_rs
+
+    def closed_form(n):
+        tail = sum(math.sqrt((n - i) / i) for i in range(1, n))
+        if n > 340:
+            front = 1.0 / math.sqrt(n * math.pi / 2.0)
+        else:
+            front = math.gamma((n - 1) / 2.0) / (math.sqrt(math.pi)
+                                                 * math.gamma(n / 2.0))
+        return ((n - 0.5) / n) * front * tail
+
+    for n in (2, 3, 8, 16, 32, 64, 128, 170, 340, 341, 500, 1000):
+        assert _anis_lloyd_expected_rs(n) == pytest.approx(closed_form(n), rel=1e-9)
+
+
+def test_anis_lloyd_expectation_approaches_the_brownian_limit_from_below():
+    from indicators_core import _anis_lloyd_expected_rs
+
+    limit = math.sqrt(math.pi / 2.0)
+    sizes = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+    ratios = [_anis_lloyd_expected_rs(n) / math.sqrt(n) for n in sizes]
+    assert all(r < limit for r in ratios), ratios
+    assert ratios == sorted(ratios), ratios
+    assert ratios[-1] > 0.98 * limit, ratios[-1]
+
+
+def test_anis_lloyd_expectation_grows_like_the_square_root_of_the_block():
+    from indicators_core import _anis_lloyd_expected_rs
+
+    sizes = np.array([256, 512, 1024, 2048, 4096], dtype=float)
+    values = np.array([_anis_lloyd_expected_rs(int(n)) for n in sizes])
+    slope, _intercept = np.polyfit(np.log(sizes), np.log(values), 1)
+    assert slope == pytest.approx(0.5, abs=0.02), slope
+
+
+def test_anis_lloyd_expectation_is_undefined_below_two_blocks():
+    from indicators_core import _anis_lloyd_expected_rs
+
+    assert np.isnan(_anis_lloyd_expected_rs(1))
+    assert np.isnan(_anis_lloyd_expected_rs(0))
+
+
+def test_hurst_dfa_estimator_is_untouched_by_the_rs_addition():
+    close = _ar1_log_price_series(2000, phi=0.0, seed=1)
+    assert hurst_exponent(close) == pytest.approx(0.5011, abs=5e-4)
+    assert hurst_exponent(close) != hurst_rescaled_range(close)
