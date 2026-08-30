@@ -119,13 +119,6 @@ func renameV19AtrMultRegimeKeys(block map[string]interface{}, ctx string) (bool,
 	return changed, nil
 }
 
-var v19AtomicRenameSites = []string{
-	"strategies[]",
-	"user_defaults.regime_atr",
-	"user_defaults.manual",
-	"user_defaults.close[]",
-}
-
 func sortedV19RenameMap() []struct {
 	LegacyKey string
 	CanonKey  string
