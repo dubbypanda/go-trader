@@ -624,6 +624,67 @@ def _classify_cancel_response(sdk_response):
     except Exception as e:
         return ("error", f"_classify_cancel_response: {e}")
 
+
+def _extract_execute_fill(sdk_response):
+    if not isinstance(sdk_response, dict) or sdk_response.get("status") != "ok":
+        return None, f"exchange rejected order: {sdk_response}"
+
+    response = sdk_response.get("response")
+    data = response.get("data") if isinstance(response, dict) else None
+    statuses = data.get("statuses") if isinstance(data, dict) else None
+    if not isinstance(statuses, list) or not statuses:
+        return None, "exchange returned no order status"
+
+    status = statuses[0]
+    if not isinstance(status, dict):
+        return None, "exchange returned a malformed order status"
+    if "error" in status:
+        return None, f"exchange rejected order: {status['error']}"
+    if "filled" not in status or not isinstance(status["filled"], dict):
+        return None, "exchange returned no filled status"
+
+    filled = status["filled"]
+    raw_avg_px = filled.get("avgPx")
+    raw_total_sz = filled.get("totalSz")
+    try:
+        avg_px = float(raw_avg_px)
+        total_sz = float(raw_total_sz)
+    except (TypeError, ValueError):
+        return None, f"exchange returned malformed fill values (avgPx={raw_avg_px!r}, totalSz={raw_total_sz!r})"
+    if not math.isfinite(avg_px) or not math.isfinite(total_sz):
+        return None, f"exchange returned malformed fill values (avgPx={raw_avg_px!r}, totalSz={raw_total_sz!r})"
+    if avg_px <= 0 or total_sz <= 0:
+        return None, f"exchange returned no confirmed fill (sz={total_sz:.8f} px={avg_px:.8f})"
+
+    fill = {"avg_px": avg_px, "total_sz": total_sz}
+    oid = filled.get("oid")
+    if oid is not None:
+        try:
+            fill["oid"] = int(oid)
+        except (TypeError, ValueError):
+            print(f"[WARN] ignoring malformed fill oid={oid!r}", file=sys.stderr)
+    fee = filled.get("fee")
+    if fee is not None:
+        try:
+            parsed_fee = float(fee)
+            if math.isfinite(parsed_fee):
+                fill["fee"] = parsed_fee
+        except (TypeError, ValueError):
+            print(f"[WARN] ignoring malformed fill fee={fee!r}", file=sys.stderr)
+    return fill, ""
+
+
+def _add_execute_cancel_metadata(payload, cancel_err, cancel_succeeded, cancel_succeeded_oids, cancel_failed_oids):
+    if cancel_err:
+        payload["cancel_stop_loss_error"] = cancel_err
+    if cancel_succeeded:
+        payload["cancel_stop_loss_succeeded"] = True
+    if cancel_succeeded_oids:
+        payload["cancel_stop_loss_succeeded_oids"] = cancel_succeeded_oids
+    if cancel_failed_oids:
+        payload["cancel_stop_loss_failed_oids"] = cancel_failed_oids
+
+
 def _oid_is_open(open_oids: set[int] | None, oid: int) -> bool:
     return oid > 0 and open_oids is not None and int(oid) in open_oids
 
@@ -1044,6 +1105,8 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
     cancel_oids = [int(oid) for oid in cancel_oids if int(oid or 0) > 0]
     cancel_attempted = len(cancel_oids) > 0
     cancel_succeeded = False
+    cancel_succeeded_oids = []
+    cancel_failed_oids = []
 
     try:
         from adapter import HyperliquidExchangeAdapter
@@ -1101,11 +1164,14 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
                             adapter.cancel_trigger_order(symbol, oid))
                         if kind == "ok":
                             cancel_succeeded = True
+                            cancel_succeeded_oids.append(oid)
                         else:
                             cancel_errors.append(f"{oid}: {payload}")
+                            cancel_failed_oids.append(oid)
                             print(f"[WARN] cancel_trigger_order({symbol}, {oid}) rejected: {payload}", file=sys.stderr)
                     except Exception as ce:
                         cancel_errors.append(f"{oid}: {ce}")
+                        cancel_failed_oids.append(oid)
                         print(f"[WARN] cancel_trigger_order({symbol}, {oid}) failed: {ce}", file=sys.stderr)
             finally:
                 if cancel_errors:
@@ -1118,23 +1184,23 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
         else:
             result = adapter.market_open(symbol, is_buy, size)
 
-        fill = {}
-        try:
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            if statuses:
-                filled = statuses[0].get("filled", {})
-                fill = {
-                    "avg_px": float(filled.get("avgPx", 0) or 0),
-                    "total_sz": float(filled.get("totalSz", 0) or 0),
-                }
-                oid = filled.get("oid")
-                if oid is not None:
-                    fill["oid"] = int(oid)
-                fee = filled.get("fee")
-                if fee is not None:
-                    fill["fee"] = float(fee)
-        except Exception:
-            pass
+        fill, fill_error = _extract_execute_fill(result)
+        if fill_error:
+            err_payload = {
+                "execution": None,
+                "platform": "hyperliquid",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": fill_error,
+            }
+            _add_execute_cancel_metadata(
+                err_payload,
+                cancel_err,
+                cancel_succeeded,
+                cancel_succeeded_oids,
+                cancel_failed_oids,
+            )
+            print(json.dumps(err_payload, cls=SafeEncoder))
+            sys.exit(1)
 
         if fill.get("oid"):
             try:
@@ -1189,10 +1255,13 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
             "platform": "hyperliquid",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        if cancel_err:
-            out["cancel_stop_loss_error"] = cancel_err
-        if cancel_succeeded:
-            out["cancel_stop_loss_succeeded"] = True
+        _add_execute_cancel_metadata(
+            out,
+            cancel_err,
+            cancel_succeeded,
+            cancel_succeeded_oids,
+            cancel_failed_oids,
+        )
         if sl_err:
             out["stop_loss_error"] = sl_err
         if sl_filled_immediately:
@@ -1207,10 +1276,13 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "error": str(e),
         }
-        if cancel_err:
-            err_payload["cancel_stop_loss_error"] = cancel_err
-        if cancel_succeeded:
-            err_payload["cancel_stop_loss_succeeded"] = True
+        _add_execute_cancel_metadata(
+            err_payload,
+            cancel_err,
+            cancel_succeeded,
+            cancel_succeeded_oids,
+            cancel_failed_oids,
+        )
         print(json.dumps(err_payload, cls=SafeEncoder))
         sys.exit(1)
 

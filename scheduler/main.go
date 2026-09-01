@@ -2081,13 +2081,15 @@ func main() {
 										execResult = er
 									} else {
 										liveExecFailed = true
-										if er != nil && er.CancelStopLossSucceeded && hlStopLossOID > 0 {
+										canceledOIDs := append([]int64{hlStopLossOID}, hlTPOIDs...)
+										canceledOIDs = hyperliquidExecuteSucceededCancelOIDs(er, canceledOIDs)
+										if len(canceledOIDs) > 0 {
 											sym := hyperliquidSymbol(sc.Args)
 											if sym != "" {
 												mu.Lock()
-												if pos, ok3 := stratState.Positions[sym]; ok3 && pos.StopLossOID == hlStopLossOID {
-													pos.StopLossOID = 0
-													logger.Info("cleared stale SL OID=%d after open failed but cancel succeeded", hlStopLossOID)
+												if pos, ok3 := stratState.Positions[sym]; ok3 {
+													clearHyperliquidProtectionOIDsMatching(pos, canceledOIDs)
+													logger.Info("cleared canceled protection OIDs=%v after live execute failed", canceledOIDs)
 												}
 												mu.Unlock()
 											}
@@ -2350,19 +2352,23 @@ func main() {
 								if intentFullClose {
 									extraCancelOIDs = cloneInt64s(pos.TPOIDs)
 								}
-								execResult, execStderr, execErr := RunHyperliquidExecute(
+								execResult, execStderr, execErr := runHyperliquidExecuteFn(
 									sc.Script, sc.Symbol, closeSide, closeQty,
 									0, cancelOID, 0, "", 0, closeFullPosition, hlExecuteSnapshot{}, extraCancelOIDs...,
 								)
 								if execStderr != "" {
 									logger.Info("HL manual close stderr: %s", execStderr)
 								}
+								requestedCancelOIDs := append([]int64{cancelOID}, extraCancelOIDs...)
+								execResult, execErr = confirmHyperliquidExecuteFill(execResult, execErr)
 								if execErr != nil {
 									logger.Error("manual close execute failed: %v", execErr)
-									break
-								}
-								if execResult.Error != "" {
-									logger.Error("manual close HL error: %s", execResult.Error)
+									canceledOIDs := hyperliquidExecuteSucceededCancelOIDs(execResult, requestedCancelOIDs)
+									if len(canceledOIDs) > 0 {
+										mu.Lock()
+										clearHyperliquidProtectionOIDsMatching(stratState.Positions[sc.Symbol], canceledOIDs)
+										mu.Unlock()
+									}
 									break
 								}
 								if execResult.CancelStopLossError != "" {
@@ -3290,7 +3296,7 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 	} else if result.CloseFraction == 1.0 {
 		logger.Info("Final-tier close %s shares coin with HL perps peers — using sized close to preserve peer exposure", result.Symbol)
 	}
-	execResult, stderr, err := RunHyperliquidExecute(sc.Script, result.Symbol, side, size, slPct, cancelOID, prevPosQty, marginMode, leverageForOpen, closeFullPosition, walletSnapshot, extraCancelOIDs...)
+	execResult, stderr, err := runHyperliquidExecuteFn(sc.Script, result.Symbol, side, size, slPct, cancelOID, prevPosQty, marginMode, leverageForOpen, closeFullPosition, walletSnapshot, extraCancelOIDs...)
 	if stderr != "" {
 		logger.Info("execute stderr: %s", stderr)
 	}
@@ -3298,14 +3304,10 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 	if side == "sell" {
 		direction = directionClose
 	}
+	execResult, err = confirmHyperliquidExecuteFill(execResult, err)
 	if err != nil {
 		logger.Error("Live execute failed: %v", err)
 		notifyLiveExecFailure(notifier, sc, direction, result.Symbol, err.Error())
-		return execResult, false
-	}
-	if execResult.Error != "" {
-		logger.Error("Live execute returned error: %s", execResult.Error)
-		notifyLiveExecFailure(notifier, sc, direction, result.Symbol, execResult.Error)
 		return execResult, false
 	}
 	clearLiveExecThrottle(sc, direction, result.Symbol)
@@ -3354,6 +3356,11 @@ func executeHyperliquidResult(sc StrategyConfig, s *StrategyState, result *Hyper
 }
 
 func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, result *HyperliquidResult, execResult *HyperliquidExecuteResult, signalStr string, price float64, regime *RegimeConfig, cfg *Config, hurst HurstGateDecision, logger *StrategyLogger) (int, string, *Trade, *RatchetTriggerAlert) {
+	if execResult != nil {
+		if _, err := confirmHyperliquidExecuteFill(execResult, nil); err != nil {
+			return 0, "", nil, nil
+		}
+	}
 	fillPrice := price
 	var fillQty float64
 	if execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.AvgPx > 0 {

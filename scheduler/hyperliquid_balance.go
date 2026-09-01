@@ -1091,10 +1091,14 @@ func clearHyperliquidProtectionOIDsMatching(pos *Position, cancelOIDs []int64) {
 	for _, cancelOID := range cancelOIDs {
 		if cancelOID > 0 && pos.StopLossOID == cancelOID {
 			pos.StopLossOID = 0
+			pos.StopLossTriggerPx = 0
 		}
 		for idx, tpOID := range pos.TPOIDs {
 			if cancelOID > 0 && tpOID == cancelOID {
 				pos.TPOIDs[idx] = 0
+				if idx < len(pos.TPArmedTiers) {
+					pos.TPArmedTiers[idx] = false
+				}
 			}
 		}
 	}

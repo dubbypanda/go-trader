@@ -256,18 +256,14 @@ func runHyperliquidScaleInOrder(sc StrategyConfig, result *HyperliquidResult, ad
 		side = "sell"
 	}
 	logger.Info("Placing live scale-in %s %s size=%.6f", side, result.Symbol, addSize)
-	execResult, stderr, err := RunHyperliquidExecute(sc.Script, result.Symbol, side, addSize, 0, 0, 0, "", 0, false, walletSnapshot)
+	execResult, stderr, err := runHyperliquidExecuteFn(sc.Script, result.Symbol, side, addSize, 0, 0, 0, "", 0, false, walletSnapshot)
 	if stderr != "" {
 		logger.Info("execute stderr: %s", stderr)
 	}
+	execResult, err = confirmHyperliquidExecuteFill(execResult, err)
 	if err != nil {
 		logger.Error("Live scale-in failed: %v", err)
 		notifyLiveExecFailure(notifier, sc, directionOpen, result.Symbol, err.Error())
-		return execResult, false
-	}
-	if execResult.Error != "" {
-		logger.Error("Live scale-in returned error: %s", execResult.Error)
-		notifyLiveExecFailure(notifier, sc, directionOpen, result.Symbol, execResult.Error)
 		return execResult, false
 	}
 	clearLiveExecThrottle(sc, directionOpen, result.Symbol)
@@ -280,14 +276,15 @@ func executeHyperliquidScaleInDeferredOpen(sc StrategyConfig, s *StrategyState, 
 	var fillOID string
 	var fillFee float64
 	useFillFee := false
-	if execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil {
+	if execResult != nil {
+		confirmed, err := confirmHyperliquidExecuteFill(execResult, nil)
+		if err != nil {
+			return 0, "", nil, nil
+		}
+		execResult = confirmed
 		fill := execResult.Execution.Fill
-		if fill.AvgPx > 0 {
-			fillPrice = fill.AvgPx
-		}
-		if fill.TotalSz > 0 {
-			fillAddQty = fill.TotalSz
-		}
+		fillPrice = fill.AvgPx
+		fillAddQty = fill.TotalSz
 		if fill.OID != 0 {
 			fillOID = fmt.Sprintf("%d", fill.OID)
 		}

@@ -22,7 +22,7 @@ def _load_check_module():
 
 class TestFillExtraction:
 
-    def _run_execute_with_mock_response(self, sdk_response, lookup_result=_UNSET):
+    def _run_execute_with_mock_response(self, sdk_response, lookup_result=_UNSET, **execute_kwargs):
         mod, spec = _load_check_module()
         spec.loader.exec_module(mod)
 
@@ -30,6 +30,10 @@ class TestFillExtraction:
         mock_adapter = MagicMock()
         mock_adapter_cls.return_value = mock_adapter
         mock_adapter.market_open.return_value = sdk_response
+        mock_adapter.cancel_trigger_order.return_value = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{}]}},
+        }
         if lookup_result is not _UNSET:
             mock_adapter.lookup_fill_fee_by_oid.return_value = lookup_result
 
@@ -48,9 +52,13 @@ class TestFillExtraction:
 
                 with patch("builtins.__import__", side_effect=mock_import):
                     with patch("sys.stdout", captured):
-                        mod.run_execute("BTC", "buy", 0.01, "live")
+                        exit_code = 0
+                        try:
+                            mod.run_execute("BTC", "buy", 0.01, "live", **execute_kwargs)
+                        except SystemExit as e:
+                            exit_code = e.code
 
-        return json.loads(captured.getvalue())
+        return json.loads(captured.getvalue()), exit_code
 
     def test_fill_with_oid_and_fee(self):
         sdk_response = {
@@ -71,7 +79,8 @@ class TestFillExtraction:
                 },
             },
         }
-        result = self._run_execute_with_mock_response(sdk_response)
+        result, exit_code = self._run_execute_with_mock_response(sdk_response)
+        assert exit_code == 0
         fill = result["execution"]["fill"]
         assert fill["avg_px"] == 55000.5
         assert fill["total_sz"] == 0.01
@@ -96,7 +105,8 @@ class TestFillExtraction:
                 },
             },
         }
-        result = self._run_execute_with_mock_response(sdk_response)
+        result, exit_code = self._run_execute_with_mock_response(sdk_response)
+        assert exit_code == 0
         fill = result["execution"]["fill"]
         assert fill["oid"] == 9876543210
         assert "fee" not in fill
@@ -119,10 +129,11 @@ class TestFillExtraction:
                 },
             },
         }
-        result = self._run_execute_with_mock_response(
+        result, exit_code = self._run_execute_with_mock_response(
             sdk_response,
             lookup_result={"fee": "0.42", "closed_pnl": "3.14"},
         )
+        assert exit_code == 0
         fill = result["execution"]["fill"]
         assert fill["fee"] == 0.42
         assert fill["closed_pnl"] == 3.14
@@ -145,7 +156,8 @@ class TestFillExtraction:
                 },
             },
         }
-        result = self._run_execute_with_mock_response(sdk_response, lookup_result=MagicMock())
+        result, exit_code = self._run_execute_with_mock_response(sdk_response, lookup_result=MagicMock())
+        assert exit_code == 0
         fill = result["execution"]["fill"]
         assert fill["oid"] == 9876543210
         assert "fee" not in fill
@@ -169,10 +181,11 @@ class TestFillExtraction:
                 },
             },
         }
-        result = self._run_execute_with_mock_response(
+        result, exit_code = self._run_execute_with_mock_response(
             sdk_response,
             lookup_result={"fee": MagicMock(), "closed_pnl": MagicMock()},
         )
+        assert exit_code == 0
         fill = result["execution"]["fill"]
         assert fill["oid"] == 9876543210
         assert "fee" not in fill
@@ -195,7 +208,8 @@ class TestFillExtraction:
                 },
             },
         }
-        result = self._run_execute_with_mock_response(sdk_response)
+        result, exit_code = self._run_execute_with_mock_response(sdk_response)
+        assert exit_code == 0
         fill = result["execution"]["fill"]
         assert fill["avg_px"] == 50000.0
         assert fill["total_sz"] == 0.1
@@ -207,8 +221,67 @@ class TestFillExtraction:
             "status": "ok",
             "response": {"type": "order", "data": {"statuses": []}},
         }
-        result = self._run_execute_with_mock_response(sdk_response)
-        assert result["execution"]["fill"] == {}
+        result, exit_code = self._run_execute_with_mock_response(sdk_response)
+        assert exit_code == 1
+        assert result["execution"] is None
+        assert "error" in result
+
+    @pytest.mark.parametrize(
+        "sdk_response",
+        [
+            {"status": "err", "response": "rejected"},
+            {
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [{}]}},
+            },
+            {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"filled": {"avgPx": "bad", "totalSz": "0.1"}}]},
+                },
+            },
+            {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"filled": {"avgPx": "50000", "totalSz": "bad"}}]},
+                },
+            },
+            {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"filled": {"avgPx": "0", "totalSz": "0.1"}}]},
+                },
+            },
+            {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"filled": {"avgPx": "50000", "totalSz": "0"}}]},
+                },
+            },
+        ],
+    )
+    def test_unconfirmed_fill_exits_with_error(self, sdk_response):
+        result, exit_code = self._run_execute_with_mock_response(sdk_response)
+        assert exit_code == 1
+        assert result["execution"] is None
+        assert result["error"]
+
+    def test_unconfirmed_fill_preserves_cancel_metadata(self):
+        sdk_response = {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": []}},
+        }
+        result, exit_code = self._run_execute_with_mock_response(
+            sdk_response,
+            cancel_oid=[111, 222],
+        )
+        assert exit_code == 1
+        assert result["cancel_stop_loss_succeeded"] is True
+        assert result["cancel_stop_loss_succeeded_oids"] == [111, 222]
 
 
 class TestMarginMode:
@@ -1452,4 +1525,3 @@ class TestProtectionSyncStopLossTriggerContract:
         assert "stop_loss_oid" not in out
         assert "stop_loss_outcome_unknown" not in out
         assert "no usable status" in out.get("stop_loss_error", "")
-

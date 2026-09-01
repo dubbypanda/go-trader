@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"sort"
@@ -70,14 +71,16 @@ type HyperliquidExecution struct {
 }
 
 type HyperliquidExecuteResult struct {
-	Execution                 *HyperliquidExecution `json:"execution"`
-	Platform                  string                `json:"platform"`
-	Timestamp                 string                `json:"timestamp"`
-	Error                     string                `json:"error,omitempty"`
-	CancelStopLossError       string                `json:"cancel_stop_loss_error,omitempty"`
-	CancelStopLossSucceeded   bool                  `json:"cancel_stop_loss_succeeded,omitempty"`
-	StopLossError             string                `json:"stop_loss_error,omitempty"`
-	StopLossFilledImmediately bool                  `json:"stop_loss_filled_immediately,omitempty"`
+	Execution                   *HyperliquidExecution `json:"execution"`
+	Platform                    string                `json:"platform"`
+	Timestamp                   string                `json:"timestamp"`
+	Error                       string                `json:"error,omitempty"`
+	CancelStopLossError         string                `json:"cancel_stop_loss_error,omitempty"`
+	CancelStopLossSucceeded     bool                  `json:"cancel_stop_loss_succeeded,omitempty"`
+	CancelStopLossSucceededOIDs []int64               `json:"cancel_stop_loss_succeeded_oids,omitempty"`
+	CancelStopLossFailedOIDs    []int64               `json:"cancel_stop_loss_failed_oids,omitempty"`
+	StopLossError               string                `json:"stop_loss_error,omitempty"`
+	StopLossFilledImmediately   bool                  `json:"stop_loss_filled_immediately,omitempty"`
 }
 
 type HyperliquidStopLossUpdateResult struct {
@@ -328,6 +331,8 @@ func RunHyperliquidExecute(script, symbol, side string, size, stopLossPct float6
 	return parseHyperliquidExecuteOutput(stdout, string(stderr), err)
 }
 
+var runHyperliquidExecuteFn = RunHyperliquidExecute
+
 func RunHyperliquidUpdateStopLoss(script, symbol, side string, size, triggerPx float64, cancelStopLossOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
 	args := []string{
 		"--update-stop-loss",
@@ -438,8 +443,11 @@ func parseHyperliquidUpdateStopLossOutput(stdout []byte, stderrStr string, runEr
 func parseHyperliquidExecuteOutput(stdout []byte, stderrStr string, runErr error) (*HyperliquidExecuteResult, string, error) {
 	if runErr != nil {
 		var result HyperliquidExecuteResult
-		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil && result.Error != "" {
-			return &result, stderrStr, nil
+		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil {
+			if result.Error != "" {
+				return &result, stderrStr, nil
+			}
+			return &result, stderrStr, fmt.Errorf("execute error: %w (stderr: %s)", runErr, stderrStr)
 		}
 		return nil, stderrStr, fmt.Errorf("execute error: %w (stderr: %s)", runErr, stderrStr)
 	}
@@ -449,6 +457,77 @@ func parseHyperliquidExecuteOutput(stdout []byte, stderrStr string, runErr error
 		return nil, stderrStr, fmt.Errorf("parse execute output: %w (stdout: %s)", err, string(stdout))
 	}
 	return &result, stderrStr, nil
+}
+
+func confirmHyperliquidExecuteFill(res *HyperliquidExecuteResult, err error) (*HyperliquidExecuteResult, error) {
+	if err != nil {
+		return res, err
+	}
+	if res == nil {
+		return res, fmt.Errorf("exchange returned no confirmed fill")
+	}
+	if res.Error != "" {
+		return res, fmt.Errorf("%s", res.Error)
+	}
+	if res.Execution == nil || res.Execution.Fill == nil {
+		return res, fmt.Errorf("exchange returned no confirmed fill")
+	}
+	fill := res.Execution.Fill
+	if !(fill.AvgPx > 0) || !(fill.TotalSz > 0) || math.IsInf(fill.AvgPx, 0) || math.IsInf(fill.TotalSz, 0) {
+		return res, fmt.Errorf("exchange returned no confirmed fill (sz=%.8f px=%.8f)", fill.TotalSz, fill.AvgPx)
+	}
+	return res, nil
+}
+
+func hyperliquidExecuteSucceededCancelOIDs(result *HyperliquidExecuteResult, requested []int64) []int64 {
+	if result == nil {
+		return nil
+	}
+	if len(result.CancelStopLossSucceededOIDs) > 0 {
+		requestedSet := make(map[int64]struct{}, len(requested))
+		for _, oid := range requested {
+			if oid > 0 {
+				requestedSet[oid] = struct{}{}
+			}
+		}
+		if len(requestedSet) == 0 {
+			return nil
+		}
+		seen := make(map[int64]struct{}, len(result.CancelStopLossSucceededOIDs))
+		var out []int64
+		for _, oid := range result.CancelStopLossSucceededOIDs {
+			if oid <= 0 {
+				continue
+			}
+			if len(requestedSet) > 0 {
+				if _, ok := requestedSet[oid]; !ok {
+					continue
+				}
+			}
+			if _, ok := seen[oid]; ok {
+				continue
+			}
+			seen[oid] = struct{}{}
+			out = append(out, oid)
+		}
+		return out
+	}
+	if result.CancelStopLossSucceeded && result.CancelStopLossError == "" {
+		seen := make(map[int64]struct{}, len(requested))
+		var out []int64
+		for _, oid := range requested {
+			if oid <= 0 {
+				continue
+			}
+			if _, ok := seen[oid]; ok {
+				continue
+			}
+			seen[oid] = struct{}{}
+			out = append(out, oid)
+		}
+		return out
+	}
+	return nil
 }
 
 type HyperliquidCloseFill struct {
