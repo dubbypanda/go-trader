@@ -116,7 +116,8 @@ type manualCoreDeps struct {
 	fetchMids   manualMarkFetcher
 	closer      HyperliquidLiveCloser
 
-	lockManualActions func() (release func(), err error)
+	lockManualActions           func() (release func(), err error)
+	reconcileCanceledProtection func(strategyID, symbol string, cancelOIDs []int64) error
 }
 
 func (d manualCoreDeps) acquireManualActionLock() (func(), error) {
@@ -143,14 +144,50 @@ func newManualCoreDeps(cfg *Config, stateDB *StateDB, notifier *MultiNotifier) m
 		cfg:         cfg,
 		stateDB:     stateDB,
 		notifier:    notifier,
-		execute:     RunHyperliquidExecute,
+		execute:     runHyperliquidExecuteFn,
 		updateSL:    RunHyperliquidUpdateStopLoss,
 		cancelOrder: RunHyperliquidCancelOrder,
 		fetchMids:   fetchHyperliquidMids,
 		closer:      defaultHyperliquidForceCloseCloser,
+		reconcileCanceledProtection: func(strategyID, symbol string, cancelOIDs []int64) error {
+			return reconcileCanceledExecuteProtectionInDB(cfg, stateDB, strategyID, symbol, cancelOIDs)
+		},
 		lockManualActions: func() (func(), error) {
 			return acquireManualActionFileLock(cfg.DBFile)
 		},
+	}
+}
+
+func reconcileCanceledExecuteProtectionInDB(cfg *Config, stateDB *StateDB, strategyID, symbol string, cancelOIDs []int64) error {
+	if stateDB == nil || len(cancelOIDs) == 0 {
+		return nil
+	}
+	state, err := LoadStateWithDB(cfg, stateDB)
+	if err != nil {
+		return err
+	}
+	strategy := state.Strategies[strategyID]
+	if strategy == nil {
+		return nil
+	}
+	position := strategy.Positions[symbol]
+	if position == nil {
+		return nil
+	}
+	clearHyperliquidProtectionOIDsMatching(position, cancelOIDs)
+	return SaveStrategyBookWithDB(strategy, stateDB)
+}
+
+func reconcileManualExecuteProtection(d manualCoreDeps, res *manualCoreResult, strategyID, symbol string, executeResult *HyperliquidExecuteResult, requestedCancelOIDs []int64) {
+	if d.reconcileCanceledProtection == nil {
+		return
+	}
+	canceledOIDs := hyperliquidExecuteSucceededCancelOIDs(executeResult, requestedCancelOIDs)
+	if len(canceledOIDs) == 0 {
+		return
+	}
+	if err := d.reconcileCanceledProtection(strategyID, symbol, canceledOIDs); err != nil {
+		res.errf("warning: could not record canceled protection for %s/%s: %v", strategyID, symbol, err)
 	}
 }
 
@@ -493,27 +530,19 @@ func manualOpenCore(d manualCoreDeps, sc StrategyConfig, in manualOpenInputs) (*
 		if execStderr != "" {
 			res.errf("HL execute stderr: %s", execStderr)
 		}
+		execResult, execErr = confirmHyperliquidExecuteFill(execResult, execErr)
 		if execErr != nil {
+			reconcileManualExecuteProtection(d, res, strategyID, sc.Symbol, execResult, nil)
 			return res, manualFailf("error placing order: %v", execErr)
-		}
-		if execResult.Error != "" {
-			return res, manualFailf("error from HL: %s", execResult.Error)
 		}
 
 		fill := execResult.Execution
-		if fill == nil || fill.Fill == nil {
-			return res, manualFailf("error: no fill returned from execute")
-		}
 		resolvedFillPrice = fill.Fill.AvgPx
 		fillQty = fill.Fill.TotalSz
 		fillFee = fill.Fill.Fee
 		if fill.Fill.OID != 0 {
 			exchangeOID = fmt.Sprintf("%d", fill.Fill.OID)
 		}
-		if fillQty <= 0 {
-			fillQty = resolveManualSize(in.Size, in.Notional, in.Margin, resolvedFillPrice, sc.Leverage)
-		}
-
 		if entryATR > 0 && resolvedFillPrice > 0 && entryATR > 0.5*resolvedFillPrice {
 			res.errf("warning: --atr %.4f exceeds 50%% of fill price %.4f — EntryATR will not be stamped", entryATR, resolvedFillPrice)
 			entryATR = 0
@@ -773,24 +802,17 @@ func manualAddCore(d manualCoreDeps, sc StrategyConfig, in manualAddInputs) (*ma
 		if execStderr != "" {
 			res.errf("HL execute stderr: %s", execStderr)
 		}
+		execResult, execErr = confirmHyperliquidExecuteFill(execResult, execErr)
 		if execErr != nil {
+			reconcileManualExecuteProtection(d, res, strategyID, sc.Symbol, execResult, nil)
 			return res, manualFailf("error placing order: %v", execErr)
 		}
-		if execResult.Error != "" {
-			return res, manualFailf("error from HL: %s", execResult.Error)
-		}
 		fill := execResult.Execution
-		if fill == nil || fill.Fill == nil {
-			return res, manualFailf("error: no fill returned from execute")
-		}
 		resolvedFillPrice = fill.Fill.AvgPx
 		fillQty = fill.Fill.TotalSz
 		fillFee = fill.Fill.Fee
 		if fill.Fill.OID != 0 {
 			exchangeOID = fmt.Sprintf("%d", fill.Fill.OID)
-		}
-		if fillQty <= 0 {
-			fillQty = resolveManualSize(in.Size, in.Notional, in.Margin, resolvedFillPrice, sc.Leverage)
 		}
 	}
 
@@ -937,11 +959,11 @@ func manualCloseCore(d manualCoreDeps, sc StrategyConfig, in manualCloseInputs) 
 	if stderr != "" {
 		res.errf("HL close stderr: %s", stderr)
 	}
+	requestedCancelOIDs := append([]int64{cancelOID}, extraCancelOIDs...)
+	execResult, execErr = confirmHyperliquidExecuteFill(execResult, execErr)
 	if execErr != nil {
+		reconcileManualExecuteProtection(d, res, strategyID, sc.Symbol, execResult, requestedCancelOIDs)
 		return res, manualFailf("error placing close order: %v", execErr)
-	}
-	if execResult.Error != "" {
-		return res, manualFailf("error from HL: %s", execResult.Error)
 	}
 	if execResult.CancelStopLossError != "" {
 		res.errf("warning: manual close cancel failed (non-fatal) for %s/%s: %s (sl_oid=%d tp_oids=%v) — verify HL on-chain triggers",
@@ -949,9 +971,6 @@ func manualCloseCore(d manualCoreDeps, sc StrategyConfig, in manualCloseInputs) 
 	}
 
 	fill := execResult.Execution
-	if fill == nil || fill.Fill == nil {
-		return res, manualFailf("error: no fill returned from close execute")
-	}
 
 	fillAvgPx := fill.Fill.AvgPx
 	fillFee := fill.Fill.Fee

@@ -72,6 +72,26 @@ func (ss *StatusServer) daemonManualCoreDeps(cfg *Config) manualCoreDeps {
 		defer ss.mu.RUnlock()
 		return manualStateViewFromState(cfg, ss.state, strategyID, symbol), nil
 	}
+	d.reconcileCanceledProtection = func(strategyID, symbol string, cancelOIDs []int64) error {
+		if len(cancelOIDs) == 0 {
+			return nil
+		}
+		ss.mu.Lock()
+		defer ss.mu.Unlock()
+		if ss.state == nil {
+			return fmt.Errorf("state unavailable")
+		}
+		strategy := ss.state.Strategies[strategyID]
+		if strategy == nil {
+			return nil
+		}
+		position := strategy.Positions[symbol]
+		if position == nil {
+			return nil
+		}
+		clearHyperliquidProtectionOIDsMatching(position, cancelOIDs)
+		return SaveStrategyBookWithDB(strategy, ss.stateDB)
+	}
 	return d
 }
 

@@ -305,7 +305,7 @@ func defaultHedgeExecutor() hedgeExecutor {
 				marginMode = hedgeMarginMode(sc)
 				leverage = hedgeLeverage(sc)
 			}
-			res, stderr, err := RunHyperliquidExecute(sc.Script, coin, side, qty, 0, 0, 0, marginMode, leverage, false, hlExecuteSnapshot{})
+			res, stderr, err := runHyperliquidExecuteFn(sc.Script, coin, side, qty, 0, 0, 0, marginMode, leverage, false, hlExecuteSnapshot{})
 			if stderr != "" {
 				fmt.Printf("[hedge] %s execute stderr: %s\n", coin, stderr)
 			}
@@ -404,14 +404,15 @@ func runHedgeSync(
 	switch action.Kind {
 	case hedgeActionOpen, hedgeActionAdd:
 		res, err := exec.Open(sc, snap.HedgeSymbol, action.Side, action.Qty, action.Kind == hedgeActionOpen)
-		if ok, why := hedgeExecuteConfirmed(res, err); !ok {
-			logger.Error("hedge %s failed on %s: %s", action.Kind, snap.HedgeSymbol, why)
-			notifyLiveExecFailure(notifier, sc, directionOpen, snap.HedgeSymbol, why)
+		res, err = confirmHyperliquidExecuteFill(res, err)
+		if err != nil {
+			logger.Error("hedge %s failed on %s: %s", action.Kind, snap.HedgeSymbol, err)
+			notifyLiveExecFailure(notifier, sc, directionOpen, snap.HedgeSymbol, err.Error())
 			if in.FreshExposureQty > hedgeQtyEpsilon {
-				unwindPrimaryAfterHedgeOpenFailure(sc, s, mu, exec, snap, why, in, notifier, logger)
+				unwindPrimaryAfterHedgeOpenFailure(sc, s, mu, exec, snap, err.Error(), in, notifier, logger)
 			} else {
 				notifyHedgeProblem(notifier, sc, snap.HedgeSymbol,
-					fmt.Sprintf("hedge %s failed: %s — the primary %s position is now under-hedged. The scheduler will retry every cycle; no position was unwound because the primary was not opened this cycle.", action.Kind, why, snap.PrimarySymbol))
+					fmt.Sprintf("hedge %s failed: %s — the primary %s position is now under-hedged. The scheduler will retry every cycle; no position was unwound because the primary was not opened this cycle.", action.Kind, err, snap.PrimarySymbol))
 			}
 			return hedgeActionNone
 		}
@@ -446,25 +447,6 @@ func runHedgeSync(
 		return action.Kind
 	}
 	return hedgeActionNone
-}
-
-func hedgeExecuteConfirmed(res *HyperliquidExecuteResult, err error) (bool, string) {
-	if err != nil {
-		return false, err.Error()
-	}
-	if res == nil {
-		return false, "no execute result returned"
-	}
-	if res.Error != "" {
-		return false, res.Error
-	}
-	if res.Execution == nil || res.Execution.Fill == nil {
-		return false, "execute returned no fill block"
-	}
-	if res.Execution.Fill.TotalSz <= 0 || res.Execution.Fill.AvgPx <= 0 {
-		return false, fmt.Sprintf("execute returned an empty fill (sz=%.8f px=%.8f)", res.Execution.Fill.TotalSz, res.Execution.Fill.AvgPx)
-	}
-	return true, ""
 }
 
 func hedgeCloseConfirmed(res *HyperliquidCloseResult, err error) (bool, string) {
