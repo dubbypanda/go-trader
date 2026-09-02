@@ -73,6 +73,7 @@ its row here in the same PR. A new row is part of the change, not a follow-up.
 | `research/regime_1076_aggregate.py` | Aggregates the #1076 battery under one global multiple-comparisons correction. | one-shot | #1076 |
 | `research/regime_1080_unsupervised_vol_model.py` | Evidence run for the unsupervised vol-state bake-off. | one-shot | #1080 |
 | `research/regime_1095_enriched_vol_model.py` | Evidence run extending the bake-off to the enriched feature matrix. | one-shot | #1095 |
+| `research/regime_1500_gmm_stability_sweep.py` | Decoder-smoothing sweep (`filter_window`, off-by-default `decode_min_dwell` / `decode_stickiness`) for the #1095 `volume:gmm:k=5` stability near-miss, re-scored through the unchanged gate; context sweep over the other Bonferroni-passing BTC candidates. | one-shot | #1500 |
 | `research/regime_1120_trail_validation.py` | Incumbent vs proposed regime opening-trail defaults. | one-shot | #1120 |
 | `research/regime_1152_exit_retune.py` | M6 entry-locked retune of ranging ratchet ladders + B2 ranging TP group. | one-shot | #1152 |
 | `research/regime_1211_incumbent_baseline.py` | Re-measures whether the promotion gate's incumbent baseline is trustworthy, or whether the shipping rule must be redesigned. | one-shot | #1211 |
