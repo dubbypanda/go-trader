@@ -609,3 +609,227 @@ def test_kmeans_path_unaffected_by_neutralizer():
     assert counts.sum() == len(z)
     for j in range(3):
         assert not (np.allclose(mu[j], 0.0, atol=1e-6) and np.allclose(var[j], 1.0, atol=1e-9))
+
+
+def _colliding_feature_matrix(seed=0):
+    rng = np.random.default_rng(seed)
+    centers = np.array([[0.0, 0.02, 0.1, 8.0],
+                        [0.07, 0.14, 0.15, 20.0],
+                        [0.15, 0.20, 0.30, 22.0]], dtype=float)
+    rows = [rng.normal(c, [0.005, 0.01, 0.02, 1.0], size=(150, 4)) for c in centers]
+    return np.vstack([np.full((5, 4), np.nan), *rows])
+
+
+def test_colliding_centroids_share_a_handrule_cell():
+    from regime import map_composite_label, _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    assert map_composite_label(0.07, 20.0, 0.14, 0.15, dict(TH)) == "trending_up_choppy"
+    assert map_composite_label(0.15, 22.0, 0.20, 0.30, dict(TH)) == "trending_up_choppy"
+
+
+@pytest.mark.parametrize("family", ["kmeans", "gmm", "hmm"])
+def test_fitted_model_with_colliding_centroids_keeps_every_latent_state_distinct(family):
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH, VALID_LABELS_COMPOSITE
+    feats = _colliding_feature_matrix()
+    model = rvm.fit_unsupervised(feats, family=family, k=3, filter_window=32,
+                                 thresholds=dict(TH), seed=0)
+    assert model["latent_count"] == 3
+    assert len(set(model["states"])) == 3, model["states"]
+    assert all(s in VALID_LABELS_COMPOSITE for s in model["states"])
+    labels, _ = forward_filter_labels(feats, model)
+    valid = ~np.isnan(feats).any(1)
+    assert len(set(labels[valid].tolist())) == 3
+
+
+def _artifact_candidate(path_tail, subset, family, k):
+    import json
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "docs", "research", "1218-artifacts", path_tail)
+    with open(path) as fh:
+        report = json.load(fh)
+    for c in report["candidates"]:
+        if c.get("subset", "canonical") == subset and c["family"] == family and c["k"] == k:
+            return c
+    raise AssertionError(f"{subset}:{family}:k={k} missing from {path_tail}")
+
+
+@pytest.mark.parametrize("path_tail,subset,family,k", [
+    ("regime_1095_btc.json", "htf", "hmm", 6),
+    ("regime_1095_eth.json", "canonical", "kmeans", 7),
+    ("regime_1095_eth.json", "funding", "kmeans", 6),
+    ("regime_1095_eth.json", "all_enriched", "kmeans", 6),
+])
+def test_1218_near_miss_centroids_map_to_distinct_names(path_tail, subset, family, k):
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH, VALID_LABELS_COMPOSITE
+    from regime_enriched_features import canonical_indices_for
+    cand = _artifact_candidate(path_tail, subset, family, k)
+    stored = cand["states"]
+    assert len(set(stored)) < len(stored)
+    raw = np.array([cand["mapping"][str(i)]["centroid_raw"] for i in range(k)], dtype=float)
+    d = raw.shape[1]
+    cidx = canonical_indices_for(cand["columns"])
+    names, mapping = rvm.map_latent_to_names(raw, np.zeros(d), np.ones(d), dict(TH),
+                                             canonical_indices=cidx)
+    assert len(set(names)) == k, names
+    assert all(nm in VALID_LABELS_COMPOSITE for nm in names)
+    handrule = [mapping[str(i)]["handrule_name"] for i in range(k)]
+    assert handrule == stored
+    for i in range(k):
+        if stored.count(stored[i]) == 1:
+            assert names[i] == stored[i]
+
+
+def test_handrule_cells_partition_matches_map_composite_label():
+    from regime import map_composite_label, _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    th = dict(TH)
+    cells = rvm.handrule_cells(th)
+    assert set(cells) == {"trending_up_clean", "trending_up_choppy", "trending_down_clean",
+                          "trending_down_choppy", "ranging_directional_up",
+                          "ranging_directional_down", "ranging_directional",
+                          "ranging_volatile", "ranging_quiet"}
+    rng = np.random.default_rng(7)
+    scale = {"return_eff": 1.0, "range_eff": 1.0, "efficiency": 1.0, "adx": 1.0}
+    for _ in range(2000):
+        pt = {"return_eff": float(rng.uniform(-0.2, 0.2)), "range_eff": float(rng.uniform(0, 0.1)),
+              "efficiency": float(rng.uniform(0, 1)), "adx": float(rng.uniform(0, 60))}
+        expected = map_composite_label(pt["return_eff"], pt["adx"], pt["range_eff"],
+                                       pt["efficiency"], th)
+        zero = [lab for lab, cell in cells.items() if rvm.cell_distance_z(pt, scale, cell) == 0.0]
+        assert zero == [expected], (pt, zero, expected)
+
+
+def test_cell_distance_scales_violation_by_feature_std():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    cells = rvm.handrule_cells(dict(TH))
+    pt = {"return_eff": 0.0, "range_eff": 0.0, "efficiency": 0.0, "adx": 15.0}
+    unit = rvm.cell_distance_z(pt, {"return_eff": 1, "range_eff": 1, "efficiency": 1, "adx": 1},
+                               cells["ranging_directional"])
+    wide = rvm.cell_distance_z(pt, {"return_eff": 1, "range_eff": 1, "efficiency": 1, "adx": 10},
+                               cells["ranging_directional"])
+    assert unit == pytest.approx(10.0)
+    assert wide == pytest.approx(1.0)
+
+
+def test_min_cost_assignment_matches_brute_force():
+    import itertools
+    rng = np.random.default_rng(11)
+    for n, m in [(2, 2), (3, 5), (4, 4), (5, 9)]:
+        for _ in range(20):
+            cost = rng.uniform(0, 10, size=(n, m))
+            assign = rvm._min_cost_assignment(cost)
+            assert sorted(assign) == sorted(set(assign)) and len(assign) == n
+            got = sum(cost[i, assign[i]] for i in range(n))
+            best = min(sum(cost[i, p[i]] for i in range(n))
+                       for p in itertools.permutations(range(m), n))
+            assert got == pytest.approx(best)
+
+
+def test_min_cost_assignment_rejects_more_rows_than_columns():
+    with pytest.raises(ValueError):
+        rvm._min_cost_assignment(np.zeros((3, 2)))
+
+
+def test_uncontested_states_keep_their_handrule_name():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    th = dict(TH)
+    std = np.ones(4)
+    raw = np.array([[0.0, 0.01, 0.1, 10.0],
+                    [0.10, 0.10, 0.2, 20.0],
+                    [0.20, 0.20, 0.3, 24.0],
+                    [-0.10, 0.10, 0.9, 40.0]], dtype=float)
+    handrule = ["ranging_quiet", "trending_up_choppy", "trending_up_choppy", "trending_down_clean"]
+    names, disp = rvm.assign_distinct_names(raw, std, handrule, th)
+    assert names[0] == "ranging_quiet" and names[3] == "trending_down_clean"
+    assert disp[0] == 0.0 and disp[3] == 0.0
+    assert {names[1], names[2]} >= {"trending_up_choppy"}
+    assert len(set(names)) == 4
+    moved = 1 if names[1] != "trending_up_choppy" else 2
+    assert disp[moved] > 0.0
+    assert disp[3 - moved if moved == 1 else 1] == 0.0
+
+
+def test_collision_moves_the_state_nearest_to_a_free_cell_in_z_units():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    th = dict(TH)
+    std = np.array([0.05, 0.05, 0.2, 10.0])
+    raw = np.array([[0.10, 0.10, 0.10, 10.0],
+                    [0.10, 0.10, 0.49, 24.9]], dtype=float)
+    handrule = ["trending_up_choppy", "trending_up_choppy"]
+    names, disp = rvm.assign_distinct_names(raw, std, handrule, th)
+    assert names == ["trending_up_choppy", "trending_up_clean"]
+    assert disp[0] == 0.0
+    assert disp[1] == pytest.approx(np.hypot(0.01 / 0.2, 0.1 / 10.0))
+    unit_names, _ = rvm.assign_distinct_names(raw, np.ones(4), handrule, th)
+    assert unit_names[0] == "trending_up_choppy" and unit_names[1] == "ranging_volatile"
+
+
+def test_ranging_collision_relabels_by_range_toward_volatile():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    th = dict(TH)
+    std = np.ones(4)
+    raw = np.array([[0.0, 0.005, 0.1, 10.0],
+                    [0.0, 0.025, 0.1, 10.0]], dtype=float)
+    names, _ = rvm.assign_distinct_names(raw, std, ["ranging_quiet", "ranging_quiet"], th)
+    assert names == ["ranging_quiet", "ranging_volatile"]
+
+
+def test_assignment_is_deterministic_across_calls_and_row_order():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    th = dict(TH)
+    std = np.ones(4)
+    raw = np.array([[0.07, 0.14, 0.15, 20.0],
+                    [0.15, 0.20, 0.30, 22.0],
+                    [0.11, 0.18, 0.20, 30.0]], dtype=float)
+    hr = ["trending_up_choppy"] * 3
+    a, _ = rvm.assign_distinct_names(raw, std, hr, th)
+    b, _ = rvm.assign_distinct_names(raw, std, hr, th)
+    assert a == b and len(set(a)) == 3
+    perm = [2, 0, 1]
+    c, _ = rvm.assign_distinct_names(raw[perm], std, hr, th)
+    assert [c[perm.index(i)] for i in range(3)] == a
+
+
+def test_more_states_than_vocabulary_falls_back_to_handrule_names_and_records_duplicates():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    th = dict(TH)
+    raw = np.tile(np.array([[0.10, 0.10, 0.10, 10.0]]), (10, 1))
+    hr = ["trending_up_choppy"] * 10
+    names, disp = rvm.assign_distinct_names(raw, np.ones(4), hr, th)
+    assert names == hr and disp == [0.0] * 10
+    mapping = {str(i): {"name": names[i], "handrule_name": hr[i], "relabeled": False,
+                        "displacement_z": 0.0} for i in range(10)}
+    summary = rvm.naming_summary(names, mapping)
+    assert summary["distinct"] is False
+    assert summary["duplicate_names"] == ["trending_up_choppy"]
+
+
+def test_fit_unsupervised_records_naming_summary_and_bumps_version():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    feats = _colliding_feature_matrix()
+    model = rvm.fit_unsupervised(feats, family="kmeans", k=3, filter_window=32,
+                                 thresholds=dict(TH), seed=0)
+    assert model["version"] == 2
+    naming = model["naming"]
+    assert naming["rule"] == "distinct_nearest_cell"
+    assert naming["distinct"] is True and naming["duplicate_names"] == []
+    assert len(naming["relabeled"]) == 1
+    (idx, rec), = naming["relabeled"].items()
+    assert model["mapping"][idx]["relabeled"] is True
+    assert rec["from"] == "trending_up_choppy" and rec["to"] == model["states"][int(idx)]
+    assert rec["to"] != "trending_up_choppy"
+    untouched = [i for i in range(3) if str(i) != idx]
+    for i in untouched:
+        assert model["mapping"][str(i)]["relabeled"] is False
+        assert model["states"][i] == model["mapping"][str(i)]["handrule_name"]
+
+
+def test_non_degeneracy_counts_distinct_decoded_states_after_relabel():
+    from regime import _DEFAULT_COMPOSITE_THRESHOLDS as TH
+    feats = _colliding_feature_matrix()
+    model = rvm.fit_unsupervised(feats, family="kmeans", k=3, filter_window=32,
+                                 thresholds=dict(TH), seed=0)
+    labels, _ = forward_filter_labels(feats, model)
+    valid = ~np.isnan(feats).any(1)
+    thr = rvm.NonDegeneracyThresholds(min_active_labels=3, max_occupancy=1.0,
+                                      min_transition_rate=0.0)
+    rep = rvm.non_degeneracy(labels[valid], thr)
+    assert rep["active_labels"] == 3 and rep["ok"] is True
