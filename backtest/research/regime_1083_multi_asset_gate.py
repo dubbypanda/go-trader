@@ -211,6 +211,7 @@ def run_cell(
             "k": winner.get("k"),
             "states": model.get("states"),
             "mapping": model.get("mapping"),
+            "naming": model.get("naming"),
             "fitted_on": model.get("fitted_on"),
         }
         economic = economic_gate_fn(

@@ -181,6 +181,7 @@ def run_bakeoff(symbol="BTC/USDT", timeframe="1h", *, in_sample="is", held_out="
             "structurally_ineligible": bool(ineligible_reasons[(sub_name, family, k)]),
             "structural_ineligibility_reason": ineligible_reasons[(sub_name, family, k)],
             "states": model["states"], "mapping": model["mapping"],
+            "naming": model["naming"],
         })
     for c in candidates:
         c["passes_bonferroni"] = (not c["structurally_ineligible"]

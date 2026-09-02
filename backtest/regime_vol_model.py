@@ -7,13 +7,16 @@ for _p in (_THIS_DIR, os.path.abspath(os.path.join(_THIS_DIR, "..")),
         sys.path.insert(0, _p)
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 from regime_hmm import stationary_distribution
 
 FEATURES = ["return_eff", "range_eff", "efficiency", "adx"]
 MODEL_TYPE = "unsupervised_vol_regime"
-MODEL_VERSION = 1
+MODEL_VERSION = 2
+NAMING_RULE = "distinct_nearest_cell"
+_RELABEL_PENALTY = 1e6
 
 
 def standardize(features):
@@ -206,6 +209,123 @@ def fit_hmm(z, k, *, seed=0, iters=50, var_floor=1e-3, tol=1e-4, min_soft_mass=1
 FITTERS = {"kmeans": fit_kmeans, "gmm": fit_gmm, "hmm": fit_hmm}
 
 
+def handrule_cells(thresholds):
+    from regime import normalize_composite_thresholds, _DEFAULT_COMPOSITE_THRESHOLDS
+    th = normalize_composite_thresholds(thresholds)
+    rt = float(th["return_eff"])
+    gt = float(th["range_eff"])
+    at = float(th.get("adx", _DEFAULT_COMPOSITE_THRESHOLDS["adx"]))
+    et = float(th.get("efficiency", _DEFAULT_COMPOSITE_THRESHOLDS["efficiency"]))
+    R, G, E, A = "return_eff", "range_eff", "efficiency", "adx"
+    return {
+        "trending_up_clean": [[(R, ">=", rt), (E, ">=", et), (A, ">=", at)]],
+        "trending_up_choppy": [[(R, ">=", rt), (E, "<", et)], [(R, ">=", rt), (A, "<", at)]],
+        "trending_down_clean": [[(R, "<=", -rt), (E, ">=", et), (A, ">=", at)]],
+        "trending_down_choppy": [[(R, "<=", -rt), (E, "<", et)], [(R, "<=", -rt), (A, "<", at)]],
+        "ranging_directional_up": [[(R, ">", 0.0), (R, "<", rt), (A, ">=", at)]],
+        "ranging_directional_down": [[(R, "<", 0.0), (R, ">", -rt), (A, ">=", at)]],
+        "ranging_directional": [[(R, ">=", 0.0), (R, "<=", 0.0), (A, ">=", at)]],
+        "ranging_volatile": [[(R, "<", rt), (R, ">", -rt), (A, "<", at), (G, ">=", gt)]],
+        "ranging_quiet": [[(R, "<", rt), (R, ">", -rt), (A, "<", at), (G, "<", gt)]],
+    }
+
+
+def cell_distance_z(point, scale, cell):
+    best = math.inf
+    for conjunction in cell:
+        acc = 0.0
+        for feat, op, th in conjunction:
+            x = float(point[feat])
+            if op in (">=", ">"):
+                violation = max(0.0, th - x)
+            else:
+                violation = max(0.0, x - th)
+            acc += (violation / float(scale[feat])) ** 2
+        best = min(best, math.sqrt(acc))
+    return best
+
+
+def _min_cost_assignment(cost):
+    cost = np.asarray(cost, dtype=float)
+    n, m = cost.shape
+    if n > m:
+        raise ValueError(f"cannot assign {n} rows to {m} columns distinctly")
+    inf = math.inf
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            for j in range(1, m + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assign = [-1] * n
+    for j in range(1, m + 1):
+        if p[j]:
+            assign[p[j] - 1] = j - 1
+    return assign
+
+
+def assign_distinct_names(raw, feature_stds, handrule_names, thresholds, *,
+                          canonical_indices=(0, 1, 2, 3)):
+    raw = np.asarray(raw, dtype=float)
+    std = np.asarray(feature_stds, dtype=float)
+    k = len(raw)
+    cells = handrule_cells(thresholds)
+    labels = sorted(cells)
+    if k > len(labels):
+        return list(handrule_names), [0.0] * k
+    ri, gi, ei, ai = (int(x) for x in canonical_indices)
+    idx = {"return_eff": ri, "range_eff": gi, "efficiency": ei, "adx": ai}
+    dist = np.zeros((k, len(labels)))
+    cost = np.zeros((k, len(labels)))
+    for i in range(k):
+        point = {f: raw[i, j] for f, j in idx.items()}
+        scale = {f: std[j] for f, j in idx.items()}
+        for li, lab in enumerate(labels):
+            if lab == handrule_names[i]:
+                d, penalty = 0.0, 0.0
+            else:
+                d, penalty = cell_distance_z(point, scale, cells[lab]), _RELABEL_PENALTY
+            dist[i, li] = d
+            cost[i, li] = d + penalty + 1e-9 * li
+    assign = _min_cost_assignment(cost)
+    names = [labels[j] for j in assign]
+    displacement = [float(dist[i, assign[i]]) for i in range(k)]
+    return names, displacement
+
+
 def map_latent_to_names(em_mean_z, feature_means, feature_stds, thresholds,
                         *, canonical_indices=(0, 1, 2, 3)):
     from regime import map_composite_label
@@ -222,13 +342,29 @@ def map_latent_to_names(em_mean_z, feature_means, feature_stds, thresholds,
     raw = em_mean_z * std + mean
     order = sorted(range(len(raw)), key=lambda i: (raw[i, gi], i))
     rank = {i: r for r, i in enumerate(order)}
-    names, mapping = [], {}
+    handrule = [map_composite_label(raw[i, ri], raw[i, ai], raw[i, gi], raw[i, ei], thresholds)
+                for i in range(len(raw))]
+    names, displacement = assign_distinct_names(raw, std, handrule, thresholds,
+                                                canonical_indices=(ri, gi, ei, ai))
+    mapping = {}
     for i in range(len(raw)):
-        name = map_composite_label(raw[i, ri], raw[i, ai], raw[i, gi], raw[i, ei], thresholds)
-        names.append(name)
-        mapping[str(i)] = {"name": name, "centroid_raw": raw[i].tolist(),
+        mapping[str(i)] = {"name": names[i], "handrule_name": handrule[i],
+                           "relabeled": bool(names[i] != handrule[i]),
+                           "displacement_z": float(displacement[i]),
+                           "centroid_raw": raw[i].tolist(),
                            "volatility_rank": int(rank[i])}
     return names, mapping
+
+
+def naming_summary(names, mapping):
+    names = list(names)
+    relabeled = {i: {"from": m["handrule_name"], "to": m["name"],
+                     "displacement_z": m["displacement_z"]}
+                 for i, m in sorted(mapping.items(), key=lambda kv: int(kv[0]))
+                 if m.get("relabeled")}
+    duplicates = sorted({nm for nm in names if names.count(nm) > 1})
+    return {"rule": NAMING_RULE, "distinct": not duplicates,
+            "relabeled": relabeled, "duplicate_names": duplicates}
 
 
 def fit_unsupervised(features, *, family, k, filter_window, period=48,
@@ -261,6 +397,7 @@ def fit_unsupervised(features, *, family, k, filter_window, period=48,
         "transition": transition.tolist(), "init": init.tolist(),
         "filter_window": int(filter_window), "period": int(period),
         "fitted_on": dict(fitted_on or {}), "mapping": mapping,
+        "naming": naming_summary(names, mapping),
     }
 
 
