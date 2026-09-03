@@ -3123,13 +3123,7 @@ func isFreshPerStrategyCircuitBreaker(reason string) bool {
 		strings.HasPrefix(reason, RiskReasonConsecutiveLosses)
 }
 
-func sendTradeAlerts(sc StrategyConfig, stratState *StrategyState, trades int, mu *sync.RWMutex, notifier *MultiNotifier) {
-	isLive := isLiveArgs(sc.Args)
-	mode := "paper"
-	if isLive {
-		mode = "live"
-	}
-
+func sendTradeAlerts(sc StrategyConfig, stratState *StrategyState, trades int, mu *sync.RWMutex, notifier tradeAlertRouter) {
 	mu.RLock()
 	n := len(stratState.TradeHistory)
 	if n == 0 || trades <= 0 {
@@ -3143,6 +3137,15 @@ func sendTradeAlerts(sc StrategyConfig, stratState *StrategyState, trades int, m
 	newTrades := make([]Trade, trades)
 	copy(newTrades, stratState.TradeHistory[start:n])
 	mu.RUnlock()
+	sendTradeAlertRows(sc, newTrades, notifier)
+}
+
+func sendTradeAlertRows(sc StrategyConfig, newTrades []Trade, notifier tradeAlertRouter) {
+	isLive := isLiveArgs(sc.Args)
+	mode := "paper"
+	if isLive {
+		mode = "live"
+	}
 
 	for _, route := range notifier.tradeAlertRoutes(sc.Platform, sc.Type, isLive) {
 		for _, t := range newTrades {
