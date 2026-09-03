@@ -940,3 +940,145 @@ class TestLazyExchangeInit:
         t2.join(timeout=10)
         assert not errors
         assert exchange_calls["n"] == 1
+
+
+def _sdk_info(asset_to_sz_decimals_by_index, name_to_coin=None, coin_to_asset=None, name_to_asset_fn=None):
+    mock_info = MagicMock()
+    mock_info.asset_to_sz_decimals = asset_to_sz_decimals_by_index
+    if name_to_coin is None:
+        name_to_coin = {sym: sym for sym in coin_to_asset.keys()} if coin_to_asset else {}
+    mock_info.name_to_coin = name_to_coin
+    mock_info.coin_to_asset = coin_to_asset or {}
+    if name_to_asset_fn is not None:
+        mock_info.name_to_asset = name_to_asset_fn
+    else:
+        def _default_name_to_asset(name):
+            return coin_to_asset.get(name)
+        mock_info.name_to_asset = _default_name_to_asset
+    return mock_info
+
+
+class TestSzDecimalsSdkShape:
+
+    @pytest.mark.parametrize(
+        "symbol,sz_by_index,coin_to_asset,expected",
+        [
+            ("HYPE", {151: 2, 0: 5}, {"HYPE": 151, "BTC": 0}, 2),
+            ("BTC", {151: 2, 0: 5}, {"HYPE": 151, "BTC": 0}, 5),
+            ("ETH", {1: 4}, {"ETH": 1}, 4),
+        ],
+    )
+    def test_returns_correct_decimals_via_name_to_asset(self, symbol, sz_by_index, coin_to_asset, expected):
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index=sz_by_index,
+            coin_to_asset=coin_to_asset,
+        )
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        assert adapter._sz_decimals(symbol) == expected
+
+    def test_missing_asset_to_sz_decimals_falls_back_to_default_3(self):
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={151: 2},
+            coin_to_asset={"HYPE": 151},
+        )
+        del mock_info.asset_to_sz_decimals
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        adapter._sz_decimals_misses.add("HYPE")
+        assert adapter._sz_decimals("HYPE") == 3
+
+    def test_resolved_index_absent_from_sz_map_falls_back_to_default_3(self):
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={0: 5},
+            coin_to_asset={"HYPE": 151},
+        )
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        adapter._build_info = lambda *args, **kwargs: mock_info
+        assert adapter._sz_decimals("HYPE") == 3
+
+    def test_symbol_missing_from_name_to_coin_still_resolves_via_coin_to_asset(self):
+        def _sdk_name_to_asset(name):
+            return mock_info.coin_to_asset[mock_info.name_to_coin[name]]
+
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={151: 2},
+            name_to_coin={},
+            coin_to_asset={"HYPE": 151},
+            name_to_asset_fn=_sdk_name_to_asset,
+        )
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        assert adapter._sz_decimals("HYPE") == 2
+
+    def test_market_open_rounds_hype_size_to_2_decimals_not_3(self):
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={151: 2},
+            coin_to_asset={"HYPE": 151},
+        )
+        mock_exchange = MagicMock()
+        mock_exchange.market_open.return_value = {"status": "ok"}
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._wallet = MagicMock()
+        adapter._exchange = mock_exchange
+        adapter._info = mock_info
+
+        adapter.market_open("HYPE", True, 6.137982)
+        mock_exchange.market_open.assert_called_once_with("HYPE", True, 6.14, None, 0.01)
+
+    def test_market_close_rounds_hype_size_to_2_decimals(self):
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={151: 2},
+            coin_to_asset={"HYPE": 151},
+        )
+        mock_exchange = MagicMock()
+        mock_exchange.market_close.return_value = {"status": "closed"}
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._wallet = MagicMock()
+        adapter._exchange = mock_exchange
+        adapter._info = mock_info
+
+        adapter.market_close("HYPE", 6.137982)
+        mock_exchange.market_close.assert_called_once_with("HYPE", 6.14)
+
+    def test_unknown_symbol_falls_through_to_default_3(self):
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={0: 5},
+            coin_to_asset={"BTC": 0},
+        )
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        assert adapter._sz_decimals("NOPE") == 3
+
+    def test_name_to_asset_raising_falls_back_to_coin_to_asset(self):
+        def _raising(name):
+            raise RuntimeError("sdk quirk")
+
+        mock_info = _sdk_info(
+            asset_to_sz_decimals_by_index={42: 2},
+            coin_to_asset={"HYPE": 42},
+            name_to_asset_fn=_raising,
+        )
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        assert adapter._sz_decimals("HYPE") == 2
+
+    def test_legacy_symbol_keyed_mock_still_works(self):
+        mock_info = MagicMock()
+        mock_info.asset_to_sz_decimals = {"BTC": 5}
+        mock_info.name_to_coin = {}
+        mock_info.coin_to_asset = {}
+        mod = _load_hl_adapter()
+        adapter = mod.HyperliquidExchangeAdapter()
+        adapter._info = mock_info
+        assert adapter._sz_decimals("BTC") == 5
+

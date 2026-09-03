@@ -351,8 +351,13 @@ class HyperliquidExchangeAdapter:
         return self._ensure_exchange()
 
     def _sz_decimals(self, symbol: str) -> int:
-        if self._info is not None and symbol in self._info.asset_to_sz_decimals:
-            return self._info.asset_to_sz_decimals[symbol]
+        info = self._info
+        resolved = self._resolve_sz_decimals(info, symbol) if info is not None else None
+        if resolved is not None:
+            return resolved
+        if info is not None and isinstance(getattr(info, "asset_to_sz_decimals", None), dict) \
+                and symbol in info.asset_to_sz_decimals:
+            return info.asset_to_sz_decimals[symbol]
         if symbol in self._sz_decimals_misses:
             return 3
         try:
@@ -361,11 +366,36 @@ class HyperliquidExchangeAdapter:
             print(f"[WARN] hl meta refresh failed for {symbol}: {exc}", file=sys.stderr)
             self._sz_decimals_misses.add(symbol)
             return 3
-        if self._info is not None and symbol in self._info.asset_to_sz_decimals:
-            return self._info.asset_to_sz_decimals[symbol]
+        info = self._info
+        resolved = self._resolve_sz_decimals(info, symbol) if info is not None else None
+        if resolved is not None:
+            return resolved
+        if info is not None and isinstance(getattr(info, "asset_to_sz_decimals", None), dict) \
+                and symbol in info.asset_to_sz_decimals:
+            return info.asset_to_sz_decimals[symbol]
         print(f"[WARN] sz_decimals not found for {symbol} after refresh, defaulting to 3", file=sys.stderr)
         self._sz_decimals_misses.add(symbol)
         return 3
+
+    @staticmethod
+    def _resolve_sz_decimals(info, symbol: str):
+        sz_by_asset = getattr(info, "asset_to_sz_decimals", None)
+        if not isinstance(sz_by_asset, dict):
+            return None
+        name_to_asset = getattr(info, "name_to_asset", None)
+        if callable(name_to_asset):
+            try:
+                asset = name_to_asset(symbol)
+            except Exception:
+                asset = None
+            if isinstance(asset, int) and asset in sz_by_asset:
+                return sz_by_asset[asset]
+        coin_to_asset = getattr(info, "coin_to_asset", None)
+        if isinstance(coin_to_asset, dict) and symbol in coin_to_asset:
+            asset = coin_to_asset[symbol]
+            if isinstance(asset, int) and asset in sz_by_asset:
+                return sz_by_asset[asset]
+        return None
 
     @property
     def is_live(self) -> bool:
