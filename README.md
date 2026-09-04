@@ -79,6 +79,54 @@ Go scheduler (always running, ~8MB idle)
 Python adapters: binanceus, deribit, ibkr, hyperliquid, topstep, robinhood, okx, luno
 ```
 
+One deployment is one systemd instance: one config, one SQLite state file, one Go daemon. Live and paper run as separate instances today. One instance may also hold both modes, with portfolio risk partitioned by live and paper scope.
+
+```mermaid
+flowchart TB
+    subgraph Instance["go-trader instance (systemd unit)"]
+        CFG["config.json<br/>StateDirectory"]
+        DB[("state.db<br/>SQLite")]
+        subgraph Daemon["Go scheduler daemon"]
+            LOOP["Cycle loop<br/>due strategies, six-phase cycle"]
+            RISK["Portfolio risk per scope<br/>drawdown latch, kill switch,<br/>daily loss, notional and exposure caps"]
+            EXEC["Executor<br/>confirmed-fill gate, booking"]
+            PROT["Protection<br/>on-chain SL/TP, trailing,<br/>liquidation clamp"]
+            RECON["Reconciliation<br/>shared wallet, cashflow, fills"]
+            MIRROR["Replay mirror<br/>live decisions to paper"]
+            OPS["Operator surfaces<br/>Discord bot, loopback dashboard,<br/>owner DMs"]
+        end
+        subgraph Py["One-shot Python subprocesses (per cycle)"]
+            CHECK["check_&lt;platform&gt;.py<br/>candles, regime, open/close signals<br/>(HL: one batch per symbol+timeframe)"]
+            XQ["check_&lt;platform&gt;.py execute<br/>live orders via adapter"]
+            REG["check_regime.py / check_price.py"]
+        end
+    end
+    EXCH["Exchanges<br/>Hyperliquid, Binance US, OKX, Deribit,<br/>IBKR, TopStep, Robinhood, Luno"]
+    DISC["Discord / Telegram"]
+    LOG["replay_log_path<br/>shared decision log"]
+
+    CFG --> LOOP
+    LOOP -->|spawn, parse JSON| CHECK
+    LOOP --> REG
+    LOOP --> RISK --> EXEC
+    EXEC -->|live only| XQ
+    EXEC --> PROT
+    PROT -->|reduce-only orders| XQ
+    CHECK -->|public data| EXCH
+    XQ -->|signed orders, fills| EXCH
+    RECON --> EXCH
+    LOOP --> RECON
+    EXEC --> DB
+    RISK --> DB
+    LOOP --> MIRROR
+    MIRROR <--> LOG
+    OPS --> DISC
+    RISK -->|alerts, reset prompt| OPS
+    DB --> OPS
+```
+
+Paper instances run the same daemon without `--mode=live`: the execute subprocess is never spawned, fills are modeled, and protection is virtual.
+
 Python provides quant libraries (pandas, numpy, scipy, CCXT); Go provides memory efficiency. Peak ~220MB for ~30s during checks, then back to ~8MB idle.
 
 ---
