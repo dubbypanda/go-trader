@@ -16,6 +16,7 @@ const (
 	hlSharedCloseHoldPeerBusy     = "peer_busy"
 	hlSharedCloseHoldVenueReject  = "venue_rejected"
 	hlSharedCloseHoldEscalateFail = "escalate_failed"
+	hlSharedCloseHoldOperatorRef  = "operator_refused"
 )
 
 type hlSharedCloseFloorOutcome int
@@ -112,13 +113,128 @@ func evaluateSharedCoinFullCloseFloor(closeFraction float64, symbol string, hlLi
 	return hlSharedCloseFloorHold, remainderUSD
 }
 
-func formatSharedCloseStrandedAlert(strategyID, symbol string, remainderUSD float64, reason, holdReason string) string {
-	recovery := "The scheduler holds this close and will not resend it until the value rises above the gate or every peer is flat on-chain and in its own book; the bot's force-close sends the same sized order the venue rejects (issue 1534), so to end it sooner close the remainder directly on the venue or add to it above the gate."
-	if holdReason == hlSharedCloseHoldVenueReject {
-		recovery = "The scheduler holds this close and will not resend it until the value rises above the gate; a peer going flat does not resend it, and the bot's force-close sends the same sized order the venue rejects (issue 1534), so close the remainder directly on the venue or add to it above the gate."
+type sharedCloseFloorResolution struct {
+	Outcome        hlSharedCloseFloorOutcome
+	RemainderUSD   float64
+	OnChainQty     float64
+	SoughtEscalate bool
+	RefetchMissing bool
+	RefetchFailed  bool
+	RefetchErr     error
+}
+
+func resolveSharedCloseFloorEscalation(closeFraction float64, symbol string, hlLiveAll []StrategyConfig, posQty float64, posSide string, price float64, onChain hlOnChainCoinView, peerVirtualQty float64, heldReason string, refetch func() (hlOnChainCoinView, error)) sharedCloseFloorResolution {
+	coin := strings.TrimSpace(symbol)
+	r := sharedCloseFloorResolution{OnChainQty: onChain.AbsQty[coin]}
+	r.Outcome, r.RemainderUSD = evaluateSharedCoinFullCloseFloor(closeFraction, symbol, hlLiveAll, posQty, posSide, price, onChain, peerVirtualQty, heldReason)
+	if r.Outcome != hlSharedCloseFloorEscalate {
+		return r
 	}
-	return fmt.Sprintf("**CRITICAL — stranded remainder below venue minimum gate** [%s] %s: the final full close is worth $%.2f, under the $%.2f gate (the $%.2f venue minimum plus the %.0f%% safety margin). %s %s",
-		strategyID, symbol, remainderUSD, hlVenueCloseGateThresholdUSD(), hlVenueMinOrderNotionalUSD, hlVenueMinOrderNotionalMargin*100, reason, recovery)
+	r.SoughtEscalate = true
+	if refetch == nil {
+		r.RefetchMissing = true
+		r.Outcome = hlSharedCloseFloorDefer
+		return r
+	}
+	fresh, err := refetch()
+	if err != nil || !fresh.Known {
+		r.RefetchFailed = true
+		r.RefetchErr = err
+		r.Outcome = hlSharedCloseFloorDefer
+		return r
+	}
+	r.OnChainQty = fresh.AbsQty[coin]
+	r.Outcome, r.RemainderUSD = evaluateSharedCoinFullCloseFloor(closeFraction, symbol, hlLiveAll, posQty, posSide, price, fresh, peerVirtualQty, heldReason)
+	return r
+}
+
+type operatorSharedCloseDecision struct {
+	Escalate       bool
+	Refuse         bool
+	MarkUnreadable bool
+	RemainderUSD   float64
+	Reason         string
+}
+
+func operatorSharedCloseUnprovableReason(symbol string, remainderUSD float64, peers int, err error) string {
+	detail := "the on-chain account positions are not readable"
+	if err != nil {
+		detail = fmt.Sprintf("the on-chain account read failed: %v", err)
+	}
+	return fmt.Sprintf("cannot prove every peer is flat on %s (%s); the closing value $%.2f is under the $%.2f venue minimum gate, so the venue rejects a sized close and a whole-position close could take the exposure of one of the %d live strategies sharing this coin — no close order sent",
+		symbol, detail, remainderUSD, hlVenueCloseGateThresholdUSD(), peers)
+}
+
+func decideOperatorSharedCloseFloor(symbol, posSide string, posQty, price float64, hlLiveAll []StrategyConfig, peerVirtualQty float64, fetchOnChain func() (hlOnChainCoinView, error)) operatorSharedCloseDecision {
+	var d operatorSharedCloseDecision
+	peers := len(hlLiveStrategiesForCoin(symbol, hlLiveAll))
+	if posQty <= 0 || peers <= 1 {
+		return d
+	}
+	gate := hlVenueCloseGateThresholdUSD()
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		d.MarkUnreadable = true
+		d.Reason = fmt.Sprintf("no usable mark price for %s, so the closing value cannot be measured against the $%.2f venue minimum gate; %d live strategies share this coin, so the escalation to a whole-position close is withheld and the sized reduce-only close is sent unchanged — the venue rejects it if the value is under the gate",
+			symbol, gate, peers)
+		return d
+	}
+	d.RemainderUSD = posQty * price
+	if d.RemainderUSD >= gate {
+		return d
+	}
+	if fetchOnChain == nil {
+		d.Refuse = true
+		d.Reason = operatorSharedCloseUnprovableReason(symbol, d.RemainderUSD, peers, fmt.Errorf("no Hyperliquid account reader is configured"))
+		return d
+	}
+	onChain, err := fetchOnChain()
+	if err != nil || !onChain.Known {
+		d.Refuse = true
+		d.Reason = operatorSharedCloseUnprovableReason(symbol, d.RemainderUSD, peers, err)
+		return d
+	}
+	r := resolveSharedCloseFloorEscalation(1.0, symbol, hlLiveAll, posQty, posSide, price, onChain, peerVirtualQty, "", fetchOnChain)
+	d.RemainderUSD = r.RemainderUSD
+	switch r.Outcome {
+	case hlSharedCloseFloorEscalate:
+		d.Escalate = true
+	case hlSharedCloseFloorDefer:
+		d.Refuse = true
+		d.Reason = operatorSharedCloseUnprovableReason(symbol, r.RemainderUSD, peers, r.RefetchErr)
+	default:
+		d.Refuse = true
+		d.Reason = fmt.Sprintf("a peer strategy still holds quantity on %s (peers hold %.6f in their own books and the account holds %.6f on-chain against this position's %.6f), so a whole-position close would take its exposure; the closing value $%.2f is under the $%.2f venue minimum gate, so the venue rejects a sized close — no close order sent",
+			symbol, peerVirtualQty, r.OnChainQty, posQty, r.RemainderUSD, gate)
+	}
+	return d
+}
+
+func operatorRefusalWithCancelledRestingLimits(reason string, cancelledOIDs []int64) string {
+	if reason == "" || len(cancelledOIDs) == 0 {
+		return reason
+	}
+	oids := make([]string, 0, len(cancelledOIDs))
+	for _, oid := range cancelledOIDs {
+		oids = append(oids, fmt.Sprintf("%d", oid))
+	}
+	return fmt.Sprintf("%s; this strategy's resting limit order(s) oid=%s were already cancelled on the venue before the refusal and are not restored — re-place them by hand if you still want them",
+		reason, strings.Join(oids, ","))
+}
+
+func formatSharedCloseStrandedAlert(strategyID, symbol string, remainderUSD float64, reason, holdReason string) string {
+	recovery := "The scheduler holds this close and will not resend it until the value rises above the gate or every peer is flat on-chain and in its own book; a hand close (manual-close or force-close) escalates to a whole-position close only under that same peer-flat proof and otherwise refuses, so to end it sooner close the remainder directly on the venue or add to it above the gate."
+	switch holdReason {
+	case hlSharedCloseHoldVenueReject:
+		recovery = "The scheduler holds this close and will not resend it until the value rises above the gate; a peer going flat does not resend it, and a hand close escalates to a whole-position close only under the same peer-flat proof and otherwise refuses, so close the remainder directly on the venue or add to it above the gate."
+	case hlSharedCloseHoldOperatorRef:
+		recovery = "The hand close was refused and no close order was sent; the scheduler's own hold on this position is unchanged. A hand close escalates to a whole-position close only when every peer is flat on-chain and in its own book, so close the remainder directly on the venue or add to it above the gate."
+	}
+	value := fmt.Sprintf("the final full close is worth $%.2f, under the $%.2f gate", remainderUSD, hlVenueCloseGateThresholdUSD())
+	if remainderUSD <= 0 {
+		value = fmt.Sprintf("the closing value of the final full close could not be measured against the $%.2f gate", hlVenueCloseGateThresholdUSD())
+	}
+	return fmt.Sprintf("**CRITICAL — stranded remainder below venue minimum gate** [%s] %s: %s (the $%.2f venue minimum plus the %.0f%% safety margin). %s %s",
+		strategyID, symbol, value, hlVenueMinOrderNotionalUSD, hlVenueMinOrderNotionalMargin*100, reason, recovery)
 }
 
 func notifySharedCloseStranded(notifier *MultiNotifier, sc StrategyConfig, symbol string, remainderUSD float64, reason, holdReason string) {
@@ -134,19 +250,12 @@ func applySharedCoinFullCloseFloor(sc StrategyConfig, result *HyperliquidResult,
 	if result == nil || result.Signal == 0 {
 		return hlSharedCloseFloorNone, 0
 	}
-	outcome, remainderUSD := evaluateSharedCoinFullCloseFloor(result.CloseFraction, result.Symbol, hlLiveAll, posQty, posSide, price, onChain, peerVirtualQty, heldReason)
-	if outcome == hlSharedCloseFloorEscalate {
-		if refetch == nil {
-			outcome = hlSharedCloseFloorDefer
-		} else if fresh, err := refetch(); err != nil || !fresh.Known {
-			logger.Warn("Final full close %s: pre-escalation account refetch failed (%v) — deferring to the next cycle", result.Symbol, err)
-			outcome = hlSharedCloseFloorDefer
-		} else {
-			outcome, remainderUSD = evaluateSharedCoinFullCloseFloor(result.CloseFraction, result.Symbol, hlLiveAll, posQty, posSide, price, fresh, peerVirtualQty, heldReason)
-			if outcome != hlSharedCloseFloorEscalate {
-				logger.Warn("Final full close %s: the refetched account state no longer shows every peer flat — outcome %s", result.Symbol, outcome)
-			}
-		}
+	r := resolveSharedCloseFloorEscalation(result.CloseFraction, result.Symbol, hlLiveAll, posQty, posSide, price, onChain, peerVirtualQty, heldReason, refetch)
+	outcome, remainderUSD := r.Outcome, r.RemainderUSD
+	if r.RefetchFailed {
+		logger.Warn("Final full close %s: pre-escalation account refetch failed (%v) — deferring to the next cycle", result.Symbol, r.RefetchErr)
+	} else if r.SoughtEscalate && !r.RefetchMissing && outcome != hlSharedCloseFloorEscalate {
+		logger.Warn("Final full close %s: the refetched account state no longer shows every peer flat — outcome %s", result.Symbol, outcome)
 	}
 	switch outcome {
 	case hlSharedCloseFloorEscalate:
