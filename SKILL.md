@@ -153,7 +153,7 @@ journalctl -u go-trader -n 100 --no-pager
 
 **Startup probe.** Every unique check script runs with `--probe-only`. A non-zero result logs, DMs the owner, and exits with code 78 (`ExitProbeFailure`). Both unit files set `RestartPreventExitStatus=78 79 80`, so the service stays down instead of crash-looping. A probe failure right after an update almost always means `shared_scripts/` was not updated or the binary was not rebuilt — rerun `scripts/update.sh`.
 
-**Graceful shutdown.** The daemon drains side-effecting subprocesses for up to 15 seconds, then SIGKILLs; state save, notifier flush, and DB close run afterwards. The unit sets `TimeoutStopSec=20`. Service-file edits need `daemon-reload`.
+**Graceful shutdown.** The daemon drains side-effecting subprocesses for up to 15 seconds, then SIGKILLs; state save, notifier flush, and DB close run afterwards. The unit sets `TimeoutStopSec=20`. Service-file edits need `daemon-reload`; `scripts/update.sh --restart` runs it for you when it installs a changed shipped unit (see Auto-Update § Unit sync), so a shipped unit change reaches a deployment on the next update instead of waiting for a hand-run `install-service.sh`.
 
 ---
 
@@ -176,6 +176,8 @@ bash scripts/update.sh --all --restart [--update-all-root <parent-dir>]
 ```
 
 `scripts/update.sh` is the single source of truth for `git pull --ff-only` + `uv sync` + `go build`, all gated under `set -euo pipefail`. External deploy automation (Ansible, image bake) must call this script rather than reproduce the steps inline.
+
+**Unit sync.** With `--restart` in systemd mode, the `unit` phase (between the binary swap and the restart) compares the loaded unit file against the one this repo ships for the resolved unit name — `go-trader.service` for a plain unit, `systemd/go-trader@.service` for `go-trader@<instance>.service`. On a difference it keeps the loaded file as `<unit>.prev`, installs the shipped one with mode 0644, and runs `daemon-reload`; on a match that systemd has not reloaded it runs `daemon-reload` only; otherwise it does nothing. A rollback restores `<unit>.prev` and reloads before restarting the previous binary. Drop-ins under `<unit>.d/` are never written — `scripts/merge-paper-instance.sh` owns those. A unit name this repo does not ship is logged and skipped, never guessed; a fragment that is a symlink whose target differs is left to the operator; a unit loaded from outside `/etc/systemd/system` (vendor or generator) stops the update before the swap. `scripts/install-service.sh` is still the first-install path: it also creates `logs/`, enables the unit, and starts it.
 
 **`--rsync-from <src>`** replaces `git pull --ff-only` with an rsync from a source clone. It preserves `.git/`, `scheduler/config.json` (or its transition symlink), `state.db` and its WAL sidecars, `.venv/`, and the live binary. Use it when the deployment directory has local changes or was not cloned from origin. Before the restart it warns on stderr about any required `EnvironmentFile=` the unit declares but the disk does not have; optional entries prefixed with `-` are skipped silently.
 
@@ -1094,7 +1096,7 @@ Channels are `spot`, `options`, `<platform>`, `<platform>-paper`. `resolveChanne
 
 ### Build, deploy, and test mechanics
 
-- `scripts/update.sh --restart` is atomic: preflight → `pull --ff-only` (or `--rsync-from <src>`) → `uv sync` → build → probe → binary swap (previous kept as `.prev`) → restart and verify → rollback on timeout. `--all --restart` discovers deployments via `discover_deployment_dirs_from_systemd`. A one-off build is `go build -ldflags "-X main.Version=$(git describe --tags --always --dirty=-mod)" -o go-trader .`; config-only reload is `kill -HUP $(pgrep go-trader)` and Python picks the change up next cycle.
+- `scripts/update.sh --restart` is atomic: preflight → `pull --ff-only` (or `--rsync-from <src>`) → `uv sync` → build → probe → binary swap (previous kept as `.prev`) → unit install + `daemon-reload` (systemd mode; previous unit kept as `<unit>.prev`) → restart and verify → rollback on timeout, which restores both `.prev` files. `--all --restart` discovers deployments via `discover_deployment_dirs_from_systemd`. A one-off build is `go build -ldflags "-X main.Version=$(git describe --tags --always --dirty=-mod)" -o go-trader .`; config-only reload is `kill -HUP $(pgrep go-trader)` and Python picks the change up next cycle.
 - Post-update classification diffs `<running>..HEAD` per § Post-Update Agent Protocol.
 - Test placement: Go `_test.go` beside the file; Python `test_*.py`. Pure helpers to extract from subprocess wrappers include `perpsLiveOrderSize`, `*OrderSkipReason`, `parseXxxCloseOutput`, and the Sharpe computation. `shared_scripts/test_*.py` sits outside pytest `testpaths`; registry and sys.path tests import through `importlib.util.spec_from_file_location`.
 
