@@ -198,6 +198,7 @@ type manualCoreDeps struct {
 	// target strategy, so a paper command never blocks a live one.
 	lockManualActions           func(strategyID string) (release func(), err error)
 	reconcileCanceledProtection func(strategyID, symbol string, cancelOIDs []int64) error
+	recordRearmedStopLoss       func(strategyID, symbol, side string, qty float64, prevStopOID int64, result *HyperliquidStopLossUpdateResult) error
 }
 
 func (d manualCoreDeps) acquireManualActionLock(strategyID string) (func(), error) {
@@ -235,6 +236,9 @@ func newManualCoreDeps(cfg *Config, stateDB *StateStore, notifier *MultiNotifier
 		},
 		reconcileCanceledProtection: func(strategyID, symbol string, cancelOIDs []int64) error {
 			return reconcileCanceledExecuteProtectionInDB(cfg, stateDB, strategyID, symbol, cancelOIDs)
+		},
+		recordRearmedStopLoss: func(strategyID, symbol, side string, qty float64, prevStopOID int64, result *HyperliquidStopLossUpdateResult) error {
+			return recordRearmedStopLossInDB(cfg, stateDB, strategyID, symbol, side, qty, prevStopOID, result)
 		},
 		lockManualActions: func(strategyID string) (func(), error) {
 			return stateDB.manualActionLock(strategyID)
@@ -1084,7 +1088,7 @@ func manualCloseCore(d manualCoreDeps, sc StrategyConfig, in manualCloseInputs) 
 	}
 
 	if intentFullClose {
-		if pending, perr := pendingSLActionExists(d.stateDB, strategyID, sc.Symbol); perr != nil {
+		if pending, perr := pendingSLActionExists(d.stateDB, strategyID, sc.Symbol, pos); perr != nil {
 			return res, manualFailf("error: could not check for queued stop-loss edits (%v) — refusing the full close to avoid orphaning an on-chain order; retry once the scheduler is reachable", perr)
 		} else if pending {
 			return res, manualFailf("error: a stop-loss edit for %s/%s is queued and not yet applied — run the scheduler (`--once`) or wait for the next cycle before a full close (closing now would orphan the new stop-loss on-chain)", strategyID, sc.Symbol)
@@ -1119,6 +1123,13 @@ func manualCloseCore(d manualCoreDeps, sc StrategyConfig, in manualCloseInputs) 
 	if intentFullClose {
 		extraCancelOIDs = cloneInt64s(pos.TPOIDs)
 	}
+	protectionSnapshot := manualCloseProtectionSnapshot{
+		Symbol:      sc.Symbol,
+		Side:        pos.Side,
+		Quantity:    pos.Quantity,
+		StopLossOID: cancelOID,
+		TriggerPx:   pos.StopLossTriggerPx,
+	}
 
 	execResult, stderr, execErr := d.execute(
 		sc.Script, sc.Symbol, closeSide, closeQty,
@@ -1131,6 +1142,7 @@ func manualCloseCore(d manualCoreDeps, sc StrategyConfig, in manualCloseInputs) 
 	execResult, execErr = confirmHyperliquidExecuteFill(execResult, execErr)
 	if execErr != nil {
 		reconcileManualExecuteProtection(d, res, strategyID, sc.Symbol, execResult, requestedCancelOIDs)
+		restoreManualStopLossAfterFailedClose(d, res, sc, strategyID, protectionSnapshot, execResult, requestedCancelOIDs)
 		return res, manualFailf("error placing close order: %v", execErr)
 	}
 	if execResult.CancelStopLossError != "" {
@@ -1252,7 +1264,7 @@ func forceCloseCore(d manualCoreDeps, sc StrategyConfig, sym string, in forceClo
 
 	closeFullPosition := false
 	if intentFullClose {
-		if pending, perr := pendingSLActionExists(d.stateDB, strategyID, sym); perr != nil {
+		if pending, perr := pendingSLActionExists(d.stateDB, strategyID, sym, pos); perr != nil {
 			return res, manualFailf("error: could not check for queued stop-loss edits (%v) - refusing the full close to avoid orphaning an on-chain order; retry once the scheduler is reachable", perr)
 		} else if pending {
 			return res, manualFailf("error: a stop-loss edit for %s/%s is queued and not yet applied - run the scheduler (`--once`) or wait for the next cycle before a full close", strategyID, sym)
@@ -1552,7 +1564,7 @@ func resolveManualSLTargetCore(d manualCoreDeps, sc StrategyConfig, cmdName, str
 		return nil, "", manualFailf("error: %s for %s/%s — a manual stop-loss edit would be reverted on the next scheduler cycle.\n       To manage the stop-loss manually, opt the strategy out of auto-protection (set stop_loss_atr_mult: 0 and remove any trailing close).", reason, strategyID, symbol)
 	}
 
-	if pending, err := pendingSLActionExists(d.stateDB, strategyID, symbol); err != nil {
+	if pending, err := pendingSLActionExists(d.stateDB, strategyID, symbol, pos); err != nil {
 		return nil, "", manualFailf("error: could not check for queued stop-loss edits (%v) — refusing to avoid orphaning an on-chain order; retry once the scheduler is reachable", err)
 	} else if pending {
 		return nil, "", manualFailf("error: a stop-loss edit for %s/%s is already queued and not yet applied — run the scheduler (`--once`) or wait for the next cycle before editing again (a second edit now would orphan the first stop-loss on-chain)", strategyID, symbol)

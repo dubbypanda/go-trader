@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -90,6 +91,24 @@ func (ss *StatusServer) daemonManualCoreDeps(cfg *Config) manualCoreDeps {
 			return nil
 		}
 		clearHyperliquidProtectionOIDsMatching(position, cancelOIDs)
+		return ss.stateDB.SaveStrategyBook(strategy)
+	}
+	d.recordRearmedStopLoss = func(strategyID, symbol, side string, qty float64, prevStopOID int64, result *HyperliquidStopLossUpdateResult) error {
+		if result == nil {
+			return nil
+		}
+		logger := strategyLoggerOrStdout(cfg.LogDir, strategyID)
+		defer logger.Close()
+		ss.mu.Lock()
+		defer ss.mu.Unlock()
+		if ss.state == nil {
+			return fmt.Errorf("state unavailable")
+		}
+		strategy := ss.state.Strategies[strategyID]
+		if strategy == nil {
+			return nil
+		}
+		applyTrailingStopUpdateResult(strategy, symbol, side, prevStopOID, 0, false, result, "manual_close_rearm_sl_immediate", logger, qty)
 		return ss.stateDB.SaveStrategyBook(strategy)
 	}
 	return d
@@ -309,4 +328,13 @@ func (ss *StatusServer) handleAPIStrategyTradeAction(w http.ResponseWriter, r *h
 		return
 	}
 	writeJSON(w, uiTradeActionResponse{OK: true, Queued: res.queued, Message: res.uiMessage()})
+}
+
+func strategyLoggerOrStdout(logDir, strategyID string) *StrategyLogger {
+	if logMgr, err := NewLogManager(logDir); err == nil {
+		if logger, lerr := logMgr.GetStrategyLogger(strategyID); lerr == nil {
+			return logger
+		}
+	}
+	return &StrategyLogger{stratID: strategyID, writer: os.Stdout}
 }

@@ -13,7 +13,7 @@ Guardrails only. Mechanism: SKILL.md § Subsystem Mechanism Reference; flows: SK
 ## Repo (`scheduler/` = one Go `package main`)
 - `executor.go`/`shutdown.go`: **side-effecting wrappers use `runPythonSideEffect`, NEVER `runPython`.** `confirmHyperliquidExecuteFill` gates each live HL book: finite `AvgPx>0`+`TotalSz>0` in `Execution.Fill`, else no book; `check_hyperliquid.py execute` exits 1 on no fill.
 - `server.go`/`ui_*.go`: **lock order `mu > strategiesMu`**. **Loopback only.** `/tuning` never writes config; `ui_tuning.go` uses `spawnPythonProcessWithEnv` (NEVER `runPython*`); `POST /api/tuning/apply` = sole promotion.
-- `config.go`/`config_migration.go`: `CurrentConfigVersion=19`, `MinSupportedConfigVersion=13`; 7 exclusive HL stop fields (none → `DefaultStopLossATRMult=1.0`); `close_strategy` canonical, unknown-key guard. `strategyUsesTieredTPATRClose(sc)` gates on-chain TPs, NOT `len(tiers)>0`. `CircuitBreaker *bool` ONLY via accessors. `portfolio_risk.paper`: evaluators use `scopeRiskConfig`, nested `paper` rejected.
+- `config.go`/`config_migration.go`: `CurrentConfigVersion=19`, `MinSupportedConfigVersion=13`; 7 exclusive HL stop fields (none → `DefaultStopLossATRMult=1.0`); `close_strategy` canonical, unknown-key guard. On-chain TP gate is NOT `len(tiers)>0`. `CircuitBreaker *bool` ONLY via accessors. `portfolio_risk.paper`: evaluators use `scopeRiskConfig`, nested `paper` rejected.
 - `close_defaults.go`: system>user>strategy, explicit `tp_tiers` wins; `applyUserCloseDefaultRatchetRegimeTrails` runs in `loadConfig` **before** the scalar ATR-stop default.
 - `portfolio_scope.go`: `PortfolioScope` from `isLiveArgs` = **sole mode classifier**; `activeScopes` evaluates ONLY configured scopes. New portfolio-wide surface: subset via `filterStatesByScope`/`strategiesInScope`, never whole roster.
 - `state.go`/`db.go`: SQLite-only, idempotent migrations. `AppState.PortfolioRisk`/`CorrelationSnapshot` = per-scope maps read only via `scopeRisk`/`scopeRiskIfPresent`/`scopeCorrelation`. `initial_capital` only via `SetInitialCapital`.
@@ -27,14 +27,14 @@ Guardrails only. Mechanism: SKILL.md § Subsystem Mechanism Reference; flows: SK
 - `hyperliquid_fills.go`: fill resolver built **outside `mu.Lock`**; `HLFillLookup.Px`=VWAP; `ClosedPnLGross` never into `Trade.RealizedPnL`; unconfirmed SL fills = gaps, never books.
 - `hyperliquid_balance.go`: reconciliation-close alerts outside `mu`, hedge-leg rows never reach public route.
 - `pause.go`: paused is NOT a `dueStrategies` skip. `pausedBlocksSignal` holds position-increasing signals at all 6 regime-gated dispatch sites (+per-scope persistence hold); closes/trailing SL/ratchet/protection pass.
-- Regime (`regime*.go`): stamp all 5 execute dispatches; strip `sl_after` before ATR parse; `regime_unified.go` owns SL; directional policy DEFAULT-OFF, exact-match certs; profile allocation flat-only; dynamic/divergence HL-live-only.
+- Regime (`regime*.go`): stamp all 5 execute dispatches; strip `sl_after` before ATR parse; `regime_unified.go` owns SL; directional policy DEFAULT-OFF; profile allocation flat-only; dynamic/divergence HL-live-only.
 - `trailing_tp_ratchet.go`: **NO on-chain TP**; HL perps+`manual`, hot-reload blocked while open.
 - `hedge.go`: HL perps only; ONE reconciler (`hedgeTargetDecision`+`runHedgeSync`), ownership `Position.HedgeFor` ONLY; hedge PnL: `RecordHedgeTradeResult`, never `RecordTradeResult`; fail-closed unwind + CRITICAL DM; hot-reload blocked while open, backtester rejects.
 - `hurst_gate.go`: **DEFAULT-OFF**, no shipped threshold, `config.example.json` clean; holds position-increasing signals only, fail-closed FLAT-ONLY; `metrics["hurst"]` ONLY from composite classifier; keep in `run_backtest.py` `stop_keys`.
 - `llm_entry_analysis.go`: advisory-only; `spawnPythonProcess` NEVER `runPython*`; sole writer of `trade_diagnostics.llm_verdict`, `trade_diagnostics*.go` never.
-- `scale_in.go`: geometry frozen via `RiskAnchorPrice`, never blended `AvgCost`. `manual*.go`: kill-switch+CB gated; SL edits queue `PendingManualAction`, NEVER a direct UPDATE; `force-close` live HL perps only.
+- `scale_in.go`: geometry frozen via `RiskAnchorPrice`, never blended `AvgCost`. `manual*.go`: kill-switch+CB gated; SL edits queue `PendingManualAction`, never a bare book write; only the re-arm also writes it; a rejected close never assumes an unconfirmed cancel spared the trigger; verify-first restore, unverified = CRITICAL; adopted SL edits never gate; `force-close` live HL perps only.
 - `hyperliquid_liquidation_guard.go`: **CLAMP, never refuse to arm; ONE-WAY TIGHTEN** at 0.5% buffer; 0 = unknown, never persisted; unclampable REFUSES, unreadable outcome keeps state. Boot `validateHLStopWithinBankruptcyBound` mirrors `LoadConfig` stop-owner resolution.
-- `hyperliquid_protection.go`: reduce-only, on-chain TP only when `strategyUsesTieredTPATRClose` AND live (paper never); `hyperliquid_open_trailing.go` arms SL at open. `hyperliquid_shared_close_floor.go`: <$10 shared-coin full close escalates ONLY if each peer is flat on-chain (refetched, raw keys) AND in book, before SL blocks; else ONE alert+hold, `venue_rejected` never resends; same-cycle re-arm (all 7 owners) ONLY after a SUBMITTED order that REQUESTED the cancel; 2nd escalated refusal holds, any wording.
+- `hyperliquid_protection.go`: reduce-only, on-chain TP needs `strategyUsesTieredTPATRClose` AND live (paper never); `hyperliquid_open_trailing.go` arms SL at open. `hyperliquid_shared_close_floor.go`: <$10 shared-coin full close escalates ONLY if each peer is flat on-chain (refetched, raw keys) AND in book, before SL blocks; else ONE alert+hold, `venue_rejected` never resends; same-cycle re-arm (all 7 owners) ONLY after a SUBMITTED order that REQUESTED the cancel; 2nd escalated refusal holds, any wording.
 - `version_probe.go`/`probe_cmd.go`: new runtime CLI flag > both probe argvs. `agent_info.go`: `--bootstrap-md` → `AGENTS.generated.md`, NEVER `AGENTS.md`.
 - `failure_alerts.go`: wire notifier on each new `run*Check`. `discord_*commands.go`: new mutating command: `opsCommandNames`+`slashCommands()`+dispatch.
 - `shared_wallet*.go`: PRE-FEE `realized_pnl`, net via `tradeNetPnL*`. Pool budgeting: 2+ live HL/OKX perps omit capital fields, positive `margin_per_trade_usd` each; allocated↔pool flat-only. `cashflow_journal.go` OUTSIDE `mu`.
@@ -45,7 +45,7 @@ Guardrails only. Mechanism: SKILL.md § Subsystem Mechanism Reference; flows: SK
 
 ## Patterns
 - Git from repo root; `go -C scheduler build .`, never `cd scheduler &&`.
-- New platform: SKILL.md § Custom Platform Integration lists touchpoints. Adapters load via `importlib`, class `endswith("ExchangeAdapter")`; check scripts: public methods only.
+- New platform: touchpoints in SKILL.md § Custom Platform Integration. Adapters load via `importlib`, class `endswith("ExchangeAdapter")`; check scripts: public methods only.
 - Subprocess contract: JSON on stdout, exit 1 on error; Go parses regardless.
 - Locking: `mu sync.RWMutex`, 6 phases (RLock > Lock(CheckRisk) > no-lock subprocess > Lock(execute) > marks > RLock(status)). Skip-reason checks BEFORE spawn; capture `posSide` with `posQty` in Phase 1; `liveExecFailed` guards live exec.
 - Dispatch by `s.Platform`, never ID prefix. Perps paper=`ExecuteSpotSignalWithFillFee`, live=`RunHyperliquidExecute`; futures=`ExecuteFuturesSignalWithFillFee`.
@@ -65,7 +65,7 @@ Guardrails only. Mechanism: SKILL.md § Subsystem Mechanism Reference; flows: SK
 - `Closes #<N>` in body; never bare `#N` in lists. Title `type(#<N>): summary [C<score>, <model>, <effort>]` (`, fableplan` if Fable planned). Body: `## Plain simple English` (<55 words) first, then `## Summary` + verification.
 - Commits, PR and issue bodies end `LLM: <model> | <effort> | Harness: <action>`, no `Co-authored-by` trailer.
 - Bot reviews land on issue-comments endpoint; before merging a long-lived PR diff `origin/main..HEAD` for reverts.
-- Review format SSoT: rk-skills `pr-review-format.md` + `.github/prompts/pr-review-format-local.md`, reviews never gate on CI.
+- Review format: rk-skills `pr-review-format.md` + `.github/prompts/pr-review-format-local.md`, reviews never gate on CI.
 - Review findings: restate as invariant, list breaking states (inverse, compound), add class tests.
 - `.github/workflows/claude.yml`: least-privilege split; mode routing fail-closed (untrusted/fork = review); no-execution ban in agent, commit/push implement-mode only; prompt never holds `"`, `` ` ``, `$`; `.github/scripts/` keeps ONLY `test_workflow_logic.py`.
 
@@ -79,17 +79,17 @@ Guardrails only. Mechanism: SKILL.md § Subsystem Mechanism Reference; flows: SK
 - Post-update: SKILL.md § Post-Update Agent Protocol. After a Python-launcher change smoke `./go-trader --once` (daemon stopped).
 
 ## Backtest
-- Harness map `docs/backtesting-registry.md`: update its row in the PR adding/deprecating it.
+- Harness map `docs/backtesting-registry.md`: update its row in the adding/deprecating PR.
 - `--config` gates on `config_version>=15`; entry ATR guard 50% of AvgCost, SL-vs-TP races default `ohlc_walk`.
 - Look-ahead: bar N signal fills at N+1 open; regime gate reads N-1, closes use closed-bar ATR. **HTF series indexed by candle OPEN time MUST `.shift(1)` BEFORE `reindex(…, method="ffill")`.**
 - Backtester rejects HL-live-only closes (`regime_window_divergence`, `tiered_tp_atr_live_regime_dynamic`); options regime gating unsupported.
 - M1–M6, auto_suggest, regime promotion, `tune_live.py` = SUGGEST-ONLY: **never write live defaults, config or PRs.**
 
 ## Testing
-- New functionality and each bug fix need a test guarding a behavior contract (money, state, protection, subprocess contracts, migration, backtest parity). Assert outcomes; pin only operator-decision wording; no constants or round-trips, table-driven variants.
-- **Test budget.** Only that contract list; max one table-driven test per new function; none asserting only wording, a constant or a round-trip (operator-decision wording aside). `check_test_budget.py` fails CI on a wording-only test outside `scripts/test_budget_baseline.json` or a stale entry; entries only for operator-decision wording; `--write-baseline` after a delete.
+- Each new feature and bug fix needs a test guarding a behavior contract (money, state, protection, subprocess contracts, migration, backtest parity). Assert outcomes; pin only operator-decision wording; no constants or round-trips, table-driven variants.
+- **Test budget.** Only that contract list; max one table-driven test per new function. `check_test_budget.py` fails CI on a wording-only test outside `scripts/test_budget_baseline.json` or a stale entry; entries only for operator-decision wording; `--write-baseline` after a delete.
 - Go CI never spawns Python: pure helpers out of subprocess wrappers; Go tests check `json.Unmarshal` errors.
-- `go build`/`go test ./...` from repo root; `gofmt -w` after edits; tabbed Go edits: Python `replace(old,new,1)`.
+- `go test ./...` after edits, then `gofmt -w`; tabbed Go edits: Python `replace(old,new,1)`.
 - Pytest: `uv run --no-sync python -m pytest shared_strategies/ shared_tools/ platforms/ backtest/`; `shared_scripts/test_*.py` by path; Registry/sys.path tests: FULL suite. CI `-n auto`: never bare-`import` an ambiguous name; intermittent failure = isolation, not flake.
 - `stampEntryATRIfOpened` rejects ATR > 50% of AvgCost. Strategy tests assert real signal values, smoke tests need `DatetimeIndex`.
 - `tiered_tp_atr`/`trailing_stop_atr_mult` need `Position.EntryATR`; `*_live` recompute via `atr_source`; `avwap_stop` = virtual exit only.
