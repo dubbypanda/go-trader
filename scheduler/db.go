@@ -254,6 +254,9 @@ CREATE TABLE IF NOT EXISTS pending_manual_actions (
     realized_pnl REAL NOT NULL DEFAULT 0,
     is_full_close INTEGER NOT NULL DEFAULT 0,
     tp_oids_json TEXT NOT NULL DEFAULT '',
+    prev_tp_oids_json TEXT NOT NULL DEFAULT '',
+    tp_armed_tiers_json TEXT NOT NULL DEFAULT '',
+    position_id TEXT NOT NULL DEFAULT '',
     ratchet_fallback_normalize_pending INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
@@ -598,6 +601,9 @@ func (sdb *StateDB) migrateSchema() error {
 		"ALTER TABLE portfolio_risk ADD COLUMN kill_switch_close_applied INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE positions ADD COLUMN shared_close_hold_usd REAL NOT NULL DEFAULT 0",
 		"ALTER TABLE positions ADD COLUMN shared_close_hold_reason TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE pending_manual_actions ADD COLUMN prev_tp_oids_json TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE pending_manual_actions ADD COLUMN tp_armed_tiers_json TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE pending_manual_actions ADD COLUMN position_id TEXT NOT NULL DEFAULT ''",
 	}
 	for _, ddl := range migrations {
 		if _, err := sdb.db.Exec(ddl); err != nil {
@@ -1790,10 +1796,15 @@ func enqueueFlushedDiagnostics(rows []TradeDiagnosticsRow) {
 }
 
 func (sdb *StateDB) SaveStrategyBook(s *StrategyState) error {
-	return sdb.saveStrategyBookWithAcks(s, scopeUnassigned, nil)
+	return sdb.saveStrategyBookWithAcks(s, scopeUnassigned, nil, nil)
 }
 
-func (sdb *StateDB) saveStrategyBookWithAcks(s *StrategyState, scope PortfolioScope, ackIDs []int64) error {
+// saveStrategyBookWithAcks persists one strategy's book, acknowledges the
+// manual actions the caller applied, and — when queue is set — inserts that
+// queued action in the same transaction. A book change that hands a restored
+// order id to the daemon must never be durable without the row that names it,
+// so both writes commit together or neither does.
+func (sdb *StateDB) saveStrategyBookWithAcks(s *StrategyState, scope PortfolioScope, ackIDs []int64, queue *PendingManualAction) error {
 	if sdb == nil || sdb.db == nil {
 		return fmt.Errorf("state db unavailable")
 	}
@@ -2010,6 +2021,16 @@ func (sdb *StateDB) saveStrategyBookWithAcks(s *StrategyState, scope PortfolioSc
 
 	if err := deletePendingManualActionsByID(tx, ackIDs); err != nil {
 		return err
+	}
+
+	if queue != nil {
+		queueSID, err := sdb.toStorageID(queue.StrategyID)
+		if err != nil {
+			return err
+		}
+		if err := insertPendingManualActionRow(tx, queueSID, *queue); err != nil {
+			return fmt.Errorf("queue manual action %s for %s: %w", queue.Action, queue.StrategyID, err)
+		}
 	}
 
 	if storeCommitHook != nil {
@@ -2867,6 +2888,9 @@ type PendingManualAction struct {
 	RealizedPnL                     float64
 	IsFullClose                     bool
 	TPOIDs                          []int64
+	PrevTPOIDs                      []int64
+	TPArmedTiers                    []bool
+	PositionID                      string
 	RatchetFallbackNormalizePending bool
 	CreatedAt                       time.Time
 
@@ -2877,6 +2901,17 @@ func (sdb *StateDB) InsertPendingManualAction(a PendingManualAction) error {
 	if sdb == nil || sdb.db == nil {
 		return fmt.Errorf("state db unavailable")
 	}
+	sid, err := sdb.toStorageID(a.StrategyID)
+	if err != nil {
+		return err
+	}
+	return insertPendingManualActionRow(sdb.db, sid, a)
+}
+
+func insertPendingManualActionRow(exec sqlExecer, sid string, a PendingManualAction) error {
+	if exec == nil {
+		return fmt.Errorf("state db unavailable")
+	}
 	isFullClose := 0
 	if a.IsFullClose {
 		isFullClose = 1
@@ -2885,16 +2920,13 @@ func (sdb *StateDB) InsertPendingManualAction(a PendingManualAction) error {
 	if a.RatchetFallbackNormalizePending {
 		ratchetFallbackNormalizePending = 1
 	}
-	sid, err := sdb.toStorageID(a.StrategyID)
-	if err != nil {
-		return err
-	}
-	_, err = sdb.db.Exec(`INSERT INTO pending_manual_actions
-		(strategy_id, action, symbol, side, quantity, fill_price, fill_fee, exchange_order_id, stop_loss_oid, stop_loss_trigger_px, entry_atr, atr_method, realized_pnl, is_full_close, tp_oids_json, ratchet_fallback_normalize_pending, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := exec.Exec(`INSERT INTO pending_manual_actions
+		(strategy_id, action, symbol, side, quantity, fill_price, fill_fee, exchange_order_id, stop_loss_oid, stop_loss_trigger_px, entry_atr, atr_method, realized_pnl, is_full_close, tp_oids_json, prev_tp_oids_json, tp_armed_tiers_json, position_id, ratchet_fallback_normalize_pending, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sid, a.Action, a.Symbol, a.Side, a.Quantity, a.FillPrice, a.FillFee,
 		a.ExchangeOrderID, a.StopLossOID, a.StopLossTriggerPx, a.EntryATR, a.ATRMethod, a.RealizedPnL,
-		isFullClose, marshalTPOIDsJSON(a.TPOIDs), ratchetFallbackNormalizePending, formatTime(a.CreatedAt))
+		isFullClose, marshalTPOIDsJSON(a.TPOIDs), marshalTPOIDsJSON(a.PrevTPOIDs), marshalTPArmedTiersJSON(a.TPArmedTiers),
+		a.PositionID, ratchetFallbackNormalizePending, formatTime(a.CreatedAt))
 	return err
 }
 
@@ -2902,7 +2934,7 @@ func (sdb *StateDB) LoadPendingManualActions() ([]PendingManualAction, error) {
 	if sdb == nil || sdb.db == nil {
 		return nil, nil
 	}
-	rows, err := sdb.db.Query(`SELECT id, strategy_id, action, symbol, side, quantity, fill_price, fill_fee, exchange_order_id, stop_loss_oid, stop_loss_trigger_px, entry_atr, COALESCE(atr_method, '') AS atr_method, realized_pnl, COALESCE(is_full_close, 0) AS is_full_close, COALESCE(tp_oids_json, '') AS tp_oids_json, COALESCE(ratchet_fallback_normalize_pending, 0) AS ratchet_fallback_normalize_pending, created_at FROM pending_manual_actions ORDER BY id`)
+	rows, err := sdb.db.Query(`SELECT id, strategy_id, action, symbol, side, quantity, fill_price, fill_fee, exchange_order_id, stop_loss_oid, stop_loss_trigger_px, entry_atr, COALESCE(atr_method, '') AS atr_method, realized_pnl, COALESCE(is_full_close, 0) AS is_full_close, COALESCE(tp_oids_json, '') AS tp_oids_json, COALESCE(prev_tp_oids_json, '') AS prev_tp_oids_json, COALESCE(tp_armed_tiers_json, '') AS tp_armed_tiers_json, COALESCE(position_id, '') AS position_id, COALESCE(ratchet_fallback_normalize_pending, 0) AS ratchet_fallback_normalize_pending, created_at FROM pending_manual_actions ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("load pending manual actions: %w", err)
 	}
@@ -2913,12 +2945,16 @@ func (sdb *StateDB) LoadPendingManualActions() ([]PendingManualAction, error) {
 		var createdStr string
 		var isFullCloseInt int
 		var tpOIDsJSON string
+		var prevTPOIDsJSON string
+		var tpArmedTiersJSON string
 		var ratchetFallbackNormalizePending int
-		if err := rows.Scan(&a.ID, &a.StrategyID, &a.Action, &a.Symbol, &a.Side, &a.Quantity, &a.FillPrice, &a.FillFee, &a.ExchangeOrderID, &a.StopLossOID, &a.StopLossTriggerPx, &a.EntryATR, &a.ATRMethod, &a.RealizedPnL, &isFullCloseInt, &tpOIDsJSON, &ratchetFallbackNormalizePending, &createdStr); err != nil {
+		if err := rows.Scan(&a.ID, &a.StrategyID, &a.Action, &a.Symbol, &a.Side, &a.Quantity, &a.FillPrice, &a.FillFee, &a.ExchangeOrderID, &a.StopLossOID, &a.StopLossTriggerPx, &a.EntryATR, &a.ATRMethod, &a.RealizedPnL, &isFullCloseInt, &tpOIDsJSON, &prevTPOIDsJSON, &tpArmedTiersJSON, &a.PositionID, &ratchetFallbackNormalizePending, &createdStr); err != nil {
 			return nil, fmt.Errorf("scan pending manual action: %w", err)
 		}
 		a.IsFullClose = isFullCloseInt != 0
 		a.TPOIDs = parseTPOIDsJSON(tpOIDsJSON, 0, 0)
+		a.PrevTPOIDs = parseTPOIDsJSON(prevTPOIDsJSON, 0, 0)
+		a.TPArmedTiers = parseTPArmedTiersJSON(tpArmedTiersJSON)
 		a.RatchetFallbackNormalizePending = ratchetFallbackNormalizePending != 0
 		a.CreatedAt = parseTime(createdStr)
 		a.StrategyID = sdb.fromStorageID(a.StrategyID)

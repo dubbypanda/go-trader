@@ -741,10 +741,13 @@ func main() {
 		channelTradeDetails := make(map[string][]string)
 
 		mu.Lock()
-		manualAlerts := drainPendingManualActions(state, cfg, store)
+		manualAlerts, manualCriticals := drainPendingManualActions(state, cfg, store)
 		mu.Unlock()
 		for _, ma := range manualAlerts {
 			sendTradeAlerts(ma.sc, ma.ss, ma.trades, &mu, notifier)
+		}
+		for _, critical := range manualCriticals {
+			notifyManualCloseRearmFailure(notifier, critical)
 		}
 
 		limitAlerts := reconcilePendingLimitOrders(state, cfg, store, &mu, notifier, logMgr)
@@ -2353,7 +2356,7 @@ func main() {
 							mu.Unlock()
 						}
 						if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 {
-							if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin); fillPx > 0 {
+							if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull); fillPx > 0 {
 								trades++
 								detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
 							}
@@ -2460,7 +2463,7 @@ func main() {
 								}
 							}
 							if execResult != nil && trades > 0 {
-								if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin); fillPx > 0 {
+								if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull); fillPx > 0 {
 									trades++
 									detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
 								}
@@ -2610,7 +2613,7 @@ func main() {
 						break
 					}
 					if pos != nil && hyperliquidIsLive(sc.Args) {
-						if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, sc.Symbol, &mu, notifier, logger, "HL manual protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin); fillPx > 0 {
+						if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, sc.Symbol, &mu, notifier, logger, "HL manual protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull); fillPx > 0 {
 							trades++
 							detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, sc.Symbol, fillPx)
 						}
