@@ -39,6 +39,106 @@ if [[ "$warn_out" == *'optional.env'* || "$warn_out" == *'ignore_errors'* ]]; th
     exit 1
 fi
 
+unit_src_cases=(
+    "go-trader|/repo/go-trader.service|bare default unit name resolves the plain shipped unit"
+    "go-trader.service|/repo/go-trader.service|plain unit name resolves the plain shipped unit"
+    "go-trader@live.service|/repo/systemd/go-trader@.service|instance unit resolves the shipped template"
+    "go-trader@paper-testing|/repo/systemd/go-trader@.service|instance unit without suffix resolves the template"
+    "go-trader-2.service||a unit name we do not ship yields no source"
+    "go-trader@.service||a template with no instance yields no source"
+    "go-trader@../etc/passwd||a traversal instance name yields no source"
+    "go-trader.socket||a non-service unit yields no source"
+    "||an empty unit name yields no source"
+)
+for row in "${unit_src_cases[@]}"; do
+    IFS='|' read -r case_unit case_want case_msg <<<"$row"
+    assert_eq "$(update_unit_source_path /repo "$case_unit")" "$case_want" "unit source: $case_msg"
+done
+assert_eq "$(update_unit_source_path /repo/ go-trader)" "/repo/go-trader.service" \
+    "unit source: a trailing slash on the repo root does not double up"
+assert_eq "$(update_unit_source_path '' go-trader)" "" "unit source: an empty repo root yields no source"
+
+assert_eq "$(update_unit_fragment_scope /etc/systemd/system/go-trader.service)" "etc" \
+    "fragment scope: an operator unit under /etc/systemd/system is ours"
+assert_eq "$(update_unit_fragment_scope /usr/lib/systemd/system/go-trader.service)" "other" \
+    "fragment scope: a vendor unit is not ours"
+assert_eq "$(update_unit_fragment_scope /run/systemd/generator/go-trader.service)" "other" \
+    "fragment scope: a generator unit is not ours"
+assert_eq "$(update_unit_fragment_scope /etc/systemd/system/go-trader.service.d/50-override.conf)" "other" \
+    "fragment scope: a drop-in path is not a fragment we install over"
+assert_eq "$(update_unit_fragment_scope etc/systemd/system/go-trader.service)" "other" \
+    "fragment scope: a relative path is not ours"
+assert_eq "$(update_unit_fragment_scope '')" "" "fragment scope: no fragment path yields no scope"
+
+unit_sync_dir=$(mktemp -d)
+mkdir -p "$unit_sync_dir/etc" "$unit_sync_dir/repo"
+printf 'shipped\n' >"$unit_sync_dir/repo/go-trader.service"
+printf 'stale\n' >"$unit_sync_dir/etc/go-trader.service"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/go-trader.service" "$unit_sync_dir/repo/go-trader.service" no)" \
+    "install" "sync decision: a differing installed unit is installed"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/absent.service" "$unit_sync_dir/repo/go-trader.service" no)" \
+    "install" "sync decision: a missing installed unit is installed"
+printf 'shipped\n' >"$unit_sync_dir/etc/go-trader.service"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/go-trader.service" "$unit_sync_dir/repo/go-trader.service" yes)" \
+    "reload" "sync decision: a matching unit systemd has not reloaded only reloads"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/go-trader.service" "$unit_sync_dir/repo/go-trader.service" no)" \
+    "none" "sync decision: a matching, loaded unit needs nothing"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/go-trader.service" "$unit_sync_dir/repo/absent.service" yes)" \
+    "none" "sync decision: no shipped source means no install and no reload"
+assert_eq "$(update_unit_sync_decision "" "$unit_sync_dir/repo/go-trader.service" yes)" \
+    "none" "sync decision: an unresolved fragment path means no install and no reload"
+printf 'operator\n' >"$unit_sync_dir/etc/linked-target.service"
+ln -s "$unit_sync_dir/etc/linked-target.service" "$unit_sync_dir/etc/linked.service"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/linked.service" "$unit_sync_dir/repo/go-trader.service" no)" \
+    "skip" "sync decision: a symlinked fragment that differs is left to the operator, never flattened"
+printf 'shipped\n' >"$unit_sync_dir/etc/linked-target.service"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/linked.service" "$unit_sync_dir/repo/go-trader.service" yes)" \
+    "reload" "sync decision: a symlinked fragment already carrying the shipped unit still reloads"
+ln -s "$unit_sync_dir/etc/no-such-target.service" "$unit_sync_dir/etc/dangling.service"
+assert_eq "$(update_unit_sync_decision "$unit_sync_dir/etc/dangling.service" "$unit_sync_dir/repo/go-trader.service" no)" \
+    "skip" "sync decision: a dangling symlink is left to the operator"
+
+UPDATE_UNIT_SUDO=""
+mkdir -p "$unit_sync_dir/etc/go-trader.service.d"
+printf '[Service]\nEnvironment=X=1\n' >"$unit_sync_dir/etc/go-trader.service.d/50-merge-paper.conf"
+dropin_before=$(cat "$unit_sync_dir/etc/go-trader.service.d/50-merge-paper.conf")
+printf 'stale\n' >"$unit_sync_dir/etc/go-trader.service"
+printf 'shipped v2\n' >"$unit_sync_dir/repo/go-trader.service"
+unit_backup=$(update_unit_install_with_backup "$unit_sync_dir/etc/go-trader.service" "$unit_sync_dir/repo/go-trader.service") \
+    || { echo "FAIL: unit install with backup returned non-zero" >&2; exit 1; }
+assert_eq "$unit_backup" "$unit_sync_dir/etc/go-trader.service.prev" \
+    "unit install: the replaced unit is retained beside it as .prev"
+assert_eq "$(cat "$unit_sync_dir/etc/go-trader.service")" "shipped v2" "unit install: the shipped unit is on disk"
+assert_eq "$(cat "$unit_backup")" "stale" "unit install: the backup holds the replaced unit"
+assert_eq "$(cat "$unit_sync_dir/etc/go-trader.service.d/50-merge-paper.conf")" "$dropin_before" \
+    "unit install: operator drop-ins are untouched"
+assert_eq "$(stat -c '%a' "$unit_sync_dir/etc/go-trader.service" 2>/dev/null || stat -f '%Lp' "$unit_sync_dir/etc/go-trader.service")" \
+    "644" "unit install: the installed unit is world-readable 0644"
+
+update_unit_restore_backup "$unit_sync_dir/etc/go-trader.service" "$unit_backup" \
+    || { echo "FAIL: unit restore returned non-zero" >&2; exit 1; }
+assert_eq "$(cat "$unit_sync_dir/etc/go-trader.service")" "stale" "unit restore: rollback puts the previous unit back"
+[[ ! -e "$unit_backup" ]] || { echo "FAIL: unit restore left the .prev backup behind" >&2; exit 1; }
+assert_eq "$(cat "$unit_sync_dir/etc/go-trader.service.d/50-merge-paper.conf")" "$dropin_before" \
+    "unit restore: operator drop-ins are untouched"
+update_unit_restore_backup "$unit_sync_dir/etc/go-trader.service" "$unit_backup" && restore_rc=0 || restore_rc=$?
+assert_eq "$restore_rc" "1" "unit restore: a missing backup fails instead of clobbering the unit"
+
+unit_no_prev=$(update_unit_install_with_backup "$unit_sync_dir/etc/fresh.service" "$unit_sync_dir/repo/go-trader.service") \
+    || { echo "FAIL: unit install onto a missing unit returned non-zero" >&2; exit 1; }
+assert_eq "$unit_no_prev" "" "unit install: no backup is made when there was no installed unit"
+[[ ! -e "$unit_sync_dir/etc/fresh.service.prev" ]] || { echo "FAIL: unit install invented a .prev for a missing unit" >&2; exit 1; }
+update_unit_install_with_backup "$unit_sync_dir/etc/go-trader.service" "$unit_sync_dir/repo/absent.service" && install_rc=0 || install_rc=$?
+assert_eq "$install_rc" "1" "unit install: a missing shipped source refuses"
+assert_eq "$(cat "$unit_sync_dir/etc/go-trader.service")" "stale" "unit install: a refused install leaves the unit as it was"
+unset UPDATE_UNIT_SUDO
+rm -rf "$unit_sync_dir"
+
+assert_eq "$(update_unit_source_path "$SCRIPT_DIR/.." go-trader)" "$SCRIPT_DIR/../go-trader.service" \
+    "unit source: the plain mapping names a file this repo ships"
+[[ -f "$SCRIPT_DIR/../go-trader.service" ]] || { echo "FAIL: shipped plain unit missing" >&2; exit 1; }
+[[ -f "$SCRIPT_DIR/../systemd/go-trader@.service" ]] || { echo "FAIL: shipped template unit missing" >&2; exit 1; }
+
 assert_eq "$(update_signal_redirect_decision active /opt/go-trader/go-trader /opt/go-trader/go-trader)" \
     "redirect" "active unit running this binary -> redirect"
 assert_eq "$(update_signal_redirect_decision active /opt/other/go-trader /opt/go-trader/go-trader)" \

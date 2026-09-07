@@ -35,6 +35,98 @@ warn_missing_systemd_environment_files() {
         | warn_missing_systemd_environment_files_from_text "$unit"
 }
 
+update_unit_source_path() {
+    local repo_root="${1%/}" unit="$2"
+    [[ -n "$repo_root" && -n "$unit" ]] || { printf ''; return 0; }
+    if [[ "$unit" != *.* ]]; then
+        unit="${unit}.service"
+    fi
+    if [[ "$unit" != *.service ]]; then
+        printf ''
+        return 0
+    fi
+    local base="${unit%.service}"
+    if [[ "$base" == "go-trader" ]]; then
+        printf '%s/go-trader.service' "$repo_root"
+        return 0
+    fi
+    if [[ "$base" == go-trader@* ]]; then
+        local instance="${base#go-trader@}"
+        if [[ "$(update_validate_instance_name "$instance")" == "ok" ]]; then
+            printf '%s/systemd/go-trader@.service' "$repo_root"
+            return 0
+        fi
+    fi
+    printf ''
+}
+
+update_unit_fragment_scope() {
+    local path="$1"
+    [[ -n "$path" ]] || { printf ''; return 0; }
+    if [[ "$path" != /* ]]; then
+        printf 'other'
+        return 0
+    fi
+    if [[ "${path%/*}" == "/etc/systemd/system" ]]; then
+        printf 'etc'
+    else
+        printf 'other'
+    fi
+}
+
+update_unit_sync_decision() {
+    local installed="$1" source_path="$2" needs_reload="$3"
+    [[ -n "$installed" && -n "$source_path" ]] || { printf 'none'; return 0; }
+    [[ -f "$source_path" ]] || { printf 'none'; return 0; }
+    if ! cmp -s "$installed" "$source_path"; then
+        if [[ -L "$installed" ]]; then
+            printf 'skip'
+        else
+            printf 'install'
+        fi
+        return 0
+    fi
+    case "$needs_reload" in
+        yes|true) printf 'reload' ;;
+        *) printf 'none' ;;
+    esac
+}
+
+update_unit_sudo() {
+    if [[ -n "${UPDATE_UNIT_SUDO+set}" ]]; then
+        if [[ -z "$UPDATE_UNIT_SUDO" ]]; then
+            "$@"
+            return $?
+        fi
+        "$UPDATE_UNIT_SUDO" "$@"
+        return $?
+    fi
+    sudo "$@"
+}
+
+update_unit_install_with_backup() {
+    local installed="$1" source_path="$2"
+    [[ -n "$installed" && -n "$source_path" && -f "$source_path" ]] || return 1
+    local backup=""
+    if [[ -f "$installed" ]]; then
+        backup="${installed}.prev"
+        update_unit_sudo cp -p "$installed" "$backup" || return 1
+    fi
+    if ! update_unit_sudo install -m 0644 "$source_path" "$installed"; then
+        if [[ -n "$backup" ]]; then
+            update_unit_sudo rm -f "$backup" || true
+        fi
+        return 1
+    fi
+    printf '%s' "$backup"
+}
+
+update_unit_restore_backup() {
+    local installed="$1" backup="$2"
+    [[ -n "$installed" && -n "$backup" && -f "$backup" ]] || return 1
+    update_unit_sudo mv -f "$backup" "$installed"
+}
+
 update_signal_redirect_decision() {
     local is_active="$1" exec_bin_abs="$2" swap_bin_abs="$3"
     [[ "$is_active" == "active" ]] || { printf ''; return 0; }

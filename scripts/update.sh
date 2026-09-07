@@ -27,6 +27,9 @@ go_trader_pidfile="$(trim_space "${GO_TRADER_PIDFILE:-./go-trader.pid}")"
 go_trader_run_sh="$(trim_space "${GO_TRADER_RUN_SH:-./run.sh}")"
 rsync_from=""
 tree_mutated=0
+unit_sync_source_path=""
+unit_sync_installed_path=""
+unit_sync_backup_path=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -111,6 +114,10 @@ while [[ $# -gt 0 ]]; do
             echo "                      --unit / --service / GO_TRADER_SERVICE is overridden when a per-dir"
             echo "                      unit exists; if no active unit owns a dir, the parent's service_unit"
             echo "                      is used and a warning is logged."
+            echo "  With --restart in systemd mode the shipped unit file for the resolved unit is installed"
+            echo "                      over the loaded one when they differ (previous kept as <unit>.prev) and"
+            echo "                      systemd is reloaded before the restart. Drop-ins under <unit>.d/ are never"
+            echo "                      touched; a unit loaded from outside /etc/systemd/system stops the update."
             echo "  RESTART=1 env var also enables restart."
             echo "  RESTART_MODE=signal requires Linux, GO_TRADER_RUN_SH, GO_TRADER_PIDFILE (see #766)."
             echo "  systemd mode falls back to signal when the unit is not found (systemctl exit 5)."
@@ -438,6 +445,19 @@ signal_sweep_stray_instance_procs() {
 do_rollback() {
     local reason="$1"
     echo "[update] rollback: $reason" >&2
+
+    if [[ -n "$unit_sync_backup_path" ]]; then
+        if update_unit_restore_backup "$unit_sync_installed_path" "$unit_sync_backup_path"; then
+            unit_sync_backup_path=""
+            echo "[update] rollback: restored previous unit file $unit_sync_installed_path" >&2
+            if ! sudo systemctl daemon-reload; then
+                echo "[update] rollback: systemctl daemon-reload failed after restoring $unit_sync_installed_path — the old unit is on disk but systemd still holds the new one" >&2
+            fi
+        else
+            echo "[update] rollback: could not restore $unit_sync_installed_path from $unit_sync_backup_path — the service stays on the newly installed unit" >&2
+        fi
+    fi
+
     if [[ ! -x ./go-trader.prev ]]; then
         echo "[update] rollback: no go-trader.prev to restore — service stays on broken binary" >&2
         return
@@ -711,6 +731,16 @@ if [[ "$restart" == "1" && "$restart_mode" == "signal" ]]; then
     fi
 fi
 
+if [[ "$restart" == "1" && "$restart_mode" == "systemd" ]]; then
+    unit_sync_source_path=$(update_unit_source_path "$repo_root" "$service_unit")
+    unit_sync_installed_path=$(trim_space "$(systemctl show -p FragmentPath --value "$service_unit" 2>/dev/null || true)")
+    if [[ -n "$unit_sync_source_path" && -n "$unit_sync_installed_path" ]]; then
+        if [[ "$(update_unit_fragment_scope "$unit_sync_installed_path")" != "etc" ]]; then
+            fail "systemd unit $service_unit loads from $unit_sync_installed_path, outside /etc/systemd/system — update.sh will not overwrite a vendor or generator unit. Install the shipped unit with 'sudo bash scripts/install-service.sh', or set GO_TRADER_SERVICE / --unit to the unit this deployment owns."
+        fi
+    fi
+fi
+
 if [[ -z "$rsync_from" ]]; then
     build_paths=(
         scheduler
@@ -854,6 +884,44 @@ fi
 status_port="${status_port:-8099}"
 
 if [[ "$restart_mode" == "systemd" ]]; then
+    begin_phase unit
+    if [[ -z "$unit_sync_source_path" ]]; then
+        echo "[update] unit: no shipped unit file matches '$service_unit' — leaving the installed unit alone (install it by hand with scripts/install-service.sh)"
+    elif [[ -z "$unit_sync_installed_path" ]]; then
+        echo "[update] unit: systemd reports no fragment path for '$service_unit' — skipping the unit install"
+    else
+        unit_needs_reload=$(trim_space "$(systemctl show -p NeedDaemonReload --value "$service_unit" 2>/dev/null || true)")
+        unit_decision=$(update_unit_sync_decision "$unit_sync_installed_path" "$unit_sync_source_path" "$unit_needs_reload")
+        case "$unit_decision" in
+            install)
+                unit_sync_backup_path=$(update_unit_install_with_backup "$unit_sync_installed_path" "$unit_sync_source_path") \
+                    || fail "could not install $unit_sync_source_path over $unit_sync_installed_path"
+                echo "[update] unit: installed $unit_sync_installed_path from $unit_sync_source_path"
+                if [[ -n "$unit_sync_backup_path" ]]; then
+                    echo "[update] unit: previous unit retained as $unit_sync_backup_path"
+                fi
+                if ! sudo systemctl daemon-reload; then
+                    if [[ -n "$unit_sync_backup_path" ]] && update_unit_restore_backup "$unit_sync_installed_path" "$unit_sync_backup_path"; then
+                        unit_sync_backup_path=""
+                        echo "[update] unit: restored $unit_sync_installed_path after the failed daemon-reload" >&2
+                    fi
+                    fail "systemctl daemon-reload failed after installing $unit_sync_installed_path"
+                fi
+                ;;
+            skip)
+                echo "[update] unit: $unit_sync_installed_path is a symlink whose target differs from $unit_sync_source_path — leaving the operator's link alone; re-point it or run 'sudo bash scripts/install-service.sh'" >&2
+                ;;
+            reload)
+                echo "[update] unit: $unit_sync_installed_path already matches $unit_sync_source_path but systemd needs a reload"
+                sudo systemctl daemon-reload || fail "systemctl daemon-reload failed for $service_unit"
+                ;;
+            *)
+                echo "[update] unit: $unit_sync_installed_path already matches $unit_sync_source_path"
+                ;;
+        esac
+    fi
+    end_phase
+
     warn_execstart_vs_swap "$service_unit"
     warn_missing_systemd_environment_files "$service_unit"
 
