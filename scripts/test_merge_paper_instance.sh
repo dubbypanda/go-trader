@@ -629,4 +629,247 @@ out=$(run_merge 2>&1) && rc=0 || rc=$?
 assert_contains "$out" "1 configured strategy without a stored book yet" "the bookless strategy is reported"
 assert_eq "$(json_get "$LIVE_CFG.merge-staged" strategies.2.id)" "hl-new" "the bookless strategy is still moved"
 
+echo "== one-shot root-key conflict report"
+setup manykeys
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["regime"] = {"enabled": True}
+cfg["telegram"] = {"enabled": True, "token": "paper-token"}
+cfg["notify_ratchet_triggers"] = True
+cfg["channels"] = {"ops": "paper-ops"}
+json.dump(cfg, open(p, "w"))
+PY
+paper_before=$(cat "$PAPER_CFG")
+out=$(run_merge 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "21" "N root-key conflicts refuse once"
+assert_contains "$out" "root key regime differs" "regime is listed"
+assert_contains "$out" "root key telegram differs" "telegram is listed in the same refuse"
+assert_contains "$out" "root key notify_ratchet_triggers differs" "notify_ratchet_triggers is listed in the same refuse"
+assert_contains "$out" "root key channels differs" "unknown root key channels is listed"
+assert_contains "$out" "dropped paper root key log_dir (live value kept)" "dropped log_dir is listed while refusing"
+assert_contains "$out" "dropped paper root key status_port (live value kept)" "dropped status_port is listed while refusing"
+[[ ! -e "$LIVE_CFG.merge-staged" ]] || fail "one-shot refuse leaves no staged config"
+assert_eq "$(cat "$PAPER_CFG")" "$paper_before" "a refused compose never edits the paper config"
+
+echo "== --diff is a static preview"
+setup diffpreview
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["regime"] = {"enabled": True}
+cfg["telegram"] = {"enabled": True, "token": "paper-token"}
+cfg["channels"] = {"ops": "paper-ops"}
+json.dump(cfg, open(p, "w"))
+PY
+printf 'active\n' > "$F/live.state"
+rm -f "$OPT/go-trader-paper/go-trader"
+hold_lock_in_background "$(update_canonical_db_path "$PAPER_DB").lock"
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+kill "$HOLD_PID" 2>/dev/null || true
+wait "$HOLD_PID" 2>/dev/null || true
+assert_rc "$rc" "0" "--diff exits 0 while units run, a binary is missing, and a lock is held"
+assert_contains "$out" "diff: refuse-on-difference regime" "--diff classifies regime"
+assert_contains "$out" "diff: refuse-on-difference telegram" "--diff classifies telegram"
+assert_contains "$out" "diff: unknown channels" "--diff classifies an unknown root key"
+assert_contains "$out" "diff: dropped log_dir" "--diff classifies dropped log_dir"
+assert_contains "$out" "(live value kept)" "--diff marks dropped keys as live-value-kept"
+assert_contains "$out" "inspect-based portfolio_risk refuses need a dry run" "--diff does not claim a clean merge"
+[[ ! -e "$LIVE_CFG.merge-staged" ]] || fail "--diff must not write a staged config"
+[[ ! -e "$JOURNAL" ]] || fail "--diff must not write a journal"
+
+echo "== --diff names compose refuses it can see without inspect"
+setup diffreplay
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["replay_log_path"] = "/tmp/other-replay.db"
+json.dump(cfg, open(p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with a paper-mirror replay_log_path clash exits 0"
+assert_contains "$out" "diff: compose-refuse replay_log_path" "--diff names a paper-mirror replay_log_path clash"
+setup diffchannel
+python3 - "$LIVE_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["discord"]["channels"]["hyperliquid-paper"] = "C-other"
+json.dump(cfg, open(p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with a -paper channel clash exits 0"
+assert_contains "$out" "diff: compose-refuse discord.channels.hyperliquid-paper" "--diff names a discord -paper clash"
+
+echo "== --diff names a same-platform type-keyed discord self-conflict"
+setup difftypes
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["strategies"].append({
+    "id": "hl-opt", "type": "options", "platform": "hyperliquid",
+    "script": "shared_scripts/check_hyperliquid.py",
+    "args": ["vwap", "ETH", "1h", "--mode=paper"],
+    "capital": 100, "leverage": 5, "margin_per_trade_usd": 50,
+})
+cfg["discord"]["channels"] = {"perps": "Ch-perps", "options": "Ch-opt"}
+cfg["discord"]["trade_alert_channels"] = {"perps": "T-perps", "options": "T-opt"}
+cfg["discord"]["dm_channels"] = {"perps": "D-perps", "options": "D-opt"}
+json.dump(cfg, open(p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with two types on one platform exits 0"
+assert_contains "$out" "diff: compose-refuse discord.channels.hyperliquid-paper" "--diff names a channels type-keyed self-conflict"
+assert_contains "$out" "diff: compose-refuse discord.trade_alert_channels.hyperliquid-paper" "--diff names a trade_alert_channels type-keyed self-conflict"
+assert_contains "$out" "diff: compose-refuse discord.dm_channels.hyperliquid-paper" "--diff names a dm_channels type-keyed self-conflict"
+
+echo "== --diff skips already-merged paper strategies for discord used"
+setup diffmerged
+python3 - "$LIVE_CFG" "$PAPER_CFG" "$PAPER_DB" <<'PY'
+import json, os, sys
+live_p, paper_p, paper_db = sys.argv[1], sys.argv[2], sys.argv[3]
+live = json.load(open(live_p))
+paper = json.load(open(paper_p))
+moved = json.loads(json.dumps(paper["strategies"][0]))
+moved["id"] = "hl-x-paper"
+moved["storage_strategy_id"] = "hl-x"
+live["strategies"].append(moved)
+live["paper_db_file"] = os.path.realpath(paper_db) if os.path.exists(paper_db) else os.path.abspath(paper_db)
+paper["strategies"].append({
+    "id": "hl-opt", "type": "options", "platform": "hyperliquid",
+    "script": "shared_scripts/check_hyperliquid.py",
+    "args": ["vwap", "ETH", "1h", "--mode=paper"],
+    "capital": 100, "leverage": 5, "margin_per_trade_usd": 50,
+})
+paper["discord"]["channels"] = {"perps": "Ch-perps", "options": "Ch-opt"}
+paper["discord"]["trade_alert_channels"] = {"perps": "T-perps", "options": "T-opt"}
+paper["discord"]["dm_channels"] = {"perps": "D-perps", "options": "D-opt"}
+json.dump(live, open(live_p, "w"))
+json.dump(paper, open(paper_p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with an already-merged type plus a new type exits 0"
+case "$out" in
+    *"diff: compose-refuse discord.channels.hyperliquid-paper"*|*"diff: compose-refuse discord.trade_alert_channels.hyperliquid-paper"*|*"diff: compose-refuse discord.dm_channels.hyperliquid-paper"*)
+        echo "$out" >&2
+        fail "--diff must not preview a type-keyed discord self-conflict when one type is already merged"
+        ;;
+esac
+
+echo "== --diff replay_log_path follows compose any_mirror"
+setup diffreplayoff
+python3 - "$LIVE_CFG" "$PAPER_CFG" "$PAPER_DB" <<'PY'
+import json, os, sys
+live_p, paper_p, paper_db = sys.argv[1], sys.argv[2], sys.argv[3]
+live = json.load(open(live_p))
+paper = json.load(open(paper_p))
+moved = json.loads(json.dumps(paper["strategies"][0]))
+moved["id"] = "hl-x-paper"
+moved["storage_strategy_id"] = "hl-x"
+moved.pop("replay_sharing", None)
+live["strategies"].append(moved)
+live["paper_db_file"] = os.path.realpath(paper_db) if os.path.exists(paper_db) else os.path.abspath(paper_db)
+paper["replay_log_path"] = "/tmp/other-replay.db"
+json.dump(live, open(live_p, "w"))
+json.dump(paper, open(paper_p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with a detached live-side mirror exits 0"
+case "$out" in
+    *"diff: compose-refuse replay_log_path"*)
+        echo "$out" >&2
+        fail "--diff must not preview replay_log_path when the merged config has no live mirror"
+        ;;
+esac
+setup diffreplayon
+python3 - "$LIVE_CFG" "$PAPER_CFG" "$PAPER_DB" <<'PY'
+import json, os, sys
+live_p, paper_p, paper_db = sys.argv[1], sys.argv[2], sys.argv[3]
+live = json.load(open(live_p))
+paper = json.load(open(paper_p))
+moved = json.loads(json.dumps(paper["strategies"][0]))
+moved["id"] = "hl-x-paper"
+moved["storage_strategy_id"] = "hl-x"
+live["strategies"].append(moved)
+live["paper_db_file"] = os.path.realpath(paper_db) if os.path.exists(paper_db) else os.path.abspath(paper_db)
+paper["replay_log_path"] = "/tmp/other-replay.db"
+json.dump(live, open(live_p, "w"))
+json.dump(paper, open(paper_p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with a still-active already-merged mirror exits 0"
+assert_contains "$out" "diff: compose-refuse replay_log_path" "--diff still names replay_log_path when an already-merged mirror is active"
+
+echo "== --align-to-live is opt-in"
+setup alignflag
+out=$(run_merge --align-to-live 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "2" "--align-to-live without --diff or --apply is usage"
+setup aligndiff
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["regime"] = {"enabled": True}
+cfg["telegram"] = {"enabled": True, "token": "paper-token"}
+json.dump(cfg, open(p, "w"))
+PY
+paper_before=$(cat "$PAPER_CFG")
+printf 'active\n' > "$F/paper.state"
+out=$(run_merge --diff --align-to-live 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff --align-to-live exits 0 while a unit is active"
+assert_eq "$(cat "$PAPER_CFG")" "$paper_before" "--align-to-live never mutates the paper source"
+[[ -f "$PAPER_CFG.aligned" ]] || fail "--diff --align-to-live writes the aligned paper config"
+assert_eq "$(json_get "$PAPER_CFG.aligned" regime)" "" "aligned file drops a paper-only regime so it matches live"
+assert_contains "$out" "align: regime before=" "align records the regime before-value"
+assert_contains "$out" "align: telegram before=" "align records the telegram before-value"
+
+echo "== --align-to-live with --apply"
+setup alignapply
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["regime"] = {"enabled": True}
+cfg["telegram"] = {"enabled": True, "token": "paper-token"}
+json.dump(cfg, open(p, "w"))
+PY
+paper_before=$(cat "$PAPER_CFG")
+out=$(run_merge --apply --align-to-live 2>&1) && rc=0 || rc=$?
+[[ "$rc" == "0" ]] || { echo "$out" >&2; fail "--apply --align-to-live exits 0 (rc=$rc)"; }
+assert_contains "$out" "VERDICT: APPLIED" "--apply --align-to-live reaches apply"
+assert_eq "$(cat "$PAPER_CFG")" "$paper_before" "--apply --align-to-live never mutates the paper source"
+[[ -f "$PAPER_CFG.aligned" ]] || fail "--apply --align-to-live preserves the aligned paper config"
+assert_eq "$(json_get "$PAPER_CFG.aligned" regime)" "" "applied alignment drops paper-only regime"
+grep -q '^align: regime before=' "$JOURNAL" || fail "journal records aligned regime with before-value"
+grep -q '^align: telegram before=' "$JOURNAL" || fail "journal records aligned telegram with before-value"
+assert_eq "$(json_get "$LIVE_CFG" strategies.1.id)" "hl-x-paper" "aligned apply still moves the paper strategy"
+
+echo "== --apply --align-to-live proves an aligned stop default"
+setup alignapplystop
+python3 - "$PAPER_CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["default_stop_loss_atr_mult"] = 2.5
+cfg["strategies"].append({
+    "id": "hl-y", "type": "perps", "platform": "hyperliquid",
+    "script": "shared_scripts/check_hyperliquid.py",
+    "args": ["vwap", "BTC", "1h", "--mode=paper"],
+    "capital": 100, "leverage": 5, "margin_per_trade_usd": 50,
+    "stop_loss_atr_mult": 3.0,
+})
+json.dump(cfg, open(p, "w"))
+PY
+paper_before=$(cat "$PAPER_CFG")
+out=$(run_merge --apply --align-to-live 2>&1) && rc=0 || rc=$?
+[[ "$rc" == "0" ]] || { echo "$out" >&2; fail "--apply --align-to-live with a differing stop default exits 0 (rc=$rc)"; }
+assert_contains "$out" "VERDICT: APPLIED" "--apply --align-to-live reaches apply when default_stop_loss_atr_mult is aligned"
+assert_eq "$(cat "$PAPER_CFG")" "$paper_before" "--apply --align-to-live never mutates the paper source when aligning a stop default"
+assert_eq "$(json_get "$PAPER_CFG.aligned" default_stop_loss_atr_mult)" "" "aligned file drops paper's default_stop_loss_atr_mult so it matches live"
+assert_eq "$(json_get "$PAPER_CFG.aligned" strategies.1.stop_loss_atr_mult)" "3.0" "aligned file keeps an explicit strategy stop override"
+
 echo "OK: merge-paper-instance tests passed"
