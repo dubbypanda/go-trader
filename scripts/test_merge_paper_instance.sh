@@ -783,7 +783,7 @@ live = json.load(open(live_p))
 paper = json.load(open(paper_p))
 live["discord"]["channels"]["okx"] = "C-okx-live"
 paper["discord"]["channels"]["hyperliquid"] = "C-live"
-paper["discord"]["dm_channels"] = {"hyperliquid": "D-live"}
+paper["discord"]["dm_channels"] = {"hyperliquid-paper": "D-live"}
 live["discord"]["dm_channels"] = {"hyperliquid": "D-live", "okx": "D-okx-live"}
 json.dump(live, open(live_p, "w"))
 json.dump(paper, open(paper_p, "w"))
@@ -800,6 +800,28 @@ assert_eq "$(json_get "$staged" discord.channels.hyperliquid-paper)" "" "no -pap
 assert_eq "$(json_get "$staged" discord.channels.okx)" "C-okx-live" "the live-only channel is untouched"
 assert_eq "$(json_get "$staged" discord.dm_channels.hyperliquid-paper)" "D-live" "the dm -paper key survives, because tradeAlertRoutes never falls back off it for a paper strategy"
 
+echo "== a paper dm map with only a bare key refuses at proof"
+setup dmbarekey
+python3 - "$LIVE_CFG" "$PAPER_CFG" <<'PY'
+import json, sys
+live_p, paper_p = sys.argv[1], sys.argv[2]
+live = json.load(open(live_p))
+paper = json.load(open(paper_p))
+paper["discord"]["channels"]["hyperliquid"] = "C-live"
+paper["discord"]["dm_channels"] = {"hyperliquid": "D-live"}
+live["discord"]["dm_channels"] = {"hyperliquid": "D-live"}
+json.dump(live, open(live_p, "w"))
+json.dump(paper, open(paper_p, "w"))
+PY
+out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "0" "--diff with a bare paper dm key exits 0"
+assert_contains "$out" "diff: channel-plan discord.dm_channels.hyperliquid-paper=D-live" "compose still promotes the bare dm key into -paper"
+out=$(run_merge 2>&1) && rc=0 || rc=$?
+assert_rc "$rc" "22" "dry run with a bare paper dm key refuses at proof"
+assert_contains "$out" "notification.dm_channel" "proof names the dm channel that compose would add"
+staged="$LIVE_CFG.merge-staged"
+assert_eq "$(json_get "$staged" discord.dm_channels.hyperliquid-paper)" "D-live" "compose still wrote the -paper dm key before proof refused"
+
 echo "== a type-keyed dm map still gets its -paper key"
 setup dmtypekey
 python3 - "$LIVE_CFG" "$PAPER_CFG" <<'PY'
@@ -814,7 +836,8 @@ json.dump(live, open(live_p, "w"))
 json.dump(paper, open(paper_p, "w"))
 PY
 out=$(run_merge 2>&1) && rc=0 || rc=$?
-assert_rc "$rc" "0" "dry run with a type-keyed dm map exits 0"
+assert_rc "$rc" "22" "dry run with a type-keyed dm map refuses at proof"
+assert_contains "$out" "notification.dm_channel" "proof names the dm channel compose would add from the type key"
 staged="$LIVE_CFG.merge-staged"
 assert_eq "$(json_get "$staged" discord.dm_channels.hyperliquid-paper)" "D-perps" "a dm value resolved from the bare type key still writes the -paper key"
 assert_eq "$(json_get "$staged" discord.channels.hyperliquid-paper)" "" "the channels map still skips its redundant key"

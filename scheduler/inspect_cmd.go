@@ -736,7 +736,7 @@ func notificationRoutingJSON(sc StrategyConfig, cfg *Config, isLive bool) map[st
 	}
 	chKey, chVal := resolveChannelKeyOverMaps(channels, sc.Platform, sc.Type, isLive)
 	alertKey, alertVal := resolveTradeAlertKeyOverMaps(alerts, channels, sc.Platform, sc.Type, isLive)
-	dmKey, dmVal := resolveChannelKeyOverMaps(dms, sc.Platform, sc.Type, isLive)
+	dmKey, dmVal := resolveDMKeyOverMaps(dms, sc.Platform, isLive)
 	return map[string]interface{}{
 		"channel_key":         chKey,
 		"channel":             chVal,
@@ -761,6 +761,19 @@ func resolveChannelKeyOverMaps(maps []map[string]string, platform, stratType str
 		}
 		if ch, ok := m[stratType]; ok && ch != "" {
 			return stratType, ch
+		}
+	}
+	return "", ""
+}
+
+func resolveDMKeyOverMaps(maps []map[string]string, platform string, isLive bool) (string, string) {
+	key := platform
+	if !isLive {
+		key = platform + "-paper"
+	}
+	for _, m := range maps {
+		if ch, ok := m[key]; ok && ch != "" {
+			return key, ch
 		}
 	}
 	return "", ""
