@@ -49,10 +49,16 @@ name is free.
 
 --diff reads only the two config files and prints every differing root key
 (refuse-on-difference, dropped with the live value kept, or unknown), the
-alias every paper strategy would take, plus compose refuses it can see
-without inspect (replay_log_path when a paper mirror is present and the
-merged config would still have a live mirror, discord -paper clashes from
-strategies compose would newly merge). It is not a dry run: inspect-based
+alias every paper strategy would take, every discord -paper channel key the
+merge would add (channel-plan lines, the same content compose prints), plus
+compose refuses it can see without inspect (replay_log_path when a paper
+mirror is present and the merged config would still have a live mirror,
+discord -paper clashes from strategies compose would newly merge). A paper
+channel value that already routes through the merged bare key adds no -paper
+key and is named as not added, except under channels when dropping the key
+would change which channels a paper-scope alert reaches: that key is kept and
+named as kept. dm_channels keys are always added, since the paper DM route
+reads that exact key. It is not a dry run: inspect-based
 portfolio_risk refuses still need the full pipeline.
 Units may stay running and no lock or binary is used.
 --align-to-live is valid only with --diff or --apply: it writes live's
@@ -194,6 +200,7 @@ DROPPED = [
     "replay_log_path",
 ]
 CHANNEL_MAPS = ["channels", "trade_alert_channels", "dm_channels"]
+CHANNEL_MAPS_WITH_BARE_KEY_FALLBACK = ["channels", "trade_alert_channels"]
 COMPOSE_DROP_SILENT = (
     "strategies",
     "portfolio_risk",
@@ -287,8 +294,13 @@ def cmd_root_diff(live_path, paper_path, paper_db_abs=""):
     paper = load(paper_path)
     refuse_keys, unknown_keys, dropped_keys = collect_root_diffs(live, paper)
     print_root_diff_report(live, paper, refuse_keys, unknown_keys, dropped_keys)
-    for label, live_v, paper_v in collect_compose_refuse_previews(live, paper, paper_db_abs):
+    previews, channel_plan = collect_compose_refuse_previews(live, paper, paper_db_abs)
+    for label, live_v, paper_v in previews:
         print("diff: compose-refuse %s live=%s paper=%s" % (label, live_v, paper_v))
+    for line in channel_plan:
+        print("diff: channel-plan %s" % line)
+    if not channel_plan:
+        print("diff: channel-plan no discord channel keys to add")
     plan, alias_skipped = compose_alias_plan(live, paper, paper_db_abs)
     for s, pid in plan:
         if pid != s["id"]:
@@ -352,6 +364,18 @@ def mirror_source(s):
         return src.strip()
     return s["id"]
 
+def merged_channel_route_key(mm, platform, stype):
+    for key in (platform, stype):
+        if mm.get(key):
+            return key
+    return ""
+
+def paper_scope_broadcast_values(mm, dropped=()):
+    vals = set(v for k, v in mm.items() if k.endswith("-paper") and v and k not in dropped)
+    if vals:
+        return vals
+    return set(v for k, v in mm.items() if v and k not in dropped)
+
 def apply_paper_discord_maps(merged_discord, paper_discord, used):
     report = []
     conflicts = []
@@ -360,11 +384,16 @@ def apply_paper_discord_maps(merged_discord, paper_discord, used):
         mm = merged_discord.get(map_key)
         if mm is None:
             mm = {}
+        added = []
+        pinned = set()
+        routed = {}
         for platform, stype in sorted(used):
             val = ""
+            src = ""
             for key in ("%s-paper" % platform, platform, stype):
                 if pm.get(key):
                     val = pm[key]
+                    src = key
                     break
             if not val:
                 continue
@@ -378,12 +407,17 @@ def apply_paper_discord_maps(merged_discord, paper_discord, used):
                 ))
             elif target not in mm:
                 mm[target] = val
-                report.append("discord.%s.%s=%s" % (map_key, target, val))
+                added.append((target, val))
+            if mm.get(target) == val:
+                routed.setdefault(target, []).append((platform, stype))
+                if src == target:
+                    pinned.add(target)
+        passthrough = []
         for key in sorted(pm):
             val = pm[key]
             if key.endswith("-paper") and key not in mm and val:
                 mm[key] = val
-                report.append("discord.%s.%s=%s" % (map_key, key, val))
+                passthrough.append("discord.%s.%s=%s" % (map_key, key, val))
             elif key.endswith("-paper") and key in mm and mm[key] != val:
                 conflicts.append((
                     "discord.%s.%s" % (map_key, key),
@@ -391,6 +425,34 @@ def apply_paper_discord_maps(merged_discord, paper_discord, used):
                     val,
                     "discord.%s.%s differs: live=%r paper=%r" % (map_key, key, mm[key], val),
                 ))
+        candidates = []
+        for target, val in added:
+            if map_key not in CHANNEL_MAPS_WITH_BARE_KEY_FALLBACK:
+                continue
+            if mm.get(target) != val or target in pinned:
+                continue
+            route_keys = [merged_channel_route_key(mm, platform, stype) for platform, stype in routed.get(target, [])]
+            if route_keys and all(k and mm.get(k) == val for k in route_keys):
+                candidates.append(target)
+        blocked = set()
+        if map_key == "channels" and candidates:
+            if paper_scope_broadcast_values(mm, candidates) != paper_scope_broadcast_values(mm):
+                blocked = set(candidates)
+                candidates = []
+        pruned = set(candidates)
+        for target, val in added:
+            if mm.get(target) != val:
+                continue
+            if target in pruned:
+                del mm[target]
+                report.append("discord.%s.%s not added (paper value %s already routes through discord.%s.%s)" % (
+                    map_key, target, val, map_key, merged_channel_route_key(mm, *routed[target][0])))
+            elif target in blocked:
+                report.append("discord.%s.%s=%s (kept: dropping it would change which channels paper-scope alerts reach)" % (
+                    map_key, target, val))
+            else:
+                report.append("discord.%s.%s=%s" % (map_key, target, val))
+        report.extend(passthrough)
         if mm:
             merged_discord[map_key] = mm
     return report, conflicts
@@ -456,12 +518,12 @@ def collect_compose_refuse_previews(live, paper, paper_db_abs=""):
         platform = s.get("platform") or ("hyperliquid" if s["id"].startswith("hl-") else "")
         used.add((platform, s.get("type") or ""))
     merged_discord = json.loads(json.dumps(live.get("discord") or {}))
-    _report, conflicts = apply_paper_discord_maps(merged_discord, paper.get("discord") or {}, used)
+    report, conflicts = apply_paper_discord_maps(merged_discord, paper.get("discord") or {}, used)
     for label, live_v, paper_v, _msg in conflicts:
         if label not in seen:
             seen.add(label)
             previews.append((label, json.dumps(live_v, sort_keys=True), json.dumps(paper_v, sort_keys=True)))
-    return previews
+    return previews, report
 
 def cmd_classify(path):
     cfg = load(path)
