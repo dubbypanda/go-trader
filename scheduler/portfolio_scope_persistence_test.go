@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -399,14 +400,49 @@ func TestResolveChannelKey_NoPaperKeyFallsBack(t *testing.T) {
 }
 
 func TestSendToScopeChannels(t *testing.T) {
+	paperHL := StrategyConfig{ID: "hl-paper", Type: "perps", Platform: "hyperliquid", Args: []string{"--mode=paper"}}
+	liveOKX := StrategyConfig{ID: "okx-live", Type: "perps", Platform: "okx", Args: []string{"--mode=live"}}
+
+	mockMerged := &mockNotifier{}
+	mnMerged := NewMultiNotifier(notifierBackend{
+		notifier: mockMerged,
+		channels: map[string]string{"hyperliquid": "C", "okx": "C-okx-live"},
+	})
+	mnMerged.ReloadConfig(&Config{
+		Discord:    DiscordConfig{Channels: map[string]string{"hyperliquid": "C", "okx": "C-okx-live"}},
+		Strategies: []StrategyConfig{paperHL, liveOKX},
+	})
+	mnMerged.SendToScopeChannels(ScopePaper, "paper message")
+	if len(mockMerged.messages) != 1 || mockMerged.messages[0].channelID != "C" {
+		t.Fatalf("merged live+paper map paper broadcast = %+v, want only C", mockMerged.messages)
+	}
+
 	mock := &mockNotifier{}
 	mn := NewMultiNotifier(notifierBackend{
 		notifier: mock,
 		channels: map[string]string{"hyperliquid": "live-ch", "hyperliquid-paper": "paper-ch"},
 	})
+	mn.ReloadConfig(&Config{
+		Discord:    DiscordConfig{Channels: map[string]string{"hyperliquid": "live-ch", "hyperliquid-paper": "paper-ch"}},
+		Strategies: []StrategyConfig{paperHL},
+	})
 	mn.SendToScopeChannels(ScopePaper, "paper message")
 	if len(mock.messages) != 1 || mock.messages[0].channelID != "paper-ch" {
 		t.Fatalf("paper broadcast = %+v, want only paper-ch", mock.messages)
+	}
+
+	mockUnused := &mockNotifier{}
+	mnUnused := NewMultiNotifier(notifierBackend{
+		notifier: mockUnused,
+		channels: map[string]string{"hyperliquid-paper": "P", "okx-paper": "O"},
+	})
+	mnUnused.ReloadConfig(&Config{
+		Discord:    DiscordConfig{Channels: map[string]string{"hyperliquid-paper": "P", "okx-paper": "O"}},
+		Strategies: []StrategyConfig{paperHL},
+	})
+	mnUnused.SendToScopeChannels(ScopePaper, "paper message")
+	if len(mockUnused.messages) != 1 || mockUnused.messages[0].channelID != "P" {
+		t.Fatalf("unused -paper key must not receive the paper broadcast; got %+v", mockUnused.messages)
 	}
 
 	mock2 := &mockNotifier{}
@@ -419,6 +455,20 @@ func TestSendToScopeChannels(t *testing.T) {
 		t.Fatalf("with no paper channel the paper broadcast must fall back to all channels; got %+v", mock2.messages)
 	}
 
+	mockEmpty := &mockNotifier{}
+	mnEmpty := NewMultiNotifier(notifierBackend{
+		notifier: mockEmpty,
+		channels: map[string]string{"okx": "C-okx-live"},
+	})
+	mnEmpty.ReloadConfig(&Config{
+		Discord:    DiscordConfig{Channels: map[string]string{"okx": "C-okx-live"}},
+		Strategies: []StrategyConfig{paperHL},
+	})
+	mnEmpty.SendToScopeChannels(ScopePaper, "paper message")
+	if len(mockEmpty.messages) != 1 || mockEmpty.messages[0].channelID != "C-okx-live" {
+		t.Fatalf("unresolved paper strategies must fall through to every channel; got %+v", mockEmpty.messages)
+	}
+
 	mock3 := &mockNotifier{}
 	mn3 := NewMultiNotifier(notifierBackend{
 		notifier: mock3,
@@ -427,6 +477,67 @@ func TestSendToScopeChannels(t *testing.T) {
 	mn3.SendToScopeChannels(ScopeLive, "live message")
 	if len(mock3.messages) != 2 {
 		t.Fatalf("a live broadcast must keep reaching every channel; got %+v", mock3.messages)
+	}
+}
+
+func TestPaperScopeChannelValues(t *testing.T) {
+	paperHL := StrategyConfig{ID: "hl-paper", Type: "perps", Platform: "hyperliquid", Args: []string{"--mode=paper"}}
+	paperOKX := StrategyConfig{ID: "okx-paper", Type: "perps", Platform: "okx", Args: []string{"--mode=paper"}}
+	liveOKX := StrategyConfig{ID: "okx-live", Type: "perps", Platform: "okx", Args: []string{"--mode=live"}}
+	cases := []struct {
+		name     string
+		channels map[string]string
+		strats   []StrategyConfig
+		want     []string
+	}{
+		{
+			name:     "bare platform plus live-only",
+			channels: map[string]string{"hyperliquid": "C", "okx": "C-okx-live"},
+			strats:   []StrategyConfig{paperHL, liveOKX},
+			want:     []string{"C"},
+		},
+		{
+			name:     "prefers platform-paper",
+			channels: map[string]string{"hyperliquid": "live-ch", "hyperliquid-paper": "paper-ch"},
+			strats:   []StrategyConfig{paperHL},
+			want:     []string{"paper-ch"},
+		},
+		{
+			name:     "unused paper key omitted",
+			channels: map[string]string{"hyperliquid-paper": "P", "okx-paper": "O"},
+			strats:   []StrategyConfig{paperHL},
+			want:     []string{"P"},
+		},
+		{
+			name:     "no paper strategy",
+			channels: map[string]string{"hyperliquid": "C", "okx": "C-okx-live"},
+			strats:   []StrategyConfig{liveOKX},
+		},
+		{
+			name:     "paper strategy with no matching channel",
+			channels: map[string]string{"okx": "C-okx-live"},
+			strats:   []StrategyConfig{paperHL},
+		},
+		{
+			name:     "dedupes shared value",
+			channels: map[string]string{"hyperliquid": "C", "okx": "C"},
+			strats:   []StrategyConfig{paperHL, paperOKX},
+			want:     []string{"C"},
+		},
+		{
+			name:     "type key fallback",
+			channels: map[string]string{"perps": "type-ch"},
+			strats:   []StrategyConfig{paperHL},
+			want:     []string{"type-ch"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := paperScopeChannelValues(tc.channels, tc.strats)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -774,7 +774,7 @@ assert_eq "$(json_get "$staged" discord.channels.hyperliquid-paper)" "" "no -pap
 assert_eq "$(json_get "$staged" discord.trade_alert_channels)" "" "no empty trade_alert_channels map is written"
 assert_eq "$(json_get "$staged" discord.dm_channels)" "" "no empty dm_channels map is written"
 
-echo "== an identical paper channel keeps its -paper key when a live-only channel exists"
+echo "== an identical paper channel skips its -paper key when a live-only channel exists"
 setup scopeisolation
 python3 - "$LIVE_CFG" "$PAPER_CFG" <<'PY'
 import json, sys
@@ -790,12 +790,13 @@ json.dump(paper, open(paper_p, "w"))
 PY
 out=$(run_merge --diff 2>&1) && rc=0 || rc=$?
 assert_rc "$rc" "0" "--diff with a live-only second channel exits 0"
-assert_contains "$out" "diff: channel-plan discord.channels.hyperliquid-paper=C-live (kept:" "--diff says the channel key is kept for paper-scope alerts"
+assert_contains "$out" "diff: channel-plan discord.channels.hyperliquid-paper not added" "--diff says the redundant channels key is skipped"
 assert_contains "$out" "diff: channel-plan discord.dm_channels.hyperliquid-paper=D-live" "the dm map has no bare-key fallback, so its key is always added"
 out=$(run_merge 2>&1) && rc=0 || rc=$?
 assert_rc "$rc" "0" "dry run with a live-only second channel exits 0"
 staged="$LIVE_CFG.merge-staged"
-assert_eq "$(json_get "$staged" discord.channels.hyperliquid-paper)" "C-live" "the -paper channel key survives so paper-scope alerts stay off the live-only channel"
+assert_eq "$(json_get "$staged" discord.channels.hyperliquid)" "C-live" "the merged map keeps the single bare channel key"
+assert_eq "$(json_get "$staged" discord.channels.hyperliquid-paper)" "" "no -paper channel key is added when the paper value already routes through the bare key"
 assert_eq "$(json_get "$staged" discord.channels.okx)" "C-okx-live" "the live-only channel is untouched"
 assert_eq "$(json_get "$staged" discord.dm_channels.hyperliquid-paper)" "D-live" "the dm -paper key survives, because tradeAlertRoutes never falls back off it for a paper strategy"
 

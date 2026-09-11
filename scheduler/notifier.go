@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ type notifierBackend struct {
 	leaderboardChannel string
 	dmChannels         map[string]string
 	plainText          bool
+	paperScopeChannels []string
 }
 
 type MultiNotifier struct {
@@ -36,6 +38,7 @@ func NewMultiNotifier(backends ...notifierBackend) *MultiNotifier {
 			b.channels = cloneStringMap(b.channels)
 			b.tradeAlertChannels = cloneStringMap(b.tradeAlertChannels)
 			b.dmChannels = cloneStringMap(b.dmChannels)
+			b.paperScopeChannels = cloneStringSlice(b.paperScopeChannels)
 			valid = append(valid, b)
 		}
 	}
@@ -54,6 +57,7 @@ func (m *MultiNotifier) snapshotBackends() []notifierBackend {
 		b.channels = cloneStringMap(b.channels)
 		b.tradeAlertChannels = cloneStringMap(b.tradeAlertChannels)
 		b.dmChannels = cloneStringMap(b.dmChannels)
+		b.paperScopeChannels = cloneStringSlice(b.paperScopeChannels)
 		out[i] = b
 	}
 	return out
@@ -140,12 +144,14 @@ func (m *MultiNotifier) ReloadConfig(cfg *Config) {
 			b.channels = cloneStringMap(cfg.Telegram.Channels)
 			b.tradeAlertChannels = cloneStringMap(cfg.Telegram.TradeAlertChannels)
 			b.dmChannels = cloneStringMap(cfg.Telegram.DMChannels)
+			b.paperScopeChannels = paperScopeChannelValues(b.channels, cfg.Strategies)
 			continue
 		}
 		b.channels = cloneStringMap(cfg.Discord.Channels)
 		b.tradeAlertChannels = cloneStringMap(cfg.Discord.TradeAlertChannels)
 		b.dmChannels = cloneStringMap(cfg.Discord.DMChannels)
 		b.leaderboardChannel = cfg.Discord.LeaderboardChannel
+		b.paperScopeChannels = paperScopeChannelValues(b.channels, cfg.Strategies)
 	}
 }
 
@@ -272,8 +278,8 @@ func (m *MultiNotifier) SendToScopeChannels(scope PortfolioScope, content string
 	sent := false
 	for _, b := range m.snapshotBackends() {
 		seen := make(map[string]bool)
-		for key, ch := range b.channels {
-			if ch == "" || !strings.HasSuffix(key, "-paper") || seen[ch] {
+		for _, ch := range b.paperScopeChannels {
+			if ch == "" || seen[ch] {
 				continue
 			}
 			seen[ch] = true
@@ -286,6 +292,30 @@ func (m *MultiNotifier) SendToScopeChannels(scope PortfolioScope, content string
 	if !sent {
 		m.SendToAllChannels(content)
 	}
+}
+
+func paperScopeChannelValues(channels map[string]string, strats []StrategyConfig) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, sc := range strategiesInScope(strats, ScopePaper) {
+		ch := resolveTradeChannel(channels, sc.Platform, sc.Type, false)
+		if ch == "" || seen[ch] {
+			continue
+		}
+		seen[ch] = true
+		out = append(out, ch)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func cloneStringSlice(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, len(s))
+	copy(out, s)
+	return out
 }
 
 func (m *MultiNotifier) AllChannelKeys() map[string]bool {
