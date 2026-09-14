@@ -132,6 +132,7 @@
     activeID: "",
     viewMode: "detail",
     sortKey: "id",
+    modeFilter: "all",
     sortDir: "asc",
     chart: null,
     series: null,
@@ -2018,7 +2019,7 @@
 
 
   function sortValue(row, key) {
-    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe") {
+    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe" || key === "trade_count" || key === "pnl") {
       const n = Number(row[key]);
       return Number.isFinite(n) ? n : -Infinity;
     }
@@ -2027,7 +2028,9 @@
   }
 
   function sortedOverviewRows() {
-    const rows = state.overviewRows.slice();
+    const rows = state.overviewRows.filter(function (row) {
+      return state.modeFilter === "all" || row.mode === state.modeFilter;
+    });
     const dir = state.sortDir === "desc" ? -1 : 1;
     rows.sort(function (a, b) {
       const av = sortValue(a, state.sortKey);
@@ -2040,6 +2043,11 @@
   }
 
   function updateSortButtons() {
+    document.querySelectorAll(".mode-filter-button").forEach(function (button) {
+      const active = button.dataset.mode === state.modeFilter;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+    });
     document.querySelectorAll(".sort-button").forEach(function (button) {
       const key = button.dataset.key;
       const active = key === state.sortKey;
@@ -2056,11 +2064,15 @@
         "<td>" + (row.paused ? '<span title="Paused">⏸</span> ' : "") + escapeHTML(row.id) + "</td>" +
         "<td>" + escapeHTML(row.platform || "-") + "</td>" +
         "<td>" + escapeHTML(row.symbol || "-") + "</td>" +
+        "<td>" + escapeHTML(row.mode || "-") + "</td>" +
+        "<td>" + escapeHTML(String(row.trade_count || 0)) + "</td>" +
+        '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtNumber(row.pnl)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtPct(row.pnl_pct)) + "</td>" +
         "<td>" + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
         "<td>" + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
         "<td>" + escapeHTML(row.regime || "-") + "</td>" +
         "<td>" + escapeHTML(row.direction || "-") + "</td>" +
+        "<td>" + escapeHTML(row.close_strategy || "-") + "</td>" +
         "</tr>";
     }).join("");
     updateSortButtons();
@@ -2604,6 +2616,12 @@
     const row = event.target.closest(".overview-row");
     if (!row || !row.dataset.id) return;
     selectStrategy(row.dataset.id, { switchToDetail: true }).catch(handleRefreshError);
+  });
+  document.querySelectorAll(".mode-filter-button").forEach(function (button) {
+    button.addEventListener("click", function () {
+      state.modeFilter = button.dataset.mode;
+      renderOverviewTable();
+    });
   });
   document.querySelectorAll(".sort-button").forEach(function (button) {
     button.addEventListener("click", function () {
