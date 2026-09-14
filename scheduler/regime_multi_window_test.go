@@ -228,3 +228,159 @@ func TestStrategyDisplayRegimeLabel_DoesNotAffectATRDirectionalFallbacks(t *test
 		t.Fatalf("strategyCurrentDirectionalRegime = %q, want ranging (unaffected shared-default fallback)", got)
 	}
 }
+
+func TestFormatTradeAlertRegimeExtra(t *testing.T) {
+	multi := &RegimeConfig{
+		Enabled: true,
+		Period:  14,
+		Windows: RegimeWindowsMap{
+			"medium": RegimeWindowSpec{Period: 24},
+			"long":   RegimeWindowSpec{Period: 168},
+			"short":  RegimeWindowSpec{},
+		},
+	}
+	legacy := &RegimeConfig{Enabled: true, Period: 14}
+
+	cases := []struct {
+		name  string
+		sc    StrategyConfig
+		trade Trade
+		rc    *RegimeConfig
+		want  string
+	}{
+		{
+			name:  "primary window on main path",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    multi,
+			want:  "Regime medium (1d): ranging",
+		},
+		{
+			name:  "gate window on scale-in",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}, RegimeGateWindow: "long"},
+			trade: Trade{Regime: "trending_up", TradeType: scaleInTradeType},
+			rc:    multi,
+			want:  "Regime long (7d): trending_up",
+		},
+		{
+			name:  "gate window on manual trade",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}, RegimeGateWindow: "long"},
+			trade: Trade{Regime: "trending_up", Manual: true},
+			rc:    multi,
+			want:  "Regime long (7d): trending_up",
+		},
+		{
+			name:  "unset gate window falls back to primary",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging", TradeType: scaleInTradeType},
+			rc:    multi,
+			want:  "Regime medium (1d): ranging",
+		},
+		{
+			name:  "window without period inherits regime period",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}, RegimeGateWindow: "short"},
+			trade: Trade{Regime: "ranging", TradeType: scaleInTradeType},
+			rc:    multi,
+			want:  "Regime short (14h): ranging",
+		},
+		{
+			name:  "regime timeframe overrides the strategy timeframe",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    &RegimeConfig{Enabled: true, Period: 14, Timeframe: "4h", Windows: RegimeWindowsMap{"medium": RegimeWindowSpec{Period: 24}}},
+			want:  "Regime medium (4d): ranging",
+		},
+		{
+			name:  "args timeframe wins over the strategy timeframe field",
+			sc:    StrategyConfig{Timeframe: "15m", Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    legacy,
+			want:  "Regime (14h): ranging",
+		},
+		{
+			name:  "regime timeframe wins over both the args and the strategy timeframe field",
+			sc:    StrategyConfig{Timeframe: "15m", Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    &RegimeConfig{Enabled: true, Period: 14, Timeframe: "4h"},
+			want:  "Regime (2d): ranging",
+		},
+		{
+			name:  "options strategy uses the options regime spec",
+			sc:    StrategyConfig{Type: "options", Timeframe: "15m", Args: []string{"s.py", "SPY", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    legacy,
+			want:  "Regime default (2d): ranging",
+		},
+		{
+			name:  "options strategy ignores a tuned global regime period",
+			sc:    StrategyConfig{Type: "options", Args: []string{"s.py", "SPY", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    &RegimeConfig{Enabled: true, Period: 20},
+			want:  "Regime default (2d): ranging",
+		},
+		{
+			name:  "options strategy ignores the global regime windows",
+			sc:    StrategyConfig{Type: "options", Args: []string{"s.py", "SPY", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    multi,
+			want:  "Regime default (2d): ranging",
+		},
+		{
+			name:  "options strategy renders its span with no regime config",
+			sc:    StrategyConfig{Type: "options", Args: []string{"s.py", "SPY"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    nil,
+			want:  "Regime default (2d): ranging",
+		},
+		{
+			name:  "missing args timeframe renders the bare label",
+			sc:    StrategyConfig{Timeframe: "15m", Args: []string{"s.py", "ETH"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    legacy,
+			want:  "Regime: ranging",
+		},
+		{
+			name:  "sub-hour window renders minutes",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1m"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    legacy,
+			want:  "Regime (14m): ranging",
+		},
+		{
+			name:  "legacy single window uses regime period",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    legacy,
+			want:  "Regime (14h): ranging",
+		},
+		{
+			name:  "zero period renders the bare label",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    &RegimeConfig{Enabled: true},
+			want:  "Regime: ranging",
+		},
+		{
+			name:  "unparseable timeframe renders the bare label",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "bogus"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    legacy,
+			want:  "Regime: ranging",
+		},
+		{
+			name:  "nil regime config renders the bare label",
+			sc:    StrategyConfig{Args: []string{"s.py", "ETH", "1h"}},
+			trade: Trade{Regime: "ranging"},
+			rc:    nil,
+			want:  "Regime: ranging",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatTradeAlertRegimeExtra(tc.sc, tc.trade, tc.rc); got != tc.want {
+				t.Fatalf("formatTradeAlertRegimeExtra = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
