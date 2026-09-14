@@ -406,7 +406,7 @@ if [[ -n "$update_test_repo_root" && -x "$update_test_repo_root/scripts/update.s
 (
     cd "$update_test_repo_root"
 
-    fleet=$(mktemp -d)
+    fleet=$(cd "$(mktemp -d)" && pwd -P)
     for n in go-trader-a go-trader-b go-trader-c; do
         mkdir -p "$fleet/$n/scheduler"
         echo '{}' > "$fleet/$n/scheduler/config.json"
