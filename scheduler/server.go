@@ -320,6 +320,17 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Partition string `json:"partition"`
 	}
 
+	// PartitionStatus is the dashboard selector's roster. It carries every
+	// partition this process owns, live and default paper included, in the
+	// stable order, so the selector never has to compose one from the
+	// by-scope maps.
+	type PartitionStatus struct {
+		Partition string `json:"partition"`
+		Label     string `json:"label"`
+		Scope     string `json:"scope"`
+		Source    string `json:"source,omitempty"`
+	}
+
 	type StatusResp struct {
 		CycleCount           int                             `json:"cycle_count"`
 		Prices               map[string]float64              `json:"prices"`
@@ -335,6 +346,7 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		ReconciliationGaps   map[string]*ReconciliationGap   `json:"reconciliation_gaps,omitempty"`
 		MarketFeed           *marketFeedHealth               `json:"market_feed,omitempty"`
 		PaperSources         []PaperSourceStatus             `json:"paper_sources,omitempty"`
+		Partitions           []PartitionStatus               `json:"partitions,omitempty"`
 	}
 
 	ss.strategiesMu.RLock()
@@ -390,13 +402,25 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// Only sources this process actually owns are listed, so the dashboard's
 	// selector can never offer a deployment this process does not read.
 	for _, part := range parts {
-		if part.Source == "" {
-			continue
+		label := partitionLabel(part)
+		if part.Source != "" {
+			// paperSourceLabel falls back to the id, which alone cannot be
+			// told from the default paper partition in the selector, so only
+			// a configured label replaces the partition text.
+			if named := ss.paperSourceLabel(part.Source); named != "" && named != part.Source {
+				label = named
+			}
+			resp.PaperSources = append(resp.PaperSources, PaperSourceStatus{
+				ID:        part.Source,
+				Label:     ss.paperSourceLabel(part.Source),
+				Partition: part.String(),
+			})
 		}
-		resp.PaperSources = append(resp.PaperSources, PaperSourceStatus{
-			ID:        part.Source,
-			Label:     ss.paperSourceLabel(part.Source),
+		resp.Partitions = append(resp.Partitions, PartitionStatus{
 			Partition: part.String(),
+			Label:     label,
+			Scope:     string(part.Scope),
+			Source:    part.Source,
 		})
 	}
 	if prs := ss.state.partitionRiskIfPresent(legacyScope); prs != nil {
@@ -406,7 +430,14 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	for id, s := range ss.state.Strategies {
 		pv := displayStrategyValue(s, prices)
-		sc := cfgByID[id]
+		sc, configured := cfgByID[id]
+		// A state row the roster no longer configures has no owning partition,
+		// and naming one would file its alerts under a deployment it may not
+		// belong to. An absent field tells the dashboard to show it always.
+		partitionText := ""
+		if configured {
+			partitionText = partitionFor(sc).String()
+		}
 		initCap := EffectiveInitialCapital(sc, s)
 		pnl := pv - initCap
 		pnlPct := 0.0
@@ -442,7 +473,7 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 			RegimeProfile:                  s.RegimeProfile,
 			Paused:                         sc.Paused,
 			Hedge:                          buildHedgeStatus(sc, s),
-			Partition:                      partitionFor(sc).String(),
+			Partition:                      partitionText,
 			PaperSource:                    sc.PaperSource,
 		}
 	}
