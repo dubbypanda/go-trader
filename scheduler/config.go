@@ -60,6 +60,7 @@ type PortfolioRiskConfig struct {
 	DailyMaxLossPct             float64 `json:"daily_max_loss_pct,omitempty"`
 	MaxSameDirectionNotionalUSD float64 `json:"max_same_direction_notional_usd,omitempty"`
 	MaxAssetConcentrationPct    float64 `json:"max_asset_concentration_pct,omitempty"`
+	IncludePausedInWarning      bool    `json:"include_paused_in_warning,omitempty"`
 
 	Paper *PortfolioRiskConfig `json:"paper,omitempty"`
 }
@@ -119,6 +120,9 @@ func applyPortfolioRiskOverride(dst, override *PortfolioRiskConfig) {
 	}
 	if override.MaxAssetConcentrationPct != 0 {
 		dst.MaxAssetConcentrationPct = override.MaxAssetConcentrationPct
+	}
+	if override.IncludePausedInWarning {
+		dst.IncludePausedInWarning = true
 	}
 }
 
