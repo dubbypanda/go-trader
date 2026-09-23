@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -529,5 +530,465 @@ func TestCashflowJournalExcludesSpotFills(t *testing.T) {
 
 	if st.FillsSinceMs != t0+25+1 {
 		t.Errorf("cursor = %d, want %d (advanced past the latest spot fill)", st.FillsSinceMs, t0+26)
+	}
+}
+
+func TestHyperliquidClosedPnlBasisError(t *testing.T) {
+	ids := func(tids ...string) map[string]struct{} {
+		out := map[string]struct{}{}
+		for _, id := range tids {
+			out["fill:tid:"+id] = struct{}{}
+		}
+		return out
+	}
+	open := hlFillRecord{Coin: "BTC", Side: "B", Sz: "1", Px: "100", StartPosition: "0", ClosedPnl: "0", Time: 1, Tid: json.Number("1")}
+	closeHigh := hlFillRecord{Coin: "BTC", Side: "A", Sz: "1", Px: "110", StartPosition: "1", ClosedPnl: "10.02", Time: 2, Tid: json.Number("2")}
+	cases := []struct {
+		name  string
+		fills []hlFillRecord
+		keep  map[string]struct{}
+		want  float64
+	}{
+		{
+			name:  "frontend closedPnl two cents above fill price",
+			fills: []hlFillRecord{open, closeHigh},
+			keep:  ids("1", "2"),
+			want:  0.02,
+		},
+		{
+			name: "same-timestamp partials chain by startPosition",
+			fills: []hlFillRecord{
+				open,
+				{Coin: "BTC", Side: "B", Sz: "0.5", Px: "140", StartPosition: "1.5", ClosedPnl: "0", Time: 2, Tid: json.Number("2")},
+				{Coin: "BTC", Side: "B", Sz: "0.5", Px: "120", StartPosition: "1", ClosedPnl: "0", Time: 2, Tid: json.Number("3")},
+				{Coin: "BTC", Side: "A", Sz: "2", Px: "130", StartPosition: "2", ClosedPnl: "40", Time: 3, Tid: json.Number("4")},
+			},
+			keep: ids("1", "2", "3", "4"),
+			want: 10,
+		},
+		{
+			name:  "pre-journal open still sets entry for a journaled close",
+			fills: []hlFillRecord{open, closeHigh},
+			keep:  ids("2"),
+			want:  0.02,
+		},
+		{
+			name:  "fill outside the journal does not move the basis",
+			fills: []hlFillRecord{open, closeHigh},
+			keep:  ids("1"),
+			want:  0,
+		},
+		{
+			name: "reverse close and reopen uses the held position",
+			fills: []hlFillRecord{
+				{Coin: "BTC", Side: "B", Sz: "1", Px: "100", StartPosition: "0", ClosedPnl: "0", Time: 1, Tid: json.Number("1")},
+				{Coin: "BTC", Side: "B", Sz: "1", Px: "131", StartPosition: "0", ClosedPnl: "0", Time: 2, Tid: json.Number("3")},
+				{Coin: "BTC", Side: "A", Sz: "1", Px: "130", StartPosition: "1", ClosedPnl: "30.01", Time: 2, Tid: json.Number("2")},
+			},
+			keep: ids("1", "2", "3"),
+			want: 0.01,
+		},
+		{
+			name: "split flip uses the held position",
+			fills: []hlFillRecord{
+				{Coin: "BTC", Side: "B", Sz: "1", Px: "100", StartPosition: "0", ClosedPnl: "0", Time: 1, Tid: json.Number("1")},
+				{Coin: "BTC", Side: "A", Sz: "1", Px: "109", StartPosition: "0", ClosedPnl: "0", Time: 2, Tid: json.Number("3")},
+				{Coin: "BTC", Side: "A", Sz: "1", Px: "110", StartPosition: "1", ClosedPnl: "10.01", Time: 2, Tid: json.Number("2")},
+			},
+			keep: ids("1", "2", "3"),
+			want: 0.01,
+		},
+		{
+			name: "partial close cycle uses the held position",
+			fills: []hlFillRecord{
+				{Coin: "BTC", Side: "B", Sz: "2", Px: "100", StartPosition: "0", ClosedPnl: "0", Time: 1, Tid: json.Number("1")},
+				{Coin: "BTC", Side: "B", Sz: "1", Px: "120", StartPosition: "1", ClosedPnl: "0", Time: 2, Tid: json.Number("3")},
+				{Coin: "BTC", Side: "A", Sz: "1", Px: "110", StartPosition: "2", ClosedPnl: "10.01", Time: 2, Tid: json.Number("2")},
+				{Coin: "BTC", Side: "A", Sz: "2", Px: "130", StartPosition: "2", ClosedPnl: "40.02", Time: 3, Tid: json.Number("4")},
+			},
+			keep: ids("1", "2", "3", "4"),
+			want: 0.03,
+		},
+		{
+			name: "unresolvable cycle uses raw closedPnl",
+			fills: []hlFillRecord{
+				{Coin: "BTC", Side: "B", Sz: "1", Px: "131", StartPosition: "0", ClosedPnl: "0", Time: 2, Tid: json.Number("3")},
+				{Coin: "BTC", Side: "A", Sz: "1", Px: "130", StartPosition: "1", ClosedPnl: "30.01", Time: 2, Tid: json.Number("2")},
+			},
+			keep: ids("2", "3"),
+			want: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hyperliquidClosedPnlBasisError(tc.fills, tc.keep)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("basis = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReconcileCashflowJournalFillPriceBasis(t *testing.T) {
+	db := newCashflowJournalTestDB(t)
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xabc"}
+	t0 := time.UnixMilli(1_700_000_000_000).UTC()
+
+	origFills := fetchHyperliquidUserFillsByTime
+	origFunding := fetchHyperliquidUserFunding
+	origTransfers := fetchHyperliquidLedgerUpdates
+	defer func() {
+		fetchHyperliquidUserFillsByTime = origFills
+		fetchHyperliquidUserFunding = origFunding
+		fetchHyperliquidLedgerUpdates = origTransfers
+	}()
+	fills := []hlFillRecord{
+		{Coin: "BTC", Side: "B", Sz: "1", Px: "100", StartPosition: "0", ClosedPnl: "0", Fee: "0.1", Time: t0.UnixMilli() + 10, Tid: json.Number("1")},
+		{Coin: "BTC", Side: "A", Sz: "1", Px: "110", StartPosition: "1", ClosedPnl: "10.02", Fee: "0.1", Time: t0.UnixMilli() + 20, Tid: json.Number("2")},
+	}
+	fetchHyperliquidUserFillsByTime = func(string, int64) ([]hlFillRecord, error) { return fills, nil }
+	fetchHyperliquidUserFunding = func(string, int64) ([]hlLedgerEvent, error) { return nil, nil }
+	fetchHyperliquidLedgerUpdates = func(string, int64) ([]hlLedgerEvent, error) { return nil, nil }
+
+	if rec := reconcileCashflowJournal(db, key, 1000, 0, t0); rec == nil || rec.Usable {
+		t.Fatalf("baseline cycle: %+v", rec)
+	}
+	stored, err := db.SumCashflowJournal(key.Platform, key.Account)
+	if err != nil {
+		t.Fatalf("sum: %v", err)
+	}
+	if math.Abs(stored) > 1e-9 {
+		t.Fatalf("baseline must not book fills, settled = %v", stored)
+	}
+
+	flat := reconcileCashflowJournal(db, key, 0, 0, t0.Add(time.Minute))
+	if flat == nil || !flat.Usable {
+		t.Fatalf("steady cycle: %+v", flat)
+	}
+	stored, err = db.SumCashflowJournal(key.Platform, key.Account)
+	if err != nil {
+		t.Fatalf("sum: %v", err)
+	}
+	const rawSettled = -0.1 + (10.02 - 0.1)
+	if math.Abs(stored-rawSettled) > 1e-9 {
+		t.Fatalf("stored settled = %v, want raw closedPnl sum %v", stored, rawSettled)
+	}
+	if math.Abs(flat.ClosedPnlBasis-0.02) > 1e-9 {
+		t.Fatalf("basis = %v, want 0.02", flat.ClosedPnlBasis)
+	}
+	corrected := reconcileCashflowJournal(db, key, flat.ExpectedEquity, 0, t0.Add(2*time.Minute))
+	if corrected == nil || math.Abs(corrected.Drift) > 1e-6 {
+		t.Fatalf("fill-price equity must reconcile, drift = %v", corrected.Drift)
+	}
+	gap := reconcileCashflowJournal(db, key, corrected.ExpectedEquity-0.02, 0, t0.Add(3*time.Minute))
+	if gap == nil || !(math.Abs(gap.Drift) > sharedWalletDriftTolerance) || math.Abs(gap.Drift-(-0.02)) > 1e-6 {
+		t.Fatalf("real two-cent cash gap must still alert, drift = %v", gap.Drift)
+	}
+}
+
+func hlBasisTestFill(coin, side, sz, px, start, closedPnl string, timeMs int64, tid string) hlFillRecord {
+	return hlFillRecord{Coin: coin, Side: side, Sz: sz, Px: px, StartPosition: start, ClosedPnl: closedPnl, Time: timeMs, Tid: json.Number(tid)}
+}
+
+func TestEnsureHyperliquidCashflowBasis(t *testing.T) {
+	type seeded struct {
+		timeMs    int64
+		closedPnl float64
+		tid       string
+	}
+	fullPage := func(tail ...hlFillRecord) []hlFillRecord {
+		out := make([]hlFillRecord, 0, hlUserFillsByTimeLimit)
+		for i := 1; i <= hlUserFillsByTimeLimit-len(tail); i++ {
+			out = append(out, hlBasisTestFill("SOL", "B", "1", "1", strconv.Itoa(i-1), "0", int64(i), strconv.Itoa(100000+i)))
+		}
+		return append(out, tail...)
+	}
+	btcOpen := hlBasisTestFill("BTC", "B", "2", "100", "0", "0", 2500, "9000")
+	btcClose := hlBasisTestFill("BTC", "A", "1", "110", "2", "10.01", 3000, "9001")
+	cases := []struct {
+		name         string
+		journaled    []seeded
+		pages        func(call int, since int64) ([]hlFillRecord, error)
+		wantReady    []bool
+		wantErr      []bool
+		after        []hlFillRecord
+		wantBasis    float64
+		wantUnpriced int
+	}{
+		{
+			name:      "backfill stops at the journal target",
+			journaled: []seeded{{3000, 10.01, "9001"}},
+			pages: func(int, int64) ([]hlFillRecord, error) {
+				return []hlFillRecord{btcOpen, btcClose, hlBasisTestFill("BTC", "A", "1", "120", "1", "20.02", 5000, "9002")}, nil
+			},
+			wantReady: []bool{true},
+			wantErr:   []bool{false},
+			after:     []hlFillRecord{hlBasisTestFill("BTC", "A", "1", "120", "1", "20.02", 5000, "9002")},
+			wantBasis: 0.03,
+		},
+		{
+			name:      "full page resumes at its last millisecond without reapplying it",
+			journaled: []seeded{{3000, 10.01, "9001"}},
+			pages: func(_ int, since int64) ([]hlFillRecord, error) {
+				add := hlBasisTestFill("BTC", "B", "1", "120", "1", "0", 2500, "9010")
+				if since == 0 {
+					return fullPage(hlBasisTestFill("BTC", "B", "1", "100", "0", "0", 2400, "9009"), add), nil
+				}
+				return []hlFillRecord{add, hlBasisTestFill("BTC", "A", "1", "115", "2", "5.01", 3000, "9001")}, nil
+			},
+			wantReady: []bool{false, true},
+			wantErr:   []bool{false, false},
+			wantBasis: 0.01,
+		},
+		{
+			name:      "fetch failure stays pending then resumes",
+			journaled: []seeded{{3000, 10.01, "9001"}},
+			pages: func(call int, _ int64) ([]hlFillRecord, error) {
+				if call == 1 {
+					return nil, errors.New("temporary fetch failure")
+				}
+				return []hlFillRecord{btcOpen, btcClose}, nil
+			},
+			wantReady: []bool{false, true},
+			wantErr:   []bool{true, false},
+			wantBasis: 0.01,
+		},
+		{
+			name: "empty journal adopted while long and short seeds both books",
+			pages: func(int, int64) ([]hlFillRecord, error) {
+				return []hlFillRecord{
+					hlBasisTestFill("BTC", "B", "2", "100", "0", "0", 100, "9100"),
+					hlBasisTestFill("ETH", "A", "1", "50", "0", "0", 200, "9101"),
+				}, nil
+			},
+			wantReady: []bool{true},
+			wantErr:   []bool{false},
+			after: []hlFillRecord{
+				hlBasisTestFill("BTC", "A", "2", "110", "2", "20.02", 4000, "9102"),
+				hlBasisTestFill("ETH", "B", "1", "45", "-1", "5.01", 4100, "9103"),
+			},
+			wantBasis: 0.03,
+		},
+		{
+			name:      "empty journal adopted while flat seeds with one fetch",
+			pages:     func(int, int64) ([]hlFillRecord, error) { return nil, nil },
+			wantReady: []bool{true},
+			wantErr:   []bool{false},
+			after: []hlFillRecord{
+				hlBasisTestFill("BTC", "B", "1", "100", "0", "0", 4000, "9200"),
+				hlBasisTestFill("BTC", "A", "1", "110", "1", "10.01", 4100, "9201"),
+			},
+			wantBasis: 0.01,
+		},
+		{
+			name:         "open outside exchange history stays on raw closedPnl and is counted",
+			pages:        func(int, int64) ([]hlFillRecord, error) { return nil, nil },
+			wantReady:    []bool{true},
+			wantErr:      []bool{false},
+			after:        []hlFillRecord{hlBasisTestFill("BTC", "A", "2", "110", "2", "20.02", 4000, "9300")},
+			wantBasis:    0,
+			wantUnpriced: 1,
+		},
+		{
+			name:      "journaled fills outside exchange history use raw closedPnl",
+			journaled: []seeded{{50, 4.02, "7"}, {3000, 10.01, "9001"}},
+			pages: func(int, int64) ([]hlFillRecord, error) {
+				return []hlFillRecord{btcOpen, btcClose}, nil
+			},
+			wantReady: []bool{true},
+			wantErr:   []bool{false},
+			wantBasis: 0.01,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newCashflowJournalTestDB(t)
+			key := SharedWalletKey{Platform: "hyperliquid", Account: "0xabc"}
+			state := CashflowJournalState{FillsSinceMs: 3001, BaselineSet: true}
+			if err := db.UpsertCashflowJournalState(key.Platform, key.Account, state); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+			for _, j := range tc.journaled {
+				if err := db.InsertCashflowJournalEntry(key.Platform, key.Account, j.timeMs, "fill", j.closedPnl, "BTC", j.closedPnl, 0, "fill:tid:"+j.tid); err != nil {
+					t.Fatalf("seed fill: %v", err)
+				}
+			}
+			orig := fetchHyperliquidUserFillsByTime
+			defer func() { fetchHyperliquidUserFillsByTime = orig }()
+			calls := 0
+			fetchHyperliquidUserFillsByTime = func(_ string, since int64) ([]hlFillRecord, error) {
+				calls++
+				return tc.pages(calls, since)
+			}
+			for i, want := range tc.wantReady {
+				ready, err := ensureHyperliquidCashflowBasis(db, key, state)
+				if ready != want || (err != nil) != tc.wantErr[i] {
+					t.Fatalf("cycle %d: ready=%v err=%v", i+1, ready, err)
+				}
+			}
+			if calls != len(tc.wantReady) {
+				t.Fatalf("fetch calls = %d, want %d", calls, len(tc.wantReady))
+			}
+			if ready, err := ensureHyperliquidCashflowBasis(db, key, state); !ready || err != nil || calls != len(tc.wantReady) {
+				t.Fatalf("ready basis must not refetch history: ready=%v err=%v calls=%d", ready, err, calls)
+			}
+			if len(tc.after) > 0 {
+				_, _, unpriced, err := db.insertHyperliquidCashflowFills(key, tc.after, state.FillsSinceMs, cashflowCutoffAll)
+				if err != nil || unpriced != tc.wantUnpriced {
+					t.Fatalf("ingest after backfill: unpriced=%d err=%v, want %d", unpriced, err, tc.wantUnpriced)
+				}
+			}
+			var unresolved int
+			if err := db.db.QueryRow(`SELECT COUNT(*) FROM cashflow_journal WHERE kind = 'fill' AND hl_basis_resolved = 0`).Scan(&unresolved); err != nil {
+				t.Fatalf("count unresolved: %v", err)
+			}
+			if unresolved != 0 {
+				t.Fatalf("unresolved journaled fills = %d, want 0", unresolved)
+			}
+			got, err := db.SumHyperliquidCashflowBasis(key)
+			if err != nil || math.Abs(got-tc.wantBasis) > 1e-9 {
+				t.Fatalf("basis = %v (err %v), want %v", got, err, tc.wantBasis)
+			}
+		})
+	}
+}
+
+func TestReconcileCashflowJournalBasisPendingThenBounded(t *testing.T) {
+	db := newCashflowJournalTestDB(t)
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xabc"}
+	t0 := time.UnixMilli(1_700_000_000_000).UTC()
+	t0ms := t0.UnixMilli()
+	if err := db.UpsertCashflowJournalState(key.Platform, key.Account, CashflowJournalState{
+		FillsSinceMs: t0ms, FundingSinceMs: t0ms, TransfersSinceMs: t0ms, BaselineAccountValue: 1000, BaselineSet: true,
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	if err := db.InsertCashflowJournalEntry(key.Platform, key.Account, t0ms-10, "fill", 10.01, "BTC", 10.01, 0, "fill:tid:2"); err != nil {
+		t.Fatalf("seed fill: %v", err)
+	}
+	origFills := fetchHyperliquidUserFillsByTime
+	origFunding := fetchHyperliquidUserFunding
+	origTransfers := fetchHyperliquidLedgerUpdates
+	defer func() {
+		fetchHyperliquidUserFillsByTime = origFills
+		fetchHyperliquidUserFunding = origFunding
+		fetchHyperliquidLedgerUpdates = origTransfers
+	}()
+	historyCalls := 0
+	incrementalCalls := 0
+	fetchHyperliquidUserFillsByTime = func(_ string, since int64) ([]hlFillRecord, error) {
+		if since != 0 {
+			incrementalCalls++
+			return nil, nil
+		}
+		historyCalls++
+		if historyCalls == 1 {
+			return nil, errors.New("temporary fetch failure")
+		}
+		return []hlFillRecord{
+			hlBasisTestFill("BTC", "B", "1", "100", "0", "0", t0ms-20, "1"),
+			hlBasisTestFill("BTC", "A", "1", "110", "1", "10.01", t0ms-10, "2"),
+		}, nil
+	}
+	fetchHyperliquidUserFunding = func(string, int64) ([]hlLedgerEvent, error) { return nil, nil }
+	fetchHyperliquidLedgerUpdates = func(string, int64) ([]hlLedgerEvent, error) { return nil, nil }
+
+	pending := reconcileCashflowJournal(db, key, 1010.00, 0, t0.Add(time.Minute))
+	if pending == nil || pending.Usable || pending.Incomplete || pending.ClosedPnlBasis != 0 {
+		t.Fatalf("backfill failure must hold the alarm pending on the transient path: %+v", pending)
+	}
+	for i := 2; i <= 4; i++ {
+		rec := reconcileCashflowJournal(db, key, 1010.00, 0, t0.Add(time.Duration(i)*time.Minute))
+		if rec == nil || !rec.Usable || math.Abs(rec.ClosedPnlBasis-0.01) > 1e-9 || math.Abs(rec.Drift) > 1e-6 {
+			t.Fatalf("cycle %d: %+v", i, rec)
+		}
+	}
+	if historyCalls != 2 || incrementalCalls != 4 {
+		t.Fatalf("history fetches = %d, incremental fetches = %d; want 2 and 4", historyCalls, incrementalCalls)
+	}
+}
+
+func TestIngestCashflowJournalFillPages(t *testing.T) {
+	page := func(tail ...hlFillRecord) []hlFillRecord {
+		out := make([]hlFillRecord, 0, hlUserFillsByTimeLimit)
+		for i := 1; i <= hlUserFillsByTimeLimit-len(tail); i++ {
+			out = append(out, hlBasisTestFill("SOL", "B", "1", "1", strconv.Itoa(i-1), "0", int64(i), strconv.Itoa(i)))
+		}
+		return append(out, tail...)
+	}
+	btcOpen := hlBasisTestFill("BTC", "B", "2", "100", "0", "0", 5000, "9000")
+	btcClose := hlBasisTestFill("BTC", "A", "1", "110", "2", "10.01", 5000, "9001")
+	noTidOpen := hlFillRecord{Coin: "BTC", Side: "B", Sz: "1", Px: "100", StartPosition: "0", ClosedPnl: "0", Time: 10, Hash: "0xh1"}
+	cases := []struct {
+		name        string
+		batches     [][]hlFillRecord
+		wantCursors []int64
+		wantRows    int
+		wantBasis   float64
+	}{
+		{
+			name:        "full page defers its last millisecond",
+			batches:     [][]hlFillRecord{page(btcOpen), {btcClose, btcOpen}},
+			wantCursors: []int64{hlUserFillsByTimeLimit, 5001},
+			wantRows:    hlUserFillsByTimeLimit + 1,
+			wantBasis:   0.01,
+		},
+		{
+			name: "records without tid sharing time hash and coin book once",
+			batches: [][]hlFillRecord{{noTidOpen, noTidOpen,
+				hlBasisTestFill("BTC", "A", "1", "110", "1", "10.01", 20, "2")}},
+			wantCursors: []int64{21},
+			wantRows:    2,
+			wantBasis:   0.01,
+		},
+		{
+			name: "fill repeated in one page books once",
+			batches: [][]hlFillRecord{{hlBasisTestFill("BTC", "B", "1", "100", "0", "0", 10, "1"), hlBasisTestFill("BTC", "B", "1", "100", "0", "0", 10, "1"),
+				hlBasisTestFill("BTC", "A", "1", "110", "1", "10.01", 20, "2")}},
+			wantCursors: []int64{21},
+			wantRows:    2,
+			wantBasis:   0.01,
+		},
+		{
+			name:        "repeated fill on the deferred last millisecond books once",
+			batches:     [][]hlFillRecord{page(btcOpen, btcOpen), {btcOpen, btcClose, btcOpen}},
+			wantCursors: []int64{hlUserFillsByTimeLimit - 1, 5001},
+			wantRows:    hlUserFillsByTimeLimit,
+			wantBasis:   0.01,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newCashflowJournalTestDB(t)
+			key := SharedWalletKey{Platform: "hyperliquid", Account: "0xabc"}
+			if err := db.UpsertCashflowJournalState(key.Platform, key.Account, CashflowJournalState{FillsSinceMs: 1, BaselineSet: true}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+			orig := fetchHyperliquidUserFillsByTime
+			defer func() { fetchHyperliquidUserFillsByTime = orig }()
+			fetchHyperliquidUserFillsByTime = func(string, int64) ([]hlFillRecord, error) { return nil, nil }
+			if ready, err := ensureHyperliquidCashflowBasis(db, key, CashflowJournalState{FillsSinceMs: 1}); !ready || err != nil {
+				t.Fatalf("empty history basis: ready=%v err=%v", ready, err)
+			}
+			st, _, err := db.GetCashflowJournalState(key.Platform, key.Account)
+			if err != nil {
+				t.Fatalf("load state: %v", err)
+			}
+			for i, batch := range tc.batches {
+				var ok bool
+				st, ok = ingestCashflowJournalEventsChecked(db, cashflowJournalFetchResult{Key: key, State: st, StateFound: true, Fills: batch, FillsFetched: true}, cashflowCutoffAll)
+				if !ok || st.FillsSinceMs != tc.wantCursors[i] {
+					t.Fatalf("batch %d: ok=%v cursor=%d, want cursor %d", i+1, ok, st.FillsSinceMs, tc.wantCursors[i])
+				}
+			}
+			var rows int
+			if err := db.db.QueryRow(`SELECT COUNT(*) FROM cashflow_journal WHERE kind = 'fill'`).Scan(&rows); err != nil {
+				t.Fatalf("count rows: %v", err)
+			}
+			basis, err := db.SumHyperliquidCashflowBasis(key)
+			if rows != tc.wantRows || err != nil || math.Abs(basis-tc.wantBasis) > 1e-9 {
+				t.Fatalf("rows=%d basis=%v err=%v, want rows %d basis %v", rows, basis, err, tc.wantRows, tc.wantBasis)
+			}
+		})
 	}
 }
