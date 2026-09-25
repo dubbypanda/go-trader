@@ -2395,7 +2395,10 @@ func main() {
 								trades++
 								detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
 							}
-							runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
+							if _, slFills, slDetail := runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin); slFills > 0 {
+								trades += slFills
+								detail = mergeTradeDetails(detail, slDetail)
+							}
 						}
 						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 {
 							if flipTrades, flipDetail := advancePaperDynamicCloseRegime(sc, stratState, stratDB, result.Symbol, price, &mu, logger); flipTrades > 0 {
@@ -2521,7 +2524,10 @@ func main() {
 									trades++
 									detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
 								}
-								runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
+								if _, slFills, slDetail := runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin); slFills > 0 {
+									trades += slFills
+									detail = mergeTradeDetails(detail, slDetail)
+								}
 								if scaleInAddQty > 0 {
 									filledAddQty := scaleInAddQty
 									if execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.TotalSz > 0 {
@@ -2713,7 +2719,10 @@ func main() {
 						}
 					}
 					if pos != nil && hyperliquidIsLive(sc.Args) {
-						runPostTPStopLossAdjustment(sc, stratState, sc.Symbol, prices[sc.Symbol], cfg, &mu, notifier, logger, hlOnChainAbsQty)
+						if _, slFills, slDetail := runPostTPStopLossAdjustment(sc, stratState, sc.Symbol, prices[sc.Symbol], cfg, &mu, notifier, logger, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin); slFills > 0 {
+							trades += slFills
+							detail = mergeTradeDetails(detail, slDetail)
+						}
 						mark := prices[sc.Symbol]
 						manualRatchetTightened := false
 						if mark > 0 && strategyUsesTrailingTPRatchetClose(sc) {

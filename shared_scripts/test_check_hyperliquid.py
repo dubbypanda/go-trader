@@ -498,6 +498,7 @@ class TestUpdateStopLoss:
         cancel_oid=11111,
         post_place_oids=_UNSET,
         size=0.5,
+        frontend_reads=None,
     ):
         mod, spec = _load_check_module()
         spec.loader.exec_module(mod)
@@ -537,6 +538,13 @@ class TestUpdateStopLoss:
         }
         if place_side_effect is not None:
             mock_adapter.place_stop_loss.side_effect = place_side_effect
+            mock_adapter.modify_stop_loss.side_effect = place_side_effect
+        else:
+            mock_adapter.modify_stop_loss.return_value = mock_adapter.place_stop_loss.return_value
+        if frontend_reads is not None:
+            mock_adapter.frontend_open_orders.side_effect = frontend_reads
+        else:
+            mock_adapter.frontend_open_orders.return_value = []
 
         captured = StringIO()
         import builtins
@@ -590,43 +598,49 @@ class TestUpdateStopLoss:
             else:
                 assert out[key] == want
 
-    def test_cancel_then_place_long_stop(self):
+    def test_modify_in_place_long_stop(self):
         out, adapter = self._run_update(side="long")
-        adapter.cancel_trigger_order.assert_called_once_with("ETH", 11111)
-        adapter.place_stop_loss.assert_called_once_with("ETH", 0.5, 3104.12, False)
-        method_names = [call[0] for call in adapter.method_calls]
-        assert method_names.index("cancel_trigger_order") < method_names.index("place_stop_loss")
-        assert out["cancel_stop_loss_succeeded"] is True
+        adapter.modify_stop_loss.assert_called_once_with("ETH", 11111, 0.5, 3104.12, False)
+        adapter.place_stop_loss.assert_not_called()
+        adapter.cancel_trigger_order.assert_not_called()
         assert out["stop_loss_oid"] == 22222
         assert out["stop_loss_trigger_px"] == 3104.12
+        assert "cancel_stop_loss_succeeded" not in out
 
     def test_short_stop_places_buy_trigger(self):
         out, adapter = self._run_update(side="short")
-        adapter.place_stop_loss.assert_called_once_with("ETH", 0.5, 3104.12, True)
+        adapter.modify_stop_loss.assert_called_once_with("ETH", 11111, 0.5, 3104.12, True)
+        adapter.place_stop_loss.assert_not_called()
         assert out["stop_loss_oid"] == 22222
 
-    def test_unreadable_placement_resolves_to_the_resting_oid(self):
-        out, _ = self._run_update(
+    def test_unreadable_modify_does_not_add_a_second_stop(self):
+        out, adapter = self._run_update(
             place_response={"status": "weird"},
             post_place_oids={22222},
         )
-        assert out["stop_loss_oid"] == 22222
-        assert "stop_loss_outcome_unknown" not in out
+        adapter.place_stop_loss.assert_not_called()
+        adapter.cancel_trigger_order.assert_not_called()
+        assert "stop_loss_oid" not in out
+        assert out.get("stop_loss_outcome_unknown") is True
+        assert out.get("stop_loss_old_still_open") is True
 
-    def test_placement_exception_resolves_to_the_resting_oid(self):
+    def test_modify_exception_does_not_add_a_second_stop(self):
         def _boom(*_a, **_k):
             raise RuntimeError("connection reset after submit")
 
-        out, _ = self._run_update(place_side_effect=_boom, post_place_oids={22222})
-        assert out["stop_loss_oid"] == 22222
-        assert "stop_loss_outcome_unknown" not in out
+        out, adapter = self._run_update(place_side_effect=_boom, post_place_oids={22222})
+        adapter.place_stop_loss.assert_not_called()
+        adapter.cancel_trigger_order.assert_not_called()
+        assert "stop_loss_oid" not in out
+        assert out.get("stop_loss_old_still_open") is True
 
-    def test_unreadable_placement_with_nothing_resting_is_a_genuine_failure(self):
-        out, _ = self._run_update(
+    def test_unreadable_modify_with_nothing_else_resting_is_unknown(self):
+        out, adapter = self._run_update(
             place_response={"status": "weird"},
             post_place_oids=set(),
         )
-        assert "stop_loss_outcome_unknown" not in out
+        adapter.place_stop_loss.assert_not_called()
+        assert out.get("stop_loss_outcome_unknown") is True
         assert "stop_loss_oid" not in out
         assert "no usable status" in out["stop_loss_error"]
 
@@ -646,25 +660,130 @@ class TestUpdateStopLoss:
         assert out.get("stop_loss_outcome_unknown") is True
         assert "stop_loss_oid" not in out
 
-    def test_rejected_placement_does_not_mark_outcome_unknown(self):
-        out, _ = self._run_update(
+    def test_rejected_placement_leaves_the_old_stop(self):
+        out, adapter = self._run_update(
+            place_response={"status": "err", "response": "invalid trigger price"},
+        )
+        adapter.cancel_trigger_order.assert_not_called()
+        assert out.get("stop_loss_old_still_open") is True
+        assert "stop_loss_outcome_unknown" not in out
+        assert "cancel_stop_loss_succeeded" not in out
+
+    def test_cap_rejection_does_not_add_a_second_stop(self):
+        out, adapter = self._run_update(
             place_response={"status": "err", "response": "open order limit"},
         )
+        adapter.modify_stop_loss.assert_called_once()
+        adapter.place_stop_loss.assert_not_called()
+        adapter.cancel_trigger_order.assert_not_called()
+        assert out.get("stop_loss_old_still_open") is True
+        assert "stop_loss_oid" not in out
+
+    def test_unreadable_place_does_not_cancel(self):
+        out, adapter = self._run_update(
+            place_response={"status": "weird"},
+            post_place_oids=RuntimeError("indexer down"),
+        )
+        adapter.cancel_trigger_order.assert_not_called()
+        assert out.get("stop_loss_outcome_unknown") is True
+        assert out.get("stop_loss_old_still_open") is True
+
+    def test_immediate_fill_does_not_cancel_a_second_stop(self):
+        out, adapter = self._run_update(
+            place_response={"response": {"data": {"statuses": [{"filled": {"totalSz": "0.5", "avgPx": "3104"}}]}}},
+        )
+        adapter.cancel_trigger_order.assert_not_called()
+        adapter.place_stop_loss.assert_not_called()
+        assert out.get("stop_loss_filled_immediately") is True
+
+    def test_modify_failure_leaves_the_old_stop(self):
+        out, adapter = self._run_update(place_side_effect=RuntimeError("cancel down"))
+        adapter.modify_stop_loss.assert_called_once()
+        adapter.place_stop_loss.assert_not_called()
+        adapter.cancel_trigger_order.assert_not_called()
+        assert "stop_loss_oid" not in out
+        assert out.get("stop_loss_old_still_open") is True
+
+    def test_modify_exception_adopts_the_landed_stop(self):
+        landed = {
+            "oid": 77, "side": "A", "sz": "0.5", "reduceOnly": True,
+            "isTrigger": True, "orderType": "Stop Market", "triggerPx": "3104.12",
+        }
+        out, adapter = self._run_update(
+            place_side_effect=RuntimeError("connection reset after submit"),
+            frontend_reads=[[], [landed]],
+        )
+        adapter.place_stop_loss.assert_not_called()
+        assert out["stop_loss_oid"] == 77
         assert "stop_loss_outcome_unknown" not in out
 
-    def test_cancel_failure_defers_replacement(self):
-        out, adapter = self._run_update(cancel_side_effect=RuntimeError("cancel down"))
-        adapter.cancel_trigger_order.assert_called_once_with("ETH", 11111)
+    def test_modify_exception_old_stop_at_old_trigger_is_unknown(self):
+        old = {
+            "oid": 11111, "side": "A", "sz": "0.5", "reduceOnly": True,
+            "isTrigger": True, "orderType": "Stop Market", "triggerPx": "3104.11",
+        }
+        out, adapter = self._run_update(
+            place_side_effect=RuntimeError("connection reset after submit"),
+            frontend_reads=[[old], [old]],
+        )
         adapter.place_stop_loss.assert_not_called()
-        assert "cancel down" in out["cancel_stop_loss_error"]
         assert "stop_loss_oid" not in out
+        assert out.get("stop_loss_outcome_unknown") is True
+        assert out.get("stop_loss_old_still_open") is True
 
-    def test_cancel_rejected_defers_replacement(self):
-        out, adapter = self._run_update(cancel_response=_CANCEL_REJECTED_RESPONSE)
+    def test_modify_exception_old_stop_at_new_trigger_confirms_in_place(self):
+        moved = {
+            "oid": 11111, "side": "A", "sz": "0.5", "reduceOnly": True,
+            "isTrigger": True, "orderType": "Stop Market", "triggerPx": "3104.12",
+        }
+        out, adapter = self._run_update(
+            place_side_effect=RuntimeError("connection reset after submit"),
+            frontend_reads=[[moved], [moved]],
+        )
         adapter.place_stop_loss.assert_not_called()
-        assert "cancel_stop_loss_succeeded" not in out
-        assert "already filled" in out["cancel_stop_loss_error"]
+        assert out["stop_loss_oid"] == 11111
+        assert "stop_loss_outcome_unknown" not in out
+
+    def test_modify_exception_ignores_a_peers_matching_stop(self):
+        old = {
+            "oid": 11111, "side": "A", "sz": "0.5", "reduceOnly": True,
+            "isTrigger": True, "orderType": "Stop Market", "triggerPx": "3104.11",
+        }
+        peer = {
+            "oid": 22222, "side": "A", "sz": "0.5", "reduceOnly": True,
+            "isTrigger": True, "orderType": "Stop Market", "triggerPx": "3104.12",
+        }
+        out, adapter = self._run_update(
+            place_side_effect=RuntimeError("connection reset after submit"),
+            frontend_reads=[[old, peer], [old, peer]],
+        )
+        adapter.place_stop_loss.assert_not_called()
         assert "stop_loss_oid" not in out
+        assert out.get("stop_loss_outcome_unknown") is True
+
+    def test_modify_value_error_is_a_plain_rejection(self):
+        out, adapter = self._run_update(place_side_effect=ValueError("Size rounded to zero"))
+        adapter.place_stop_loss.assert_not_called()
+        assert "stop_loss_outcome_unknown" not in out
+        assert out.get("stop_loss_old_still_open") is True
+
+    def test_fresh_place_unreadable_reply_resolves_by_book_diff(self):
+        out, _ = self._run_update(
+            open_oids=set(),
+            lookup_result=None,
+            place_response={"status": "weird"},
+            post_place_oids={22222},
+        )
+        assert out["stop_loss_oid"] == 22222
+        assert "stop_loss_outcome_unknown" not in out
+
+    def test_resting_modify_does_not_cancel(self):
+        out, adapter = self._run_update(cancel_response=_CANCEL_REJECTED_RESPONSE)
+        adapter.modify_stop_loss.assert_called_once()
+        adapter.place_stop_loss.assert_not_called()
+        adapter.cancel_trigger_order.assert_not_called()
+        assert "cancel_stop_loss_succeeded" not in out
+        assert out["stop_loss_oid"] == 22222
 
     def test_open_order_lookup_failure_defers_replacement(self):
         out, adapter = self._run_update(open_oids_side_effect=RuntimeError("indexer down"))
@@ -693,6 +812,45 @@ class TestUpdateStopLoss:
         adapter.cancel_trigger_order.assert_not_called()
         adapter.place_stop_loss.assert_called_once_with("ETH", 0.5, 3104.12, False)
         assert out["stop_loss_oid"] == 22222
+
+    def test_list_open_orders_reads_frontend_stop_fields(self):
+        mod, spec = _load_check_module()
+        spec.loader.exec_module(mod)
+        mock_adapter_cls = MagicMock()
+        mock_adapter = MagicMock()
+        mock_adapter_cls.return_value = mock_adapter
+        mock_adapter.frontend_open_orders.return_value = [{
+            "coin": "ETH",
+            "oid": 44444,
+            "side": "A",
+            "sz": "0.5",
+            "isTrigger": True,
+            "reduceOnly": True,
+            "orderType": "Stop Market",
+            "triggerPx": "3104.12",
+        }]
+        captured = StringIO()
+        import builtins
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "adapter":
+                fake_mod = MagicMock()
+                fake_mod.HyperliquidExchangeAdapter = mock_adapter_cls
+                return fake_mod
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            with patch("sys.stdout", captured):
+                mod.run_list_open_order_oids("ETH")
+        out = json.loads(captured.getvalue())
+        mock_adapter.open_order_oids.assert_not_called()
+        order = out["open_orders"][0]
+        assert order["oid"] == 44444
+        assert order["is_trigger"] is True
+        assert order["reduce_only"] is True
+        assert order["order_type"] == "Stop Market"
+        assert order["trigger_px"] == 3104.12
 
 
 class TestCloseFullPosition:

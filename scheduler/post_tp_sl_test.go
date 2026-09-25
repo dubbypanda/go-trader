@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -55,12 +57,123 @@ func TestRunPostTPStopLossAdjustment_CapsAtOnChainQty(t *testing.T) {
 	var mu sync.RWMutex
 
 	onChain := map[string]float64{"ETH": 0.7}
-	if !runPostTPStopLossAdjustment(sc, state, "ETH", 105, nil, &mu, nil, nil, onChain) {
+	applied, _, _ := runPostTPStopLossAdjustment(sc, state, "ETH", 105, nil, &mu, nil, nil, onChain, nil, nil)
+	if !applied {
 		t.Fatal("expected runPostTPStopLossAdjustment to apply")
 	}
 	if gotQty != 0.7 {
 		t.Fatalf("subprocess size=%v, want 0.7 (capped at on-chain)", gotQty)
 	}
+}
+
+// The post-TP clamp fallback: the rule trigger lands past liquidation, so the
+// replace runs at the clamped trigger, with one fresh placement when the first
+// reply is protection-lost. Ground: the review finding that a deferred retry
+// was discarded, citing the first attempt's error.
+func TestRunPostTPStopLossAdjustment_LiquidationClampFallback(t *testing.T) {
+	old := runHyperliquidUpdateStopLossFunc
+	defer func() { runHyperliquidUpdateStopLossFunc = old }()
+	clearHLLiquidationAlert("hl-sl-after", "ETH")
+	defer clearHLLiquidationAlert("hl-sl-after", "ETH")
+
+	newState := func() *StrategyState {
+		return &StrategyState{ID: "hl-sl-after", Positions: map[string]*Position{"ETH": {
+			Symbol: "ETH", Quantity: 1.0, InitialQuantity: 2.0,
+			AvgCost: 100, EntryATR: 5, Side: "long",
+			StopLossOID: 111, StopLossTriggerPx: 95,
+			TPOIDs:                   []int64{0, 222},
+			TPArmedTiers:             []bool{true, true},
+			SLAdjustedTiersProcessed: 0,
+		}}}
+	}
+	sc := postTPSLTestStrategy("breakeven", []interface{}{
+		map[string]interface{}{"atr_multiple": 2, "close_fraction": 0.5},
+		map[string]interface{}{"atr_multiple": 3, "close_fraction": 1.0},
+	})
+	// Breakeven trigger is $100; liquidation at $100.4 clamps it to $100.902.
+	liqPx := map[string]float64{"ETH": 100.4}
+	netSide := map[string]string{"ETH": "long"}
+	onChain := map[string]float64{"ETH": 1.0}
+	const clampedTrigger = 100.4 * 1.005
+
+	run := func(t *testing.T, firstReply, retryReply *HyperliquidStopLossUpdateResult) (*StrategyState, *mockNotifier, bool, string) {
+		t.Helper()
+		clearHLLiquidationAlert("hl-sl-after", "ETH")
+		var logOutput bytes.Buffer
+		mock := &mockNotifier{}
+		mn := NewMultiNotifier(notifierBackend{
+			notifier:           mock,
+			tradeAlertChannels: map[string]string{"hyperliquid": "trade-alerts"},
+			ownerID:            "owner",
+		})
+		state := newState()
+		var mu sync.RWMutex
+		runHyperliquidUpdateStopLossFunc = func(_, _, _ string, _, _ float64, cancelOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
+			if cancelOID == 111 {
+				return firstReply, "", nil
+			}
+			return retryReply, "", nil
+		}
+		logger := &StrategyLogger{stratID: "test", writer: &logOutput}
+		applied, _, _ := runPostTPStopLossAdjustment(sc, state, "ETH", 105, nil, &mu, mn, logger, onChain, liqPx, netSide)
+		return state, mock, applied, logOutput.String()
+	}
+
+	t.Run("clamped replace rests on the first attempt", func(t *testing.T) {
+		state, mock, applied, _ := run(t, &HyperliquidStopLossUpdateResult{StopLossOID: 555, StopLossTriggerPx: clampedTrigger}, nil)
+		if !applied {
+			t.Fatal("expected the clamped replace to apply")
+		}
+		pos := state.Positions["ETH"]
+		if pos.StopLossOID != 555 || pos.StopLossTriggerPx != clampedTrigger {
+			t.Errorf("stop = oid %d @ %.4f, want 555 @ %.4f", pos.StopLossOID, pos.StopLossTriggerPx, clampedTrigger)
+		}
+		if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "STOP PAST LIQUIDATION") {
+			t.Fatalf("dms = %v, want one clamp alert", mock.dms)
+		}
+	})
+
+	t.Run("protection-lost first reply, retry places", func(t *testing.T) {
+		state, _, applied, _ := run(t,
+			&HyperliquidStopLossUpdateResult{CancelStopLossSucceeded: true, StopLossError: "first boom"},
+			&HyperliquidStopLossUpdateResult{StopLossOID: 888, StopLossTriggerPx: clampedTrigger})
+		if !applied {
+			t.Fatal("expected the retry placement to apply")
+		}
+		pos := state.Positions["ETH"]
+		if pos.StopLossOID != 888 || pos.StopLossTriggerPx != clampedTrigger {
+			t.Errorf("stop = oid %d @ %.4f, want the retry's 888 @ %.4f", pos.StopLossOID, pos.StopLossTriggerPx, clampedTrigger)
+		}
+	})
+
+	t.Run("protection-lost first reply, retry also fails", func(t *testing.T) {
+		state, mock, applied, logOutput := run(t,
+			&HyperliquidStopLossUpdateResult{CancelStopLossSucceeded: true, StopLossError: "first boom"},
+			&HyperliquidStopLossUpdateResult{StopLossError: "retry boom"})
+		if applied {
+			t.Fatal("a deferred retry must not apply")
+		}
+		pos := state.Positions["ETH"]
+		if pos.StopLossOID != 0 {
+			t.Errorf("StopLossOID = %d, want 0 after a landed cancel with nothing resting", pos.StopLossOID)
+		}
+		if len(mock.dms) != 1 {
+			t.Fatalf("dms = %v, want exactly one clamp alert (no duplicate protection-lost alert)", mock.dms)
+		}
+		if strings.Contains(mock.dms[0].content, "first boom") {
+			t.Errorf("clamp alert cites the first attempt's error: %s", mock.dms[0].content)
+		}
+		var criticalLog string
+		for _, line := range strings.Split(logOutput, "\n") {
+			if strings.Contains(line, "CRITICAL: post-TP SL for ETH cancelled OID=111") {
+				criticalLog = line
+				break
+			}
+		}
+		if !strings.Contains(criticalLog, "retry boom") || strings.Contains(criticalLog, "first boom") {
+			t.Errorf("critical log = %q, want the retry error only", criticalLog)
+		}
+	})
 }
 
 type slAfterParityPosition struct {

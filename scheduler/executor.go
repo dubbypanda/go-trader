@@ -107,7 +107,11 @@ type HyperliquidStopLossUpdateResult struct {
 	StopLossFilledImmediately bool    `json:"stop_loss_filled_immediately,omitempty"`
 	StopLossFilledExternally  bool    `json:"stop_loss_filled_externally,omitempty"`
 	StopLossOutcomeUnknown    bool    `json:"stop_loss_outcome_unknown,omitempty"`
+	StopLossOldStillOpen      bool    `json:"stop_loss_old_still_open,omitempty"`
+	PrePlaceOpenOIDs          []int64 `json:"pre_place_open_oids,omitempty"`
 	OpenOrderCheckError       string  `json:"open_order_check_error,omitempty"`
+	SentCancelOID             int64   `json:"-"`
+	MatchedSize               float64 `json:"-"`
 	CancelOnly                bool    `json:"cancel_only,omitempty"`
 	StopLossNotOpen           bool    `json:"stop_loss_not_open,omitempty"`
 }
@@ -398,6 +402,36 @@ func RunHyperliquidUpdateStopLoss(script, symbol, side string, size, triggerPx f
 	}
 	stdout, stderr, err := runPythonSideEffect(script, args)
 	return parseHyperliquidUpdateStopLossOutput(stdout, string(stderr), err)
+}
+
+var runHyperliquidListOpenOrderOIDsFunc = RunHyperliquidListOpenOrderOIDs
+
+type hlListedOpenOrder struct {
+	OID        int64   `json:"oid"`
+	Side       string  `json:"side"`
+	Sz         float64 `json:"sz"`
+	ReduceOnly bool    `json:"reduce_only"`
+	IsTrigger  bool    `json:"is_trigger"`
+	OrderType  string  `json:"order_type"`
+	TriggerPx  float64 `json:"trigger_px"`
+}
+
+func RunHyperliquidListOpenOrderOIDs(script, symbol string) (orders []hlListedOpenOrder, readErr string, err error) {
+	stdout, _, err := runPythonSideEffect(script, []string{"--list-open-order-oids", fmt.Sprintf("--symbol=%s", symbol)})
+	if err != nil && len(stdout) == 0 {
+		return nil, "", err
+	}
+	var payload struct {
+		OpenOrders          []hlListedOpenOrder `json:"open_orders"`
+		OpenOrderCheckError string              `json:"open_order_check_error"`
+	}
+	if uerr := json.Unmarshal(stdout, &payload); uerr != nil {
+		return nil, "", uerr
+	}
+	if payload.OpenOrderCheckError != "" {
+		return nil, payload.OpenOrderCheckError, nil
+	}
+	return payload.OpenOrders, "", nil
 }
 
 func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, forceSLReplace bool, forceTPReplace []bool, cancelTPOIDs []int64, reconcileFillHintsJSON []byte) []string {

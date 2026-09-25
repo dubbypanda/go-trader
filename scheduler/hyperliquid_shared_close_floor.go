@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -573,13 +574,13 @@ func rearmProtectionForCloseRemainder(sc StrategyConfig, stratState *StrategySta
 		detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, symbol, fillPx)
 	}
 	claimed = append(claimed, syncRes)
-	extraTrades, slDetail, trailRes := rearmTrailingStopAfterFailedClose(sc, stratState, symbol, price, prevStopOID, prevTriggerPx, prevHighWater, liqPxByCoin, netSideByCoin, stop, mu, logger)
+	extraTrades, slDetail, trailRes := rearmTrailingStopAfterFailedClose(sc, stratState, symbol, price, prevStopOID, prevTriggerPx, prevHighWater, liqPxByCoin, netSideByCoin, stop, mu, notifier, logger)
 	if extraTrades > 0 {
 		trades += extraTrades
 		detail = slDetail
 	}
 	claimed = append(claimed, trailRes)
-	extraTrades, slDetail, scalarRes := rearmScalarStopAfterFailedClose(sc, stratState, symbol, prevStopOID, prevTriggerPx, liqPxByCoin, netSideByCoin, stop, mu, logger)
+	extraTrades, slDetail, scalarRes := rearmScalarStopAfterFailedClose(sc, stratState, symbol, prevStopOID, prevTriggerPx, liqPxByCoin, netSideByCoin, stop, mu, notifier, logger)
 	if extraTrades > 0 {
 		trades += extraTrades
 		detail = slDetail
@@ -752,7 +753,7 @@ func manualRecordedStopOwner(sc StrategyConfig, pos *Position) bool {
 	return !ok || plan.StopLossATRMult <= 0
 }
 
-func rearmScalarStopAfterFailedClose(sc StrategyConfig, stratState *StrategyState, symbol string, prevStopOID int64, prevTriggerPx float64, liqPxByCoin map[string]float64, netSideByCoin map[string]string, stop hlCloseRemainderStop, mu *sync.RWMutex, logger *StrategyLogger) (int, string, hlStopRearmResult) {
+func rearmScalarStopAfterFailedClose(sc StrategyConfig, stratState *StrategyState, symbol string, prevStopOID int64, prevTriggerPx float64, liqPxByCoin map[string]float64, netSideByCoin map[string]string, stop hlCloseRemainderStop, mu *sync.RWMutex, notifier *MultiNotifier, logger *StrategyLogger) (int, string, hlStopRearmResult) {
 	if !hyperliquidIsLive(sc.Args) || stratState == nil || symbol == "" {
 		return 0, "", hlStopRearmResult{}
 	}
@@ -818,20 +819,42 @@ func rearmScalarStopAfterFailedClose(sc StrategyConfig, stratState *StrategyStat
 		QtyCapped:   capped,
 		StopLossOID: cancelOID,
 	}
-	result, _ := hlLiquidationClampReplace(candidate, triggerPx, logger)
+	result, _ := hlLiquidationClampReplace(candidate, triggerPx, logger, notifier, func(oid int64, trigger float64) {
+		mu.Lock()
+		if p := stratState.Positions[symbol]; p != nil {
+			p.StopLossOID = oid
+			if trigger > 0 {
+				p.StopLossTriggerPx = trigger
+			}
+		}
+		mu.Unlock()
+	})
+	prevOID := cancelOID
+	if result != nil && result.SentCancelOID > 0 {
+		prevOID = result.SentCancelOID
+	}
 	outcome := classifyStopRearmUpdate(ownerLabel, slEffectiveQty, triggerPx, result)
 	mu.Lock()
-	defer mu.Unlock()
-	if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, cancelOID, 0, true, result, "stop_loss_pct_immediate", logger, slEffectiveQty); immediateFill {
-		return 1, fmt.Sprintf("[%s] LIVE PERCENTAGE SL %s @ $%.2f", sc.ID, symbol, fillPx), outcome
+	immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, prevOID, 0, true, result, "stop_loss_pct_immediate", logger, slEffectiveQty)
+	var cancelAlert string
+	if result != nil && result.CancelStopLossError != "" && (result.StopLossOID > 0 || (result.StopLossFilledImmediately && result.StopLossTriggerPx > 0)) {
+		cancelAlert = fmt.Sprintf("**HL STOP CANCEL FAILED** [%s] %s old trigger OID %d may still be resting while the replacement filled or rested (new OID %d). Error: %s",
+			sc.ID, symbol, prevOID, result.StopLossOID, result.CancelStopLossError)
 	}
-	if outcome.Status == hlStopRearmPlaced {
+	if outcome.Status == hlStopRearmPlaced && result != nil {
 		logger.Info("%s re-armed after close for %s (qty=%.6f trigger=$%.4f)", ownerLabel, symbol, slEffectiveQty, result.StopLossTriggerPx)
+	}
+	mu.Unlock()
+	if cancelAlert != "" {
+		hlStopReplaceNotifyOnce(sc.ID+"|cancel|"+symbol+"|"+strconv.FormatInt(prevOID, 10), notifier, cancelAlert)
+	}
+	if immediateFill {
+		return 1, fmt.Sprintf("[%s] LIVE PERCENTAGE SL %s @ $%.2f", sc.ID, symbol, fillPx), outcome
 	}
 	return 0, "", outcome
 }
 
-func rearmTrailingStopAfterFailedClose(sc StrategyConfig, stratState *StrategyState, symbol string, mark float64, prevStopOID int64, prevTriggerPx, prevHighWater float64, liqPxByCoin map[string]float64, netSideByCoin map[string]string, stop hlCloseRemainderStop, mu *sync.RWMutex, logger *StrategyLogger) (int, string, hlStopRearmResult) {
+func rearmTrailingStopAfterFailedClose(sc StrategyConfig, stratState *StrategyState, symbol string, mark float64, prevStopOID int64, prevTriggerPx, prevHighWater float64, liqPxByCoin map[string]float64, netSideByCoin map[string]string, stop hlCloseRemainderStop, mu *sync.RWMutex, notifier *MultiNotifier, logger *StrategyLogger) (int, string, hlStopRearmResult) {
 	if !hyperliquidIsLive(sc.Args) || stratState == nil || symbol == "" {
 		return 0, "", hlStopRearmResult{}
 	}
@@ -868,7 +891,7 @@ func rearmTrailingStopAfterFailedClose(sc StrategyConfig, stratState *StrategySt
 	placedQty := slEffectiveQty
 	logger.Warn("Failed close %s cancelled its on-chain stop (oid=%d); re-arming the trailing SL from high-water $%.4f with the old oid verified on-chain before any cancel", symbol, cancelOID, highWater)
 	policy := trailingReplacePolicy{forceResize: true, liquidationPx: hlLiquidationPxForSide(liqPxByCoin, netSideByCoin, symbol, side)}
-	newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, symbol, side, slEffectiveQty, &posSnap, mark, highWater, triggerPx, cancelOID, policy, nil, logger)
+	newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, symbol, side, slEffectiveQty, &posSnap, mark, highWater, triggerPx, cancelOID, policy, notifier, logger)
 	outcome := classifyStopRearmUpdate(hlRearmOwnerTrailing, slEffectiveQty, triggerPx, slUpdate)
 	mu.Lock()
 	defer mu.Unlock()
