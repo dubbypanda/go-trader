@@ -236,13 +236,6 @@ func lockHyperliquidTrailingUpdate(symbol string) func() {
 	return m.Unlock
 }
 
-func hlSLEffectiveQty(symbol string, virtualQty float64, onChainQtyMap map[string]float64) (float64, bool) {
-	if onChainQty, ok := onChainQtyMap[symbol]; ok && onChainQty > 1e-9 && onChainQty < virtualQty-1e-9 {
-		return onChainQty, true
-	}
-	return virtualQty, false
-}
-
 func effectiveTrailingStopPct(sc StrategyConfig, pos *Position) float64 {
 	if sc.Platform != "hyperliquid" {
 		return 0
@@ -783,7 +776,7 @@ func applyTrailingStopUpdateResult(s *StrategyState, symbol, expectedSide string
 	switch {
 	case slUpdate.StopLossFilledImmediately && slUpdate.StopLossTriggerPx > 0:
 		pos.RatchetFallbackNormalizePending = false
-		if recordPerpsStopLossCloseQty(s, symbol, placedQty, slUpdate.StopLossTriggerPx, closeReason, logger) {
+		if recordPerpsStopLossCloseQty(s, symbol, hlPlacedStopQty(placedQty, slUpdate.StopLossSize), slUpdate.StopLossTriggerPx, closeReason, logger) {
 			if residue, ok := s.Positions[symbol]; ok && residue != nil && residue.Quantity > 0 {
 				residue.StopLossOID = 0
 				residue.StopLossTriggerPx = 0

@@ -851,6 +851,19 @@ class TestUpdateStopLoss:
         assert order["reduce_only"] is True
         assert order["order_type"] == "Stop Market"
         assert order["trigger_px"] == 3104.12
+        assert order["coin"] == "ETH"
+        assert order["sz"] == 0.5
+
+
+def test_compute_tp_tier_sizes_never_sums_above_the_floored_input():
+    mod, spec = _load_check_module()
+    spec.loader.exec_module(mod)
+
+    def floor(sz):
+        return math.floor(sz * 100) / 100.0
+
+    sizes = mod.compute_tp_tier_sizes(8.127, [(1.0, 0.5), (2.0, 1.0)], floor)
+    assert sum(sizes) <= floor(8.127) + 1e-9
 
 
 class TestCloseFullPosition:
@@ -1093,7 +1106,7 @@ class TestSyncProtection:
             )
         mock_adapter.round_perps_trigger_px.side_effect = lambda _sym, px: round(px, 4)
         mock_adapter.round_size.side_effect = lambda _sym, sz: round(sz, 3)
-        mock_adapter.floor_size.side_effect = lambda _sym, sz: math.floor(sz * 1000) / 1000
+        mock_adapter.floor_size.side_effect = lambda _sym, sz: math.floor(sz * 1000 + 1e-9) / 1000
         if cancel_response is not None:
             mock_adapter.cancel_order_by_oid.return_value = cancel_response
 
@@ -1299,7 +1312,7 @@ class TestSyncProtection:
         mock_adapter.open_order_oids.return_value = {303}
         mock_adapter.round_perps_trigger_px.side_effect = lambda _sym, px: round(px, 4)
         mock_adapter.round_size.side_effect = lambda _sym, sz: round(sz, 3)
-        mock_adapter.floor_size.side_effect = lambda _sym, sz: math.floor(sz * 1000) / 1000
+        mock_adapter.floor_size.side_effect = lambda _sym, sz: math.floor(sz * 1000 + 1e-9) / 1000
         mock_adapter.lookup_fill_fee_by_oid.return_value = {}
         mock_adapter.cancel_order_by_oid.side_effect = Exception("rpc down")
         captured = StringIO()
@@ -1590,7 +1603,7 @@ class TestSyncProtection:
         mock_adapter.open_order_oids.side_effect = RuntimeError("indexer down")
         mock_adapter.round_perps_trigger_px.side_effect = lambda _sym, px: round(px, 4)
         mock_adapter.round_size.side_effect = lambda _sym, sz: round(sz, 3)
-        mock_adapter.floor_size.side_effect = lambda _sym, sz: math.floor(sz * 1000) / 1000
+        mock_adapter.floor_size.side_effect = lambda _sym, sz: math.floor(sz * 1000 + 1e-9) / 1000
 
         captured = StringIO()
         import builtins

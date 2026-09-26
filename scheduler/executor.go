@@ -114,6 +114,14 @@ type HyperliquidStopLossUpdateResult struct {
 	MatchedSize               float64 `json:"-"`
 	CancelOnly                bool    `json:"cancel_only,omitempty"`
 	StopLossNotOpen           bool    `json:"stop_loss_not_open,omitempty"`
+	StopLossSize              float64 `json:"stop_loss_size,omitempty"`
+}
+
+func hlPlacedStopQty(sent, reported float64) float64 {
+	if reported > 0 && reported < sent {
+		return reported
+	}
+	return sent
 }
 
 type HyperliquidProtectionSyncResult struct {
@@ -147,6 +155,7 @@ type HyperliquidProtectionSyncResult struct {
 	CancelStopLossSucceeded   bool      `json:"cancel_stop_loss_succeeded,omitempty"`
 	CancelStopLossError       string    `json:"cancel_stop_loss_error,omitempty"`
 	StopLossOutcomeUnknown    bool      `json:"stop_loss_outcome_unknown,omitempty"`
+	StopLossSize              float64   `json:"stop_loss_size,omitempty"`
 }
 
 func runPython(parentCtx context.Context, script string, args []string, stdinData []byte) ([]byte, []byte, error) {
@@ -383,6 +392,7 @@ func buildHyperliquidExecuteArgs(symbol, side string, size, stopLossPct float64,
 func RunHyperliquidExecute(script, symbol, side string, size, stopLossPct float64, cancelStopLossOID int64, prevPosQty float64, marginMode string, leverage float64, closeMode hlCloseMode, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
 	args := buildHyperliquidExecuteArgs(symbol, side, size, stopLossPct, cancelStopLossOID, prevPosQty, marginMode, leverage, closeMode, snapshot, extraCancelOIDs...)
 	stdout, stderr, err := runPythonSideEffect(script, args)
+	hlNoteCoinSubmission(symbol)
 	return parseHyperliquidExecuteOutput(stdout, string(stderr), err)
 }
 
@@ -401,19 +411,30 @@ func RunHyperliquidUpdateStopLoss(script, symbol, side string, size, triggerPx f
 		args = append(args, fmt.Sprintf("--cancel-stop-loss-oid=%d", cancelStopLossOID))
 	}
 	stdout, stderr, err := runPythonSideEffect(script, args)
-	return parseHyperliquidUpdateStopLossOutput(stdout, string(stderr), err)
+	res, stderrStr, parseErr := parseHyperliquidUpdateStopLossOutput(stdout, string(stderr), err)
+	if hlStopUpdateMovesChain(res) {
+		hlNoteCoinSubmission(symbol)
+	}
+	return res, stderrStr, parseErr
 }
 
 var runHyperliquidListOpenOrderOIDsFunc = RunHyperliquidListOpenOrderOIDs
 
 type hlListedOpenOrder struct {
 	OID        int64   `json:"oid"`
+	Coin       string  `json:"coin"`
 	Side       string  `json:"side"`
 	Sz         float64 `json:"sz"`
 	ReduceOnly bool    `json:"reduce_only"`
 	IsTrigger  bool    `json:"is_trigger"`
 	OrderType  string  `json:"order_type"`
 	TriggerPx  float64 `json:"trigger_px"`
+}
+
+type hlAllOpenOrders struct {
+	Orders   []hlListedOpenOrder
+	Decimals map[string]int
+	ReadErr  string
 }
 
 func RunHyperliquidListOpenOrderOIDs(script, symbol string) (orders []hlListedOpenOrder, readErr string, err error) {
@@ -424,6 +445,8 @@ func RunHyperliquidListOpenOrderOIDs(script, symbol string) (orders []hlListedOp
 	var payload struct {
 		OpenOrders          []hlListedOpenOrder `json:"open_orders"`
 		OpenOrderCheckError string              `json:"open_order_check_error"`
+		SzDecimals          *int                `json:"sz_decimals"`
+		SzDecimalsByCoin    map[string]int      `json:"sz_decimals_by_coin"`
 	}
 	if uerr := json.Unmarshal(stdout, &payload); uerr != nil {
 		return nil, "", uerr
@@ -433,6 +456,37 @@ func RunHyperliquidListOpenOrderOIDs(script, symbol string) (orders []hlListedOp
 	}
 	return payload.OpenOrders, "", nil
 }
+
+func parseHLAllOpenOrders(stdout []byte) (hlAllOpenOrders, error) {
+	var payload struct {
+		OpenOrders          []hlListedOpenOrder `json:"open_orders"`
+		OpenOrderCheckError string              `json:"open_order_check_error"`
+		SzDecimalsByCoin    map[string]int      `json:"sz_decimals_by_coin"`
+	}
+	if err := json.Unmarshal(stdout, &payload); err != nil {
+		return hlAllOpenOrders{}, err
+	}
+	if payload.OpenOrderCheckError != "" {
+		return hlAllOpenOrders{ReadErr: payload.OpenOrderCheckError}, nil
+	}
+	decimals := make(map[string]int, len(payload.SzDecimalsByCoin))
+	for coin, d := range payload.SzDecimalsByCoin {
+		if key := hlCoinKey(coin); key != "" {
+			decimals[key] = d
+		}
+	}
+	return hlAllOpenOrders{Orders: payload.OpenOrders, Decimals: decimals}, nil
+}
+
+func RunHyperliquidListAllOpenOrders(script string) (hlAllOpenOrders, error) {
+	stdout, _, err := runPythonSideEffect(script, []string{"--list-open-order-oids"})
+	if err != nil && len(stdout) == 0 {
+		return hlAllOpenOrders{}, err
+	}
+	return parseHLAllOpenOrders(stdout)
+}
+
+var runHyperliquidListAllOpenOrdersFn = RunHyperliquidListAllOpenOrders
 
 func buildHyperliquidSyncProtectionArgv(symbol, side string, size, avgCost, entryATR, stopLossATRMult float64, tiers []hlProtectionTier, stopLossOID int64, tpOIDs []int64, tpArmedTiers []bool, forceSLReplace bool, forceTPReplace []bool, cancelTPOIDs []int64, reconcileFillHintsJSON []byte) []string {
 	args := []string{
@@ -502,6 +556,9 @@ func RunHyperliquidSyncProtection(script, symbol, side string, size, avgCost, en
 			return nil, stderrStr, fmt.Errorf("script error: %w (stderr: %s; stdout: %s)", err, stderrStr, string(stdout))
 		}
 		return nil, stderrStr, fmt.Errorf("parse output: %w (stdout: %s)", jsonErr, string(stdout))
+	}
+	if hlProtectionSyncMovesChain(&result) {
+		hlNoteCoinSubmission(symbol)
 	}
 	if err != nil && result.Error == "" {
 		return &result, stderrStr, fmt.Errorf("script error: %w (stderr: %s)", err, stderrStr)
@@ -672,6 +729,7 @@ func RunHyperliquidCloseCancelAfterFill(script, symbol string, partialSz *float6
 func runHyperliquidClose(script, symbol string, partialSz *float64, cancelStopLossOIDs []int64, cancelProtectionAfterClose bool) (*HyperliquidCloseResult, string, error) {
 	args := buildHyperliquidCloseArgs(symbol, partialSz, cancelStopLossOIDs, cancelProtectionAfterClose)
 	stdout, stderr, runErr := runPythonSideEffect(script, args)
+	hlNoteCoinSubmission(symbol)
 	return parseHyperliquidCloseOutput(stdout, string(stderr), runErr)
 }
 
